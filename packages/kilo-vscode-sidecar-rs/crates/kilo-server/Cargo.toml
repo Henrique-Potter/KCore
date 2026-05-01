@@ -1,0 +1,25 @@
+[package]
+name = "kilo-server"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+async-stream.workspace = true
+axum.workspace = true
+base64.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+kilo-protocol.workspace = true
+kilo-provider.workspace = true
+kilo-store.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+kilo-store = { path = "../kilo-store", features = ["test-utils"] }

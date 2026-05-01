@@ -1,0 +1,11 @@
+[package]
+name = "kilo-vscode-sidecar"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+clap.workspace = true
+kilo-server.workspace = true
+tokio.workspace = true

@@ -1,0 +1,20 @@
+{
+  "contract_version": "kilo-vscode-sidecar.preview.0",
+  "health_response_body": {
+    "healthy": true,
+    "version": "<VERSION>"
+  },
+  "health_response_status": 200,
+  "notes": [
+    "stdout_line is the exact line emitted by `kilo serve --port 0` once the server has bound a loopback port. The VS Code extension parses this with the regex in packages/kilo-vscode/src/services/cli-backend/server-utils.ts (`listening on http:\\/\\/[\\w.]+:(\\d+)`).",
+    "The Rust sidecar must reproduce this line verbatim except for the port number; see CONTRACT.md.",
+    "health_response_body version is normalized to `<VERSION>` because Rust and Bun report different version strings; the only invariant Rust must preserve is `healthy: true` plus a non-empty `version` string.",
+    "This fixture is the canonical post-normalization form. Tests that capture against a live Bun process will produce the same shape after running through `Normalizer`."
+  ],
+  "parsed": {
+    "host": "127.0.0.1",
+    "port": "<PORT>"
+  },
+  "scenario": "startup",
+  "stdout_line": "kilo server listening on http://127.0.0.1:<PORT>"
+}

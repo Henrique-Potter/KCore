@@ -1,0 +1,18 @@
+{
+  "bun_version": null,
+  "captured": false,
+  "captured_at_iso": "deterministic-rust-fixture",
+  "contract_version": "kilo-vscode-sidecar.preview.0",
+  "identity_map": {
+    "event_ids": {},
+    "message_ids": {},
+    "part_ids": {},
+    "request_ids": {},
+    "session_ids": {},
+    "timestamps": {},
+    "uuids": {}
+  },
+  "kilo_server_version": "rust-sidecar-test-harness",
+  "recorded_at_iso": "<TIMESTAMP:0>",
+  "scenario": "m7-abort-mid-stream"
+}

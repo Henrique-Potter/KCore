@@ -1,0 +1,34 @@
+[package]
+name = "kilo-oracle"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = { workspace = true }
+futures-util = "0.3"
+once_cell = "1"
+rand = { workspace = true }
+regex = "1"
+reqwest.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "1"
+tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "time", "io-util", "sync"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+chrono = { workspace = true }
+hex = "0.4"
+kilo-server = { workspace = true }
+pretty_assertions = "1"
+rusqlite.workspace = true

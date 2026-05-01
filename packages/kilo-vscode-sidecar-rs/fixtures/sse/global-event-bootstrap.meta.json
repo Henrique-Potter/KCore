@@ -1,0 +1,19 @@
+{
+  "bun_binary_sha256": "3fc2e5319c7fd35fc22d8625e6d3c2dea490455613a3a5497275c4c57c8ee1bf",
+  "bun_version": null,
+  "captured": true,
+  "captured_at_iso": "2026-05-01T18:21:15Z",
+  "contract_version": "kilo-vscode-sidecar.preview.0",
+  "identity_map": {
+    "message_ids": {},
+    "part_ids": {},
+    "request_ids": {},
+    "session_ids": {},
+    "timestamps": {},
+    "uuids": {}
+  },
+  "kilo_server_version": "0.0.0-main-202604300411",
+  "observed_heartbeat_interval_ms": 10007,
+  "recorded_at_iso": "<TIMESTAMP:0>",
+  "scenario": "global-event"
+}

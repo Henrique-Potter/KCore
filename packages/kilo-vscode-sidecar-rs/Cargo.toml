@@ -1,0 +1,39 @@
+[workspace]
+members = [
+  "crates/kilo-vscode-sidecar",
+  "crates/kilo-server",
+  "crates/kilo-protocol",
+  "crates/kilo-store",
+  "crates/kilo-session",
+  "crates/kilo-provider",
+  "crates/kilo-tools",
+  "crates/kilo-mcp",
+  "crates/kilo-oracle",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+publish = false
+version = "0.0.0-preview.0"
+
+[workspace.dependencies]
+async-stream = "0.3"
+axum = { version = "0.8", features = ["http1", "tokio"] }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.5", features = ["derive"] }
+futures-core = "0.3"
+futures-util = "0.3"
+kilo-protocol = { path = "crates/kilo-protocol" }
+kilo-provider = { path = "crates/kilo-provider" }
+kilo-server = { path = "crates/kilo-server" }
+kilo-store = { path = "crates/kilo-store" }
+rand = { version = "0.8", features = ["std_rng"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

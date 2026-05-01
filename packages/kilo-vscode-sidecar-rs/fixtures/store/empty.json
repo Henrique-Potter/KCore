@@ -1,0 +1,52 @@
+{
+  "bun_binary_sha256": "3fc2e5319c7fd35fc22d8625e6d3c2dea490455613a3a5497275c4c57c8ee1bf",
+  "captured": true,
+  "captured_at_iso": "2026-05-01T18:21:15Z",
+  "contract_version": "kilo-vscode-sidecar.preview.0",
+  "description": "First-launch on-disk layout produced by `kilo serve --port 0` against a fresh HOME tempdir, after a single `/global/health` GET and graceful shutdown. Captures the real Bun layout: SQLite database (`kilo.db` + WAL/SHM), version stamp, telemetry id, and a startup log under XDG paths derived from HOME — not the hand-coded `config/global.json` shape the previous placeholder advertised.",
+  "expected_shape": {
+    "files": [
+      {
+        "path": ".cache/kilo/models.json",
+        "size_bytes": 1849873
+      },
+      {
+        "path": ".cache/kilo/version",
+        "sha256": "6f4b6612125fb3a0daecd2799dfd6c9c299424fd920f9b308110a2c1fbd8f443",
+        "size_bytes": 2
+      },
+      {
+        "path": ".local/share/kilo/kilo.db",
+        "sha256": "2fb9e76bc8b8bb820a77e21342abe7b079f687749503315e13c0cf95106675e0",
+        "size_bytes": 4096
+      },
+      {
+        "path": ".local/share/kilo/kilo.db-shm",
+        "size_bytes": 32768
+      },
+      {
+        "path": ".local/share/kilo/kilo.db-wal",
+        "size_bytes": 177192
+      },
+      {
+        "path": ".local/share/kilo/log/2026-05-01T182055.log",
+        "sha256": "7cf7458d04de712f435c11aa8f50ffcf0831386ca63bf15d94f5c31ffe5ee806",
+        "size_bytes": 1761
+      },
+      {
+        "path": ".local/share/kilo/telemetry-id",
+        "sha256": "0719ee114262533b1eff5a02ad2a1c8e5aafaabff6f5554f918772839f185207",
+        "size_bytes": 36
+      }
+    ],
+    "format": "List of relative paths under the recording tempdir (HOME + KILO_HOME + XDG dirs all rooted there). `size_bytes` is recorded for every file; `sha256` only for files smaller than 16 KiB. SQLite WAL/SHM files have unstable contents and are deliberately captured as size-only when they exceed 16 KiB, but for the empty-store baseline most are well under that threshold."
+  },
+  "kilo_server_version": "0.0.0-main-202604300411",
+  "notes": [
+    "When Rust eventually owns the store, the diff between this fixture and Rust's freshly-created store is the read-side compatibility gate for milestone 6.",
+    "The `kilo.db*` files are SQLite write-ahead log artifacts. Bun creates them eagerly even if no rows have been inserted, so they show up in this fixture even though no session work has happened.",
+    "`telemetry-id` is a single-line random ID Bun writes once per host. Treated as opaque content here; the Rust port must produce-or-preserve this file but the value is not part of the contract.",
+    "Re-run via `KILO_ORACLE_RECORD=1 cargo test -p kilo-oracle --tests --ignored record_fixtures`."
+  ],
+  "scenario": "store-empty"
+}
