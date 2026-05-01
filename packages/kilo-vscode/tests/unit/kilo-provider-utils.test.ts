@@ -20,6 +20,7 @@ import type {
   Agent,
   Provider,
   Event,
+  EventMessagePartDelta,
   EventMessagePartUpdated,
   EventMessageUpdated,
   EventSessionStatus,
@@ -265,6 +266,32 @@ describe("mapSSEEventToWebviewMessage", () => {
       properties: { part: makeTextPart({ text: "" }) },
     }
     expect(mapSSEEventToWebviewMessage(event, undefined)).toBeNull()
+  })
+
+  it("maps message.part.delta to the streaming partUpdated shape used by the sidebar", () => {
+    const event: EventMessagePartDelta = {
+      type: "message.part.delta",
+      properties: {
+        sessionID: "sess-1",
+        messageID: "msg-1",
+        partID: "part-1",
+        field: "text",
+        delta: "Echo: first chat smoke",
+      },
+    }
+    const msg = mapSSEEventToWebviewMessage(event, "sess-1")
+    expect(msg?.type).toBe("partUpdated")
+    if (msg?.type === "partUpdated") {
+      expect(msg.sessionID).toBe("sess-1")
+      expect(msg.messageID).toBe("msg-1")
+      expect(msg.delta?.textDelta).toBe("Echo: first chat smoke")
+      expect(msg.part).toEqual({
+        id: "part-1",
+        type: "text",
+        messageID: "msg-1",
+        text: "Echo: first chat smoke",
+      })
+    }
   })
 
   it("maps message.updated to messageCreated with ISO date", () => {

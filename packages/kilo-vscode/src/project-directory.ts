@@ -1,5 +1,5 @@
 /**
- * Project directory resolution for standalone panels (Settings, Profile, Marketplace).
+ * Project directory resolution for standalone panels (Settings and Profile).
  *
  * ## Why this exists
  *
@@ -10,8 +10,8 @@
  * Standalone editor panels (opened via SettingsEditorProvider) don't have that
  * implicit context. In a **multi-root workspace** — where VS Code has multiple
  * folders open (e.g. `/repo-a` and `/repo-b`) — we can't just pick
- * `workspaceFolders[0]` because the user may intend to install a marketplace
- * item into `/repo-b`, not `/repo-a`.
+ * `workspaceFolders[0]` because the user may intend to configure `/repo-b`,
+ * not `/repo-a`.
  *
  * The resolution strategy is:
  *
@@ -21,8 +21,8 @@
  * 2. If there's exactly one workspace folder, use it. There's no ambiguity.
  *
  * 3. If there are multiple folders and no active editor, return `null` to
- *    **disable project-scope operations** (e.g. marketplace installs default
- *    to global scope). This prevents silently writing config into the wrong project.
+ *    **disable project-scope operations**. This prevents silently writing config
+ *    into the wrong project.
  *
  * ## How KiloProvider uses this
  *

@@ -1,4 +1,3 @@
-import type { InstallMarketplaceItemOptions, MarketplaceFilters, MarketplaceItem } from "../marketplace"
 import type { FileAttachment } from "./parts"
 import type { MessageLoadMode } from "./sessions"
 import type { PermissionFileDiff } from "./permissions"
@@ -189,10 +188,6 @@ export interface OpenConfigFileRequest {
     sourceProjectKilocode: string
     sourceProjectOpencode: string
   }
-}
-
-export interface OpenMarketplacePanelRequest {
-  type: "openMarketplacePanel"
 }
 
 export interface OpenAgentManagerRequest {
@@ -917,27 +912,6 @@ export interface MoveSectionRequest {
   dir: -1 | 1
 }
 
-export interface FetchMarketplaceDataMessage {
-  type: "fetchMarketplaceData"
-}
-
-export interface FilterMarketplaceItemsMessage {
-  type: "filterMarketplaceItems"
-  filters: MarketplaceFilters
-}
-
-export interface InstallMarketplaceItemMessage {
-  type: "installMarketplaceItem"
-  mpItem: MarketplaceItem
-  mpInstallOptions: InstallMarketplaceItemOptions
-}
-
-export interface RemoveInstalledMarketplaceItemMessage {
-  type: "removeInstalledMarketplaceItem"
-  mpItem: MarketplaceItem
-  mpInstallOptions: InstallMarketplaceItemOptions
-}
-
 export type WebviewMessage =
   | SendMessageRequest
   | AbortRequest
@@ -957,7 +931,6 @@ export type WebviewMessage =
   | OpenSettingsPanelRequest
   | OpenVSCodeSettingsRequest
   | OpenConfigFileRequest
-  | OpenMarketplacePanelRequest
   | OpenAgentManagerRequest
   | OpenAdvancedWorktreeRequest
   | OpenFileRequest
@@ -1071,10 +1044,6 @@ export type WebviewMessage =
   | AgentManagerOpenSessionsMessage
   | RequestAutoApproveStateMessage
   | ToggleAutoApproveMessage
-  | FetchMarketplaceDataMessage
-  | FilterMarketplaceItemsMessage
-  | InstallMarketplaceItemMessage
-  | RemoveInstalledMarketplaceItemMessage
   | ConnectProviderMessage
   | AuthorizeProviderOAuthMessage
   | CompleteProviderOAuthMessage

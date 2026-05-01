@@ -1,5 +1,10 @@
 import { describe, it, expect } from "bun:test"
-import { resolveEventSessionId } from "../../src/services/cli-backend/connection-utils"
+import {
+  resolveEventSessionId,
+  createMutationTrackingFetch,
+  isMutatingMethod,
+  methodFromFetchArgs,
+} from "../../src/services/cli-backend/connection-utils"
 import type { Event } from "@kilocode/sdk/v2/client"
 
 const noLookup = (_: string) => undefined
@@ -181,5 +186,155 @@ describe("resolveEventSessionId", () => {
   it("returns undefined for another unknown event type", () => {
     const e = event({ type: "server.heartbeat", properties: {} })
     expect(resolveEventSessionId(e, noLookup)).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// M3 mutation gate tests
+// ---------------------------------------------------------------------------
+
+describe("isMutatingMethod", () => {
+  it("treats POST/PUT/PATCH/DELETE as mutating", () => {
+    expect(isMutatingMethod("POST")).toBe(true)
+    expect(isMutatingMethod("PUT")).toBe(true)
+    expect(isMutatingMethod("PATCH")).toBe(true)
+    expect(isMutatingMethod("DELETE")).toBe(true)
+  })
+
+  it("treats GET/HEAD/OPTIONS as non-mutating", () => {
+    expect(isMutatingMethod("GET")).toBe(false)
+    expect(isMutatingMethod("HEAD")).toBe(false)
+    expect(isMutatingMethod("OPTIONS")).toBe(false)
+  })
+
+  it("is case-insensitive", () => {
+    expect(isMutatingMethod("post")).toBe(true)
+    expect(isMutatingMethod("Patch")).toBe(true)
+    expect(isMutatingMethod("get")).toBe(false)
+  })
+})
+
+describe("methodFromFetchArgs", () => {
+  it("reads method from a Request input", () => {
+    const req = new Request("http://x/", { method: "PATCH" })
+    expect(methodFromFetchArgs(req)).toBe("PATCH")
+  })
+
+  it("reads method from init when input is a string", () => {
+    expect(methodFromFetchArgs("http://x/", { method: "POST" })).toBe("POST")
+  })
+
+  it("reads method from init when input is a URL", () => {
+    expect(methodFromFetchArgs(new URL("http://x/"), { method: "DELETE" })).toBe("DELETE")
+  })
+
+  it("defaults to GET when neither carries a method", () => {
+    expect(methodFromFetchArgs("http://x/")).toBe("GET")
+    expect(methodFromFetchArgs("http://x/", {})).toBe("GET")
+  })
+})
+
+describe("createMutationTrackingFetch", () => {
+  function fakeResponse(status: number): Response {
+    return new Response("body", { status })
+  }
+
+  it("flips gate on a 2xx mutation response", async () => {
+    let count = 0
+    const baseFetch = (async () => fakeResponse(200)) as typeof fetch
+    const wrapped = createMutationTrackingFetch(baseFetch, () => count++)
+
+    await wrapped("http://x/", { method: "POST" })
+
+    expect(count).toBe(1)
+  })
+
+  it("does NOT flip gate on a 404 response — Rust never accepted the mutation", async () => {
+    // This is the M3 HIGH-2 regression: a missing route (e.g. PATCH
+    // /global/config before M5) used to permanently lock fallback even
+    // though Rust never touched state. The fix says "flip on 2xx only."
+    let count = 0
+    const baseFetch = (async () => fakeResponse(404)) as typeof fetch
+    const wrapped = createMutationTrackingFetch(baseFetch, () => count++)
+
+    await wrapped("http://x/", { method: "PATCH" })
+
+    expect(count).toBe(0)
+  })
+
+  it("does NOT flip gate on a 500 response — Rust crashed before persisting", async () => {
+    let count = 0
+    const baseFetch = (async () => fakeResponse(500)) as typeof fetch
+    const wrapped = createMutationTrackingFetch(baseFetch, () => count++)
+
+    await wrapped("http://x/", { method: "DELETE" })
+
+    expect(count).toBe(0)
+  })
+
+  it("does NOT flip gate on a network error (baseFetch throws)", async () => {
+    // A thrown fetch means we never even got a response, so Rust cannot
+    // have observed the mutation. The error must propagate untouched.
+    let count = 0
+    const networkError = new Error("ECONNREFUSED")
+    const baseFetch = (async () => {
+      throw networkError
+    }) as typeof fetch
+    const wrapped = createMutationTrackingFetch(baseFetch, () => count++)
+
+    await expect(wrapped("http://x/", { method: "POST" })).rejects.toBe(networkError)
+    expect(count).toBe(0)
+  })
+
+  it("does NOT flip gate on a 2xx GET — only mutating methods can flip", async () => {
+    let count = 0
+    const baseFetch = (async () => fakeResponse(200)) as typeof fetch
+    const wrapped = createMutationTrackingFetch(baseFetch, () => count++)
+
+    await wrapped("http://x/", { method: "GET" })
+
+    expect(count).toBe(0)
+  })
+
+  it("flips gate when SDK sends a Request object with method PATCH", async () => {
+    // The SDK normally constructs a `Request` rather than passing init —
+    // the helper has to read method off the Request, not init.
+    let count = 0
+    const baseFetch = (async () => fakeResponse(200)) as typeof fetch
+    const wrapped = createMutationTrackingFetch(baseFetch, () => count++)
+
+    await wrapped(new Request("http://x/", { method: "PATCH" }))
+
+    expect(count).toBe(1)
+  })
+
+  it("flips gate every successful mutation — caller (ServerManager) handles idempotence", async () => {
+    let count = 0
+    const baseFetch = (async () => fakeResponse(201)) as typeof fetch
+    const wrapped = createMutationTrackingFetch(baseFetch, () => count++)
+
+    await wrapped("http://x/", { method: "POST" })
+    await wrapped("http://x/", { method: "POST" })
+
+    // The wrapper itself does not memoize; ServerManager.markMutationAttempted
+    // short-circuits after the first call. The contract is "called at least
+    // once per successful mutation," not "called exactly once."
+    expect(count).toBe(2)
+  })
+
+  it("returns the response untouched (does not consume the body)", async () => {
+    // Reading response.ok doesn't consume the body, so callers can still
+    // parse JSON from it — verify by reading the body downstream.
+    const baseFetch = (async () =>
+      new Response(JSON.stringify({ ok: 1 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch
+    const wrapped = createMutationTrackingFetch(baseFetch, () => {})
+
+    const res = await wrapped("http://x/", { method: "POST" })
+    const body = await res.json()
+
+    expect(body).toEqual({ ok: 1 })
   })
 })

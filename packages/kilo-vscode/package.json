@@ -101,16 +101,6 @@
         "icon": "$(organization)"
       },
       {
-        "command": "kilo-code.new.kiloClawOpen",
-        "title": "KiloClaw",
-        "icon": "$(comment-discussion)"
-      },
-      {
-        "command": "kilo-code.new.marketplaceButtonClicked",
-        "title": "Marketplace",
-        "icon": "$(extensions)"
-      },
-      {
         "command": "kilo-code.new.historyButtonClicked",
         "title": "History",
         "icon": "$(history)"
@@ -377,16 +367,6 @@
         {
           "command": "kilo-code.new.agentManagerOpen",
           "group": "navigation@2",
-          "when": "view == kilo-code.SidebarProvider"
-        },
-        {
-          "command": "kilo-code.new.kiloClawOpen",
-          "group": "navigation@3",
-          "when": "view == kilo-code.SidebarProvider"
-        },
-        {
-          "command": "kilo-code.new.marketplaceButtonClicked",
-          "group": "navigation@4",
           "when": "view == kilo-code.SidebarProvider"
         },
         {
@@ -781,6 +761,21 @@
           "default": false,
           "description": "Load CLAUDE.md instructions and skills from your Claude Code configuration directory into Kilo sessions. Enable this if you want Kilo to use your Claude Code instructions and skills."
         },
+        "kilo-code.new.sidecarRuntime": {
+          "type": "string",
+          "default": "bun",
+          "enum": [
+            "bun",
+            "rust",
+            "auto"
+          ],
+          "enumDescriptions": [
+            "Use the existing bundled Bun sidecar.",
+            "Use the preview Rust sidecar and surface startup failures.",
+            "Try the preview Rust sidecar, then fall back to Bun only if startup fails before mutable requests."
+          ],
+          "description": "Select the VS Code backend sidecar runtime. Bun remains the default while the Rust sidecar is in preview. Can be overridden for development and CI with KILO_VSCODE_SIDECAR_RUNTIME."
+        },
         "kilo-code.new.browserAutomation.enabled": {
           "type": "boolean",
           "default": false,
@@ -927,7 +922,6 @@
     "quick-lru": "^7.0.0",
     "simple-git": "3.35.2",
     "solid-js": "^1.9.11",
-    "stream-chat": "9.38.0",
     "uri-js": "^4.4.1",
     "virtua": "catalog:",
     "web-tree-sitter": "^0.24.7",

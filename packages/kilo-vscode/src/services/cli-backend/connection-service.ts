@@ -3,7 +3,10 @@ import { ServerManager } from "./server-manager"
 import { createKiloClient, type KiloClient, type Event } from "@kilocode/sdk/v2/client"
 import { SdkSSEAdapter } from "./sdk-sse-adapter"
 import type { ServerConfig } from "./types"
-import { resolveEventSessionId as resolveEventSessionIdPure } from "./connection-utils"
+import {
+  resolveEventSessionId as resolveEventSessionIdPure,
+  createMutationTrackingFetch,
+} from "./connection-utils"
 
 export type ConnectionState = "connecting" | "connected" | "disconnected" | "error"
 type SSEEventListener = (event: Event, directory?: string) => void
@@ -574,13 +577,27 @@ export class KiloConnectionService {
 
     this.config = config
 
-    // Create SDK client with Basic Auth header
+    // Create SDK client with Basic Auth header.
+    //
+    // Wrap the SDK's fetch so that the M3 mutation gate flips only AFTER
+    // the sidecar accepts a mutation with a 2xx response. The earlier
+    // request-time flip locked fallback whenever Rust returned 4xx/5xx for
+    // a missing/erroring route, even though Rust never touched state. See
+    // `createMutationTrackingFetch` for the full contract.
     const authHeader = `Basic ${Buffer.from(`kilo:${server.password}`).toString("base64")}`
+    // Mirror the SDK's default fetch wrapper from
+    // `packages/sdk/js/src/v2/client.ts:47-56` (duplex/timeout overrides) so
+    // we don't change Bun semantics by injecting our own fetch.
+    const baseFetch: typeof fetch = (input, init) =>
+      fetch(input as any, { duplex: "half", timeout: false, ...(init ?? {}) } as any)
+    const sm = this.serverManager
+    const trackedFetch = createMutationTrackingFetch(baseFetch, () => sm.markMutationAttempted())
     this.client = createKiloClient({
       baseUrl: config.baseUrl,
       headers: {
         Authorization: authHeader,
       },
+      fetch: trackedFetch,
     })
 
     this.sseClient = new SdkSSEAdapter(this.client)

@@ -1,4 +1,5 @@
 import * as path from "path"
+import * as os from "os"
 import * as vscode from "vscode"
 import { buildPreviewPath, getPreviewCommand, getPreviewDir, parseImage, trimEntries } from "./image-preview"
 import { isAbsolutePath } from "./path-utils"
@@ -40,7 +41,6 @@ import { GitOps } from "./agent-manager/GitOps"
 import { GitStatsPoller, type LocalStats } from "./agent-manager/GitStatsPoller"
 import { diffSummary as localDiffSummary } from "./agent-manager/local-diff"
 import { getWorkspaceRoot } from "./review-utils"
-import { MarketplaceService, type MarketplaceItem, type RemoveResult } from "./services/marketplace"
 import type { RemoteStatusService } from "./services/RemoteStatusService"
 import { resolveProjectDirectory } from "./project-directory"
 import { getBusySessionCount, seedSessionStatuses } from "./session-status"
@@ -217,7 +217,6 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
 
   private ignoreController: FileIgnoreController | null = null
   private ignoreControllerDir: string | null = null
-  private marketplace: MarketplaceService | null = null
   private chatAutocomplete: ChatTextAreaAutocomplete | null = null
   private projectDirectory: string | null | undefined
   private slimEditMetadata = true
@@ -726,9 +725,6 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
         case "openConfigFile":
           await openConfig(message.scope, message.labels, this.getProjectDirectory(this.currentSession?.id))
           break
-        case "openMarketplacePanel":
-          vscode.commands.executeCommand("kilo-code.new.marketplaceButtonClicked", this.projectDirectory)
-          break
         case "openDiffVirtual":
           this.openDiffVirtual(message.diff, message.initialDiffStyle)
           break
@@ -1023,46 +1019,6 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
                 requestId: message.requestId,
               })
             })
-          break
-        }
-        case "fetchMarketplaceData": {
-          const workspace = this.getProjectDirectory(this.currentSession?.id)
-          const mp = this.getMarketplace()
-          // Fetch skills from CLI backend (authoritative source) so the
-          // marketplace doesn't need to duplicate the CLI's skill scanning.
-          const skills = await this.fetchCliSkills()
-          const data = await mp.fetchData(workspace, skills)
-          this.postMessage({ type: "marketplaceData", ...data })
-          break
-        }
-        case "filterMarketplaceItems": {
-          // Client-side filtering — no server action needed
-          break
-        }
-        case "installMarketplaceItem": {
-          const workspace = this.getProjectDirectory(this.currentSession?.id)
-          const scope = message.mpInstallOptions?.target ?? "project"
-          const result = await this.getMarketplace().install(message.mpItem, message.mpInstallOptions, workspace)
-          if (result.success) {
-            await this.invalidateAfterMarketplaceChange(scope)
-          }
-          this.postMessage({
-            type: "marketplaceInstallResult",
-            success: result.success,
-            slug: result.slug,
-            error: result.error,
-          })
-          break
-        }
-        case "removeInstalledMarketplaceItem": {
-          const scope = message.mpInstallOptions?.target ?? "project"
-          const result = await this.removeMarketplaceItem(message.mpItem, scope)
-          this.postMessage({
-            type: "marketplaceRemoveResult",
-            success: result.success,
-            slug: result.slug,
-            error: result.error,
-          })
           break
         }
       }
@@ -1799,18 +1755,6 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
     }
   }
 
-  private async fetchCliSkills(): Promise<Array<{ name: string; location: string }> | undefined> {
-    if (!this.client) return undefined
-    try {
-      const dir = this.getWorkspaceDirectory()
-      const { data } = await retry(() => this.client!.app.skills({ directory: dir }, { throwOnError: true }))
-      return data
-    } catch (error) {
-      console.error("[Kilo New] KiloProvider: Failed to fetch CLI skills for marketplace:", error)
-      return undefined
-    }
-  }
-
   /**
    * Remove a skill via the CLI backend (deletes from disk + clears cache), then refresh.
    * Returns true on success, false on failure.
@@ -1862,9 +1806,8 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
       // CLI removal failed — agent may be in kilo.json instead
     }
 
-    // 2. Try removing from kilo.json (handles marketplace-installed modes)
-    const stub = { id: name, type: "mode" as const, name, description: "", content: "" }
-    const removed = await this.removeMarketplaceItemFromAllScopes(stub)
+    // 2. Try removing from kilo.json config entries.
+    const removed = await this.removeConfigEntryFromAllScopes("agent", name)
     if (!removed) {
       console.error("[Kilo New] KiloProvider: Failed to remove mode:", name)
     }
@@ -1875,8 +1818,7 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
     // causes the CLI to re-read config without the legacy entry.
     await this.removeLegacyMcp(name)
 
-    const stub = { id: name, type: "mcp" as const, name, description: "", url: "", content: "" }
-    const removed = await this.removeMarketplaceItemFromAllScopes(stub)
+    const removed = await this.removeConfigEntryFromAllScopes("mcp", name)
     if (!removed) {
       console.error("[Kilo New] KiloProvider: Failed to remove MCP server:", name)
     }
@@ -1974,73 +1916,74 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
     }
   }
 
-  /**
-   * Remove a marketplace item from a single scope and invalidate CLI caches.
-   */
-  private async removeMarketplaceItem(item: MarketplaceItem, scope: "project" | "global"): Promise<RemoveResult> {
-    const workspace = this.getProjectDirectory(this.currentSession?.id)
-    const result = await this.getMarketplace().remove(item, scope, workspace)
-    if (result.success) {
-      await this.invalidateAfterMarketplaceChange(scope)
-    }
-    return result
-  }
-
-  /**
-   * Remove a marketplace item from both project and global scopes.
-   * mp.remove returns success even when the entry doesn't exist (no-op),
-   * so we must attempt both scopes to cover dual-scope installations.
-   * Returns true if at least one scope removal succeeded.
-   */
-  private async removeMarketplaceItemFromAllScopes(item: MarketplaceItem): Promise<boolean> {
-    const workspace = this.getProjectDirectory(this.currentSession?.id)
-    const mp = this.getMarketplace()
-    const project = await mp.remove(item, "project", workspace)
-    const global = await mp.remove(item, "global", workspace)
-
-    if (project.success || global.success) {
-      const scope = global.success ? "global" : "project"
-      await this.invalidateAfterMarketplaceChange(scope)
-      return true
-    }
-    return false
-  }
-
-  /**
-   * Invalidate CLI caches and refresh the webview after a marketplace install/remove.
-   *
-   * For global scope: uses global.config.update with the freshly-written config file
-   * contents rather than global.dispose. This goes through Config.updateGlobal() which
-   * calls Config.global.reset() to invalidate the lazy-cached global config, ensuring
-   * the newly installed/removed MCP entry is visible on the next config.get call.
-   * (global.dispose alone is not sufficient on older CLI versions that lack the
-   * Config.global.reset() call in the dispose handler.)
-   *
-   * For project scope: instance.dispose is sufficient because the per-instance
-   * Config.state is cleared and re-reads all files (including global) on next access.
-   */
-  private async invalidateAfterMarketplaceChange(scope: "project" | "global"): Promise<void> {
-    if (!this.client) return
+  private configPath(scope: "project" | "global"): string | null {
     if (scope === "global") {
-      // Use global.config.update with an empty config to trigger Config.updateGlobal()
-      // which calls Config.global.reset(). This invalidates the lazy-cached global
-      // config in the CLI process so it re-reads kilo.json from disk.
-      // An empty object merge is a no-op for the file content but resets the cache.
-      // (global.dispose alone is insufficient on older CLI versions that lack
-      // the Config.global.reset() call in the dispose handler.)
-      await this.client.global.config.update({ config: {} }).catch((e: unknown) => {
-        console.warn("[Kilo New] global.config.update after marketplace change failed:", e)
-      })
+      const root = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config")
+      return path.join(root, "kilo", "kilo.json")
     }
+
+    const workspace = this.getProjectDirectory(this.currentSession?.id)
+    if (!workspace) return null
+    return path.join(workspace, ".kilo", "kilo.json")
+  }
+
+  private async removeConfigEntry(kind: "agent" | "mcp", name: string, scope: "project" | "global"): Promise<boolean> {
+    const file = this.configPath(scope)
+    if (!file) return false
+
+    try {
+      const uri = vscode.Uri.file(file)
+      const bytes = await vscode.workspace.fs.readFile(uri).then(
+        (buf) => buf,
+        () => null,
+      )
+      if (!bytes) return false
+
+      const config = JSON.parse(Buffer.from(bytes).toString("utf8")) as Record<string, unknown>
+      const section = config[kind]
+      if (!section || typeof section !== "object" || Array.isArray(section) || !(name in section)) return false
+
+      const nextSection = { ...(section as Record<string, unknown>) }
+      delete nextSection[name]
+      const next = { ...config, [kind]: nextSection }
+      if (Object.keys(nextSection).length === 0) delete next[kind]
+
+      await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(file)))
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(next, null, 2) + "\n", "utf8"))
+      return true
+    } catch (err) {
+      console.warn(`[Kilo New] KiloProvider: Failed to remove ${kind} from ${scope} config:`, err)
+      return false
+    }
+  }
+
+  private async removeConfigEntryFromAllScopes(kind: "agent" | "mcp", name: string): Promise<boolean> {
+    const results = await Promise.all([
+      this.removeConfigEntry(kind, name, "project"),
+      this.removeConfigEntry(kind, name, "global"),
+    ])
+
+    if (!results.some(Boolean)) return false
+    await this.invalidateAfterConfigChange()
+    return true
+  }
+
+  private async invalidateAfterConfigChange(): Promise<void> {
+    if (!this.client) return
+
+    await this.client.global.config.update({ config: {} }).catch((e: unknown) => {
+      console.warn("[Kilo New] global.config.update after config change failed:", e)
+    })
     // Always dispose the per-project instance so it rebuilds state from
     // the (possibly updated) global + project config on the next request.
     const dir = this.getWorkspaceDirectory()
     await this.client.instance.dispose({ directory: dir }).catch((e: unknown) => {
-      console.warn("[Kilo New] instance.dispose() after marketplace change failed:", e)
+      console.warn("[Kilo New] instance.dispose() after config change failed:", e)
     })
     this.cachedAgentsMessage = null
     this.cachedConfigMessage = null
-    await Promise.all([this.fetchAndSendAgents(), this.fetchAndSendConfig()])
+    this.cachedMcpStatusMessage = null
+    await Promise.all([this.fetchAndSendAgents(), this.fetchAndSendConfig(), this.fetchAndSendMcpStatus()])
   }
 
   /**
@@ -3344,12 +3287,6 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
 
   // legacy-migration end ---------------------------------------------------------
 
-  private getMarketplace(): MarketplaceService {
-    if (this.marketplace) return this.marketplace
-    this.marketplace = new MarketplaceService()
-    return this.marketplace
-  }
-
   // ── Worktree stats polling (sidebar diff badge) ──────────────────
 
   private startStatsPolling(): void {
@@ -3414,6 +3351,6 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
     this.sessionStatusMap.clear()
     this.ignoreController?.dispose()
     this.chatAutocomplete?.dispose()
-    ;(this.marketplace?.dispose(), disposeGitChangesTarget())
+    disposeGitChangesTarget()
   }
 }

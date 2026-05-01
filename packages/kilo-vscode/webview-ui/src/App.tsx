@@ -20,7 +20,6 @@ import { IndexingProvider } from "./context/indexing"
 import { SessionProvider, useSession } from "./context/session"
 import { LanguageProvider } from "./context/language"
 import { ChatView } from "./components/chat"
-import { MarketplaceView } from "./components/marketplace"
 import { registerExpandedTaskTool } from "./components/chat/TaskToolExpanded"
 import { registerVscodeToolOverrides } from "./components/chat/VscodeToolOverrides"
 
@@ -35,8 +34,8 @@ import { NotificationsProvider } from "./context/notifications"
 import type { Message as SDKMessage, Part as SDKPart } from "@kilocode/sdk/v2"
 import "./styles/chat.css"
 
-type ViewType = "newTask" | "marketplace" | "history" | "profile" | "settings" | "subAgentViewer"
-const VALID_VIEWS = new Set<string>(["newTask", "marketplace", "history", "profile", "settings", "subAgentViewer"])
+type ViewType = "newTask" | "history" | "profile" | "settings" | "subAgentViewer"
+const VALID_VIEWS = new Set<string>(["newTask", "history", "profile", "settings", "subAgentViewer"])
 
 /**
  * Bridge our session store to the DataProvider's expected Data shape.
@@ -194,9 +193,6 @@ const AppContent: Component = () => {
         window.dispatchEvent(new CustomEvent("newTaskRequest"))
         setCurrentView("newTask")
         break
-      case "marketplaceButtonClicked":
-        setCurrentView("marketplace")
-        break
       case "historyButtonClicked":
         setCurrentView("history")
         break
@@ -298,9 +294,6 @@ const AppContent: Component = () => {
                 continueInWorktree
                 promptBoxId="sidebar:new-task"
               />
-            </Match>
-            <Match when={currentView() === "marketplace"}>
-              <MarketplaceView />
             </Match>
             <Match when={currentView() === "history"}>
               <HistoryView onSelectSession={handleSelectSession} onBack={() => setCurrentView("newTask")} />

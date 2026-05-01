@@ -2,15 +2,24 @@ import { type ChildProcess } from "child_process"
 import { spawn } from "../../util/process"
 import * as crypto from "crypto"
 import * as fs from "fs"
-import * as path from "path"
 import * as vscode from "vscode"
 import { t } from "./i18n"
 import { parseServerPort } from "./server-utils"
+import { resolveSidecar, type SidecarCandidate, type SidecarKind, type SidecarPlan } from "./sidecar-runtime"
+
+function describeError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message
+  }
+  return String(error)
+}
 
 export interface ServerInstance {
   port: number
   password: string
   process: ChildProcess
+  /** Which sidecar runtime is actually running (after any auto-fallback). */
+  runtime: SidecarKind
 }
 
 const STARTUP_TIMEOUT_SECONDS = 30
@@ -19,7 +28,44 @@ export class ServerManager {
   private instance: ServerInstance | null = null
   private startupPromise: Promise<ServerInstance> | null = null
 
+  /**
+   * Set to `true` the first time the host has issued a mutating SDK request
+   * against the running sidecar. While this flag is `false`, an `auto`-mode
+   * Rust startup failure is allowed to fall back to Bun. Once `true`,
+   * fallback is forbidden — falling back after Rust may have observed
+   * mutations would silently lose state.
+   *
+   * Wired by `KiloConnectionService`: the SDK fetch wrapper calls
+   * {@link markMutationAttempted} on every POST/PUT/PATCH/DELETE.
+   */
+  private hasAttemptedMutation = false
+
   constructor(private readonly context: vscode.ExtensionContext) {}
+
+  /**
+   * Mark that a mutating SDK request has been observed against this
+   * sidecar. After this is called, automatic fallback from Rust to Bun is
+   * disabled and a Rust startup or runtime failure is surfaced.
+   *
+   * Called from the SDK fetch wrapper in `KiloConnectionService` on every
+   * POST/PUT/PATCH/DELETE — that is the contract path the SDK takes for
+   * mutating routes. Idempotent and cheap.
+   */
+  markMutationAttempted(): void {
+    if (this.hasAttemptedMutation) {
+      return
+    }
+    this.hasAttemptedMutation = true
+    console.log("[Kilo New] ServerManager: ✏️ Mutation observed — auto-fallback disabled for the rest of this session")
+  }
+
+  /**
+   * Whether mutation has been observed since the current sidecar was
+   * started. Exposed for diagnostics and tests.
+   */
+  hasObservedMutation(): boolean {
+    return this.hasAttemptedMutation
+  }
 
   /**
    * Get or start the server instance
@@ -40,7 +86,10 @@ export class ServerManager {
     this.startupPromise = this.startServer()
     try {
       this.instance = await this.startupPromise
-      console.log("[Kilo New] ServerManager: ✅ Server started successfully:", { port: this.instance.port })
+      console.log("[Kilo New] ServerManager: ✅ Server started successfully:", {
+        port: this.instance.port,
+        runtime: this.instance.runtime,
+      })
       return this.instance
     } finally {
       this.startupPromise = null
@@ -48,9 +97,61 @@ export class ServerManager {
   }
 
   private async startServer(): Promise<ServerInstance> {
+    const plan = resolveSidecar(this.context)
+    console.log("[Kilo New] ServerManager: 🧭 Sidecar plan:", {
+      requested: plan.requested,
+      candidates: plan.candidates.map((c) => ({ runtime: c.runtime, path: c.path })),
+    })
+
+    return await this.tryCandidates(plan)
+  }
+
+  /**
+   * Walk the resolver's candidate list, honoring fallback rules:
+   *
+   * - `requested === "bun"` or `"rust"`: only that single candidate is
+   *   tried; failure is surfaced.
+   * - `requested === "auto"`: candidates are tried in order. Fallback to
+   *   the next candidate is only allowed when (a) the current candidate is
+   *   the Rust sidecar and (b) `hasAttemptedMutation` is `false`. Bun
+   *   failure is always surfaced.
+   *
+   * The fallback gate is conservative: once `hasAttemptedMutation` flips,
+   * we never silently swap to a different process again.
+   */
+  private async tryCandidates(plan: SidecarPlan): Promise<ServerInstance> {
+    const errors: Array<{ candidate: SidecarCandidate; error: unknown }> = []
+    for (let i = 0; i < plan.candidates.length; i++) {
+      const candidate = plan.candidates[i]!
+      const isLast = i === plan.candidates.length - 1
+      try {
+        return await this.spawnCandidate(candidate)
+      } catch (error) {
+        errors.push({ candidate, error })
+        const fallbackAllowed =
+          plan.requested === "auto" &&
+          candidate.runtime === "rust" &&
+          !this.hasAttemptedMutation &&
+          !isLast
+        if (!fallbackAllowed) {
+          throw error
+        }
+        console.warn(
+          `[Kilo New] ServerManager: ⤵️ Rust sidecar failed to start (${describeError(error)}); falling back to next candidate`,
+        )
+      }
+    }
+    // Should be unreachable: the loop always either returns or throws.
+    throw new ServerStartupError(
+      "No sidecar candidate succeeded",
+      errors.map((e) => `${e.candidate.runtime}@${e.candidate.path}: ${describeError(e.error)}`).join("\n"),
+    )
+  }
+
+  private async spawnCandidate(candidate: SidecarCandidate): Promise<ServerInstance> {
     const password = crypto.randomBytes(32).toString("hex")
-    const cliPath = this.getCliPath()
-    console.log("[Kilo New] ServerManager: 📍 CLI path:", cliPath)
+    const cliPath = candidate.path
+    console.log("[Kilo New] ServerManager: 📍 CLI path:", cliPath, "(runtime:", candidate.runtime + ")")
     console.log("[Kilo New] ServerManager: 🔐 Generated password (length):", password.length)
 
     // Verify the CLI binary exists
@@ -65,11 +166,11 @@ export class ServerManager {
     console.log("[Kilo New] ServerManager: 📄 CLI mode (octal):", (stat.mode & 0o777).toString(8))
 
     return new Promise((resolve, reject) => {
-      console.log("[Kilo New] ServerManager: 🎬 Spawning CLI process:", cliPath, ["serve", "--port", "0"])
+      console.log("[Kilo New] ServerManager: 🎬 Spawning CLI process:", cliPath, candidate.args)
       const claudeCompat = vscode.workspace.getConfiguration("kilo-code.new").get<boolean>("claudeCodeCompat", false)
       // Pin cwd so the CLI doesn't inherit the extension host's cwd ("/" under F5 debug)
       const spawnCwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.env.HOME ?? require("os").homedir()
-      const serverProcess = spawn(cliPath, ["serve", "--port", "0"], {
+      const serverProcess = spawn(cliPath, candidate.args, {
         cwd: spawnCwd,
         env: {
           ...process.env,
@@ -110,7 +211,7 @@ export class ServerManager {
         if (port !== null && !resolved) {
           resolved = true
           console.log("[Kilo New] ServerManager: 🎯 Port detected:", port)
-          resolve({ port, password, process: serverProcess })
+          resolve({ port, password, process: serverProcess, runtime: candidate.runtime })
         }
       })
 
@@ -155,14 +256,6 @@ export class ServerManager {
         }
       }, STARTUP_TIMEOUT_SECONDS * 1000)
     })
-  }
-
-  private getCliPath(): string {
-    // Always use the bundled binary from the extension directory
-    const binName = process.platform === "win32" ? "kilo.exe" : "kilo"
-    const cliPath = path.join(this.context.extensionPath, "bin", binName)
-    console.log("[Kilo New] ServerManager: 📦 Using CLI path:", cliPath)
-    return cliPath
   }
 
   /**

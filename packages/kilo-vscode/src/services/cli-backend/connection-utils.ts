@@ -1,6 +1,82 @@
 import type { Event } from "@kilocode/sdk/v2/client"
 
 /**
+ * The HTTP methods that count as a "mutation" for the M3 fallback gate.
+ * Any of these on the SDK fetch path means the sidecar may have observed
+ * state, so silently switching processes after a successful one would risk
+ * losing or duplicating that state.
+ *
+ * GET/HEAD/OPTIONS are the only safe-by-default methods. Everything else
+ * (POST/PUT/PATCH/DELETE) is treated as a mutation candidate.
+ */
+const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"])
+
+export function isMutatingMethod(method: string): boolean {
+  return MUTATING_METHODS.has(method.toUpperCase())
+}
+
+/**
+ * Resolve the HTTP method from a `fetch(input, init)` call. The SDK passes
+ * a `Request` instance for SDK-driven calls (method on the Request); the
+ * `(string|URL)` form carries the verb in `init.method`. Defaults to GET
+ * when neither is present, matching the WHATWG fetch default.
+ */
+export function methodFromFetchArgs(input: RequestInfo | URL, init?: RequestInit): string {
+  if (typeof input === "object" && input !== null && "method" in (input as any)) {
+    return (input as Request).method
+  }
+  return init?.method ?? "GET"
+}
+
+/**
+ * Wrap a `fetch` so that the M3 mutation gate (`onMutationObserved`) flips
+ * exactly once, **after** the sidecar has accepted a mutation by responding
+ * with a 2xx status — never on the request side.
+ *
+ * The earlier implementation (`packages/kilo-vscode/src/services/cli-backend/
+ * connection-service.ts` pre-fix) flipped the gate on the request method
+ * alone, before the response was known. That made any Rust route returning
+ * 4xx (e.g. unregistered `PATCH /global/config` before M5) permanently lock
+ * fallback to a broken Rust process: the SDK error never persisted state,
+ * but the gate had already flipped.
+ *
+ * Behavior:
+ *
+ * - Mutating method (POST/PUT/PATCH/DELETE) **with** a 2xx response →
+ *   `onMutationObserved()` is called once. Streaming routes (e.g.
+ *   `POST /session/{id}/prompt_async`) flip on the initial 200 OK headers,
+ *   which is correct: by then Rust has accepted the prompt.
+ * - Mutating method with a 3xx/4xx/5xx response → gate is **not** flipped.
+ *   Rust did not accept the mutation, so falling back stays safe.
+ * - Mutating method with a network error (baseFetch throws) → gate is
+ *   **not** flipped, error is re-thrown. Same reasoning: no acceptance.
+ * - GET/HEAD/OPTIONS regardless of status → gate is **not** flipped.
+ *
+ * The returned function preserves the standard `fetch` signature so it can
+ * be passed directly to `createKiloClient({ fetch })`.
+ *
+ * @param baseFetch The underlying fetch (typically the SDK's
+ *   duplex/timeout-aware wrapper).
+ * @param onMutationObserved Called once per successful mutation. Idempotent
+ *   responsibility lives with the caller (`ServerManager.markMutationAttempted`
+ *   already short-circuits on repeats), but the wrapper itself does not
+ *   memoize, so each successful mutation triggers a callback.
+ */
+export function createMutationTrackingFetch(
+  baseFetch: typeof fetch,
+  onMutationObserved: () => void,
+): typeof fetch {
+  return async (input, init) => {
+    const method = methodFromFetchArgs(input, init)
+    const response = await baseFetch(input, init)
+    if (isMutatingMethod(method) && response.ok) {
+      onMutationObserved()
+    }
+    return response
+  }
+}
+
+/**
  * Pure session ID resolution for SSE events.
  * The lookupMessageSessionId callback is used for message.part.updated fallback lookup,
  * and onMessageUpdated is called when message.updated is encountered so the caller can

@@ -1,7 +1,6 @@
 import type { ProviderAuthAuthorization, ProviderAuthMethod } from "@kilocode/sdk/v2/client"
 import type { PartBatch, PartUpdate } from "../../../../src/shared/stream-messages"
 import type { SessionMode } from "../../context/worktree-mode"
-import type { MarketplaceItem, MarketplaceInstalledMetadata } from "../marketplace"
 import type { ConnectionState, ServerInfo, SessionStatus } from "./connection"
 import type { FileAttachment, Part } from "./parts"
 import type { CloudSessionInfo, Message, MessageLoadMode, SessionInfo } from "./sessions"
@@ -267,7 +266,7 @@ export interface DeviceAuthCancelledMessage {
 
 export interface NavigateMessage {
   type: "navigate"
-  view: "newTask" | "marketplace" | "history" | "profile" | "settings" | "subAgentViewer"
+  view: "newTask" | "history" | "profile" | "settings" | "subAgentViewer"
   tab?: string
 }
 
@@ -725,31 +724,6 @@ export interface ExtensionDataReadyMessage {
   type: "extensionDataReady"
 }
 
-// ============================================
-// Marketplace Messages
-// ============================================
-
-export interface MarketplaceDataMessage {
-  type: "marketplaceData"
-  marketplaceItems: MarketplaceItem[]
-  marketplaceInstalledMetadata: MarketplaceInstalledMetadata
-  errors?: string[]
-}
-
-export interface MarketplaceInstallResultMessage {
-  type: "marketplaceInstallResult"
-  success: boolean
-  slug: string
-  error?: string
-}
-
-export interface MarketplaceRemoveResultMessage {
-  type: "marketplaceRemoveResult"
-  success: boolean
-  slug: string
-  error?: string
-}
-
 export interface ProviderOAuthReadyMessage {
   type: "providerOAuthReady"
   requestId: string
@@ -917,9 +891,6 @@ export type ExtensionMessage =
   | DiffViewerDiffsMessage
   | DiffViewerLoadingMessage
   | DiffViewerRevertFileResultMessage
-  | MarketplaceDataMessage
-  | MarketplaceInstallResultMessage
-  | MarketplaceRemoveResultMessage
   | ProviderOAuthReadyMessage
   | ProviderConnectedMessage
   | ProviderDisconnectedMessage

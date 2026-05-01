@@ -4,18 +4,16 @@ import { resolvePanelProjectDirectory } from "./project-directory"
 import type { KiloConnectionService } from "./services/cli-backend"
 import type { RemoteStatusService } from "./services/RemoteStatusService"
 
-type PanelView = "settings" | "profile" | "marketplace" | "indexing"
+type PanelView = "settings" | "profile" | "indexing"
 
 const PANEL_TITLES: Record<PanelView, string> = {
   settings: "Kilo Settings",
   profile: "Kilo Profile",
-  marketplace: "Kilo Marketplace",
   indexing: "Codebase Indexing",
 }
 
 /**
- * Opens Settings, Profile, or Marketplace as an editor-area WebviewPanel,
- * keeping the sidebar chat undisturbed.
+ * Opens Settings or Profile as an editor-area WebviewPanel, keeping the sidebar chat undisturbed.
  *
  * Each view type is a singleton panel — calling openPanel() again
  * reveals the existing panel instead of creating a duplicate.

@@ -56,7 +56,6 @@ const AgentBehaviourTab: Component = () => {
   const [newSkillUrl, setNewSkillUrl] = createSignal("")
   const [newInstruction, setNewInstruction] = createSignal("")
   const [claudeCompat, setClaudeCompat] = createSignal(false)
-  const browse = () => vscode.postMessage({ type: "openMarketplacePanel" })
 
   // Load the VS Code setting for Claude Code compatibility
   vscode.postMessage({ type: "requestClaudeCompatSetting" })
@@ -324,9 +323,6 @@ const AgentBehaviourTab: Component = () => {
             <Button variant="ghost" size="small" onClick={triggerImport}>
               {language.t("settings.agentBehaviour.importMode")}
             </Button>
-            <Button variant="ghost" size="small" onClick={browse}>
-              {language.t("settings.agentBehaviour.mcpBrowseMarketplace")}
-            </Button>
             <Button variant="secondary" size="small" onClick={() => setAgentView("create")}>
               {language.t("settings.agentBehaviour.createMode")}
             </Button>
@@ -572,18 +568,6 @@ const AgentBehaviourTab: Component = () => {
 
     return (
       <div>
-        <div
-          style={{
-            display: "flex",
-            "align-items": "center",
-            "justify-content": "flex-end",
-            "margin-bottom": "8px",
-          }}
-        >
-          <Button variant="secondary" size="small" onClick={browse}>
-            {language.t("settings.agentBehaviour.mcpBrowseMarketplace")}
-          </Button>
-        </div>
         <Show
           when={mcpEntries().length > 0}
           fallback={
@@ -787,18 +771,6 @@ const AgentBehaviourTab: Component = () => {
 
   const renderSkillsSubtab = () => (
     <div>
-      <div
-        style={{
-          display: "flex",
-          "align-items": "center",
-          "justify-content": "flex-end",
-          "margin-bottom": "8px",
-        }}
-      >
-        <Button variant="secondary" size="small" onClick={browse}>
-          {language.t("settings.agentBehaviour.mcpBrowseMarketplace")}
-        </Button>
-      </div>
       {/* Discovered skills */}
       <h4 style={{ "margin-top": "0", "margin-bottom": "8px" }}>
         {language.t("settings.agentBehaviour.discoveredSkills")}
