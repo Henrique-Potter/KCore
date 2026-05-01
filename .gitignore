@@ -46,6 +46,10 @@ tsconfig.tsbuildinfo
 
 # Kilo
 .kilo/plans/*upstream-merge-report-*.md
+.kilo/agent-manager.json
+
+# VSIX build artifacts
+packages/kilo-vscode/*.vsix
 
 # Test Artifacts
 packages/app/.artifacts/
