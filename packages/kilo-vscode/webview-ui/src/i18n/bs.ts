@@ -451,15 +451,6 @@ export const dict = {
 
   "error.startup.title": "Povezivanje sa serverom nije uspjelo",
 
-  "error.paidModel.title": "Morate se prijaviti da biste koristili ovaj model",
-  "error.paidModel.description":
-    "Prijavite se ili kreirajte račun za pristup preko 500 modela, koristite kredite po cijeni koštanja ili donesite vlastiti ključ.",
-  "error.paidModel.action": "Prijava",
-  "error.promotionLimit.title": "Morate se registrovati da biste nastavili",
-  "error.promotionLimit.description":
-    "Registrujte se besplatno da nastavite i istražite preko 500 modela. Traje 2 minute, bez kreditne kartice. Ili se vratite kasnije.",
-  "error.promotionLimit.action": "Registracija",
-
   "error.chain.unknown": "Nepoznata greška",
   "error.chain.causedBy": "Uzrok:",
   "error.chain.apiError": "API greška",
@@ -807,7 +798,6 @@ export const dict = {
   "settings.providers.section.popular": "Popularni provajderi",
   "settings.providers.search.placeholder": "Pretraži provajdere",
   "settings.providers.select.placeholder": "Odaberi provajdera...",
-  "settings.providers.tag.gateway": "Gateway",
   "settings.providers.tag.environment": "Okruženje",
   "settings.providers.tag.config": "Konfiguracija",
   "settings.providers.tag.chatgpt": "ChatGPT",
@@ -986,21 +976,11 @@ export const dict = {
   "session.showHistory": "Prikaži historiju",
   "session.search.placeholder": "Pretraži sesije...",
   "session.empty": "Još nema sesija. Kliknite + za početak novog razgovora.",
-  "session.tab.local": "Lokalno",
-  "session.tab.cloud": "Oblak",
-  "session.cloud.repoOnly": "Samo ovaj repozitorij",
-  "session.cloud.import": "Uvezi iz oblaka",
   "feedback.button": "Povratne informacije i podrška",
   "feedback.dialog.message": "Voljeli bismo čuti vaše povratne informacije ili pomoći s problemima koje doživljavate.",
   "feedback.dialog.github": "Prijavite problem na GitHubu",
   "feedback.dialog.discord": "Pridružite se našoj Discord zajednici",
   "feedback.dialog.support": "Korisnička podrška",
-  "session.cloud.import.title": "Uvezi iz oblaka",
-  "session.cloud.import.placeholder": "ID sesije, URL ili kilo import naredba",
-  "session.cloud.import.button": "Uvezi",
-  "session.cloud.import.invalid": "Neispravan format ID-a sesije",
-  "session.cloud.import.legacy": "Čini se da je ovo zastarjela sesija koja više nije podržana.",
-  "session.cloud.import.failed": "Uvoz sesije iz oblaka nije uspio",
 
   "workspace.new": "Novi radni prostor",
   "workspace.type.local": "lokalno",
@@ -1028,36 +1008,8 @@ export const dict = {
   "workspace.reset.archived.many": "Biće arhivirano {{count}} sesija.",
   "workspace.reset.note": "Ovo će resetovati radni prostor da odgovara podrazumijevanoj grani.",
 
-  "deviceAuth.toast.urlCopied": "URL kopiran u međuspremnik",
-  "deviceAuth.toast.codeCopied": "Kod kopiran u međuspremnik",
-  "deviceAuth.toast.errorCopied": "Greška kopirana u međuspremnik",
-  "deviceAuth.status.initiating": "Pokretanje prijave...",
-  "deviceAuth.title": "Prijavite se u Kilo Code",
-  "deviceAuth.step1": "Korak 1: Otvorite ovaj URL",
-  "deviceAuth.action.copyUrl": "Kopiraj URL",
-  "deviceAuth.action.openBrowser": "Otvori preglednik",
-  "deviceAuth.qrCode.alt": "QR kod",
-  "deviceAuth.step2": "Korak 2: Unesite ovaj kod",
-  "deviceAuth.action.clickToCopy": "Kliknite za kopiranje",
-  "deviceAuth.status.waiting": "Čekanje na autorizaciju...",
-  "deviceAuth.status.success": "Prijava uspješna!",
-  "deviceAuth.status.failed": "Prijava neuspješna",
-  "deviceAuth.error.detailsTitle": "Detalji greške pri prijavi",
-  "deviceAuth.status.cancelled": "Prijava otkazana",
-  "deviceAuth.action.tryAgain": "Pokušajte ponovo",
-  "deviceAuth.action.copyError": "Kopiraj grešku",
-  "deviceAuth.action.showDetails": "Prikaži detalje",
-
   "common.retry": "Pokušaj ponovo",
   "common.refresh": "Osvježi",
-
-  "profile.title": "Profil",
-  "profile.notLoggedIn": "Niste prijavljeni",
-  "profile.action.login": "Prijavite se putem Kilo Code",
-  "profile.balance.title": "Stanje",
-  "profile.balance.refresh": "Osvježi stanje",
-  "profile.action.dashboard": "Kontrolna ploča",
-  "profile.action.logout": "Odjava",
 
   "settings.section.configuration": "Konfiguracija",
   "settings.agentBehaviour.title": "Ponašanje agenta",
@@ -1333,7 +1285,6 @@ export const dict = {
   "settings.agentBehaviour.mcpDetail.args": "Argumenti",
   "settings.agentBehaviour.mcpDetail.env": "Okruženje",
   "settings.agentBehaviour.mcpDetail.disabled": "Ovaj server je onemogućen.",
-  "settings.agentBehaviour.mcpBrowseMarketplace": "Pregledaj Marketplace",
   "settings.agentBehaviour.mcpEmpty":
     "Nema konfiguriranih MCP servera. Dodajte MCP servere u kilo.jsonc ili zamolite agenta da ih doda.",
   "settings.agentBehaviour.workflowsPlaceholder": "Tokovi rada se upravljaju putem datoteka tokova rada.",
@@ -1419,8 +1370,6 @@ export const dict = {
   "settings.providers.enabled.description": "Ako je postavljeno, samo ovi pružatelji će biti dostupni",
   "settings.providers.notSet": "Nije postavljeno (koristi zadano servera)",
   "dialog.model.notSet": "Nije postavljeno",
-  "profile.personalAccount": "Osobni račun",
-  "profile.switchingAccount": "Prebacivanje računa…",
 
   // Agent Manager strings live in webview-ui/agent-manager/i18n/bs.ts
 
@@ -1530,8 +1479,4 @@ export const dict = {
   "settings.saveBar.cancel": "Otkaži",
   "settings.saveBar.saving": "Spremanje…",
   "settings.saveBar.saveFailed": "Postavke nije moguće spremiti",
-  "notifications.action.next": "Sljedeći",
-  "notifications.action.close": "Zatvori",
-  "notifications.action.tryModel": "Probaj {{model}}",
-  "notifications.action.tryModelGeneric": "Probaj model",
 }

@@ -1,0 +1,17 @@
+data: {"type":"response.created","response":{"id":"resp_redacted_tool","object":"response","created_at":1710000000,"status":"in_progress","model":"gpt-5.1-codex"}}
+
+data: {"type":"response.output_text.delta","item_id":"msg_redacted","output_index":0,"content_index":0,"delta":"I'll inspect "}
+
+data: {"type":"response.output_text.delta","item_id":"msg_redacted","output_index":0,"content_index":0,"delta":"the file."}
+
+data: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_redacted","type":"function_call","call_id":"call_read_note","name":"read","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":1,"call_id":"call_read_note","name":"read","delta":"{\"filePath\":"}
+
+data: {"type":"response.function_call_arguments.delta","output_index":1,"call_id":"call_read_note","delta":"\"repo/note.txt\",\"limit\":20}"}
+
+data: {"type":"response.function_call_arguments.done","output_index":1,"call_id":"call_read_note","name":"read"}
+
+data: {"type":"response.completed","response":{"id":"resp_redacted_tool","status":"completed","usage":{"input_tokens":111,"output_tokens":22,"total_tokens":133}}}
+
+data: [DONE]

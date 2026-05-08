@@ -1,6 +1,6 @@
 import type { Session, Agent, Event, ProviderListResponse } from "@kilocode/sdk/v2/client"
 import { prettifyError } from "zod/v4"
-import type { CloudSessionMessage, IndexingStatus } from "./services/cli-backend/types"
+import type { IndexingStatus } from "./services/cli-backend/types"
 import type { PartBatch, PartUpdate } from "./kilo-provider/session-stream-scheduler"
 
 export { SessionStreamScheduler } from "./kilo-provider/session-stream-scheduler"
@@ -557,21 +557,6 @@ export function mapSSEEventToWebviewMessage(event: Event, sessionID: string | un
       }
     default:
       return null
-  }
-}
-
-export function mapCloudSessionMessageToWebviewMessage(message: CloudSessionMessage) {
-  return {
-    id: message.info.id,
-    sessionID: message.info.sessionID,
-    role: message.info.role as "user" | "assistant",
-    parts: message.parts,
-    createdAt: message.info.time?.created
-      ? new Date(message.info.time.created).toISOString()
-      : new Date().toISOString(),
-    time: message.info.time,
-    cost: message.info.cost,
-    tokens: message.info.tokens,
   }
 }
 

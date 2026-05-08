@@ -444,15 +444,6 @@ export const dict = {
 
   "error.startup.title": "فشل الاتصال بالخادم",
 
-  "error.paidModel.title": "يجب عليك تسجيل الدخول لاستخدام هذا النموذج",
-  "error.paidModel.description":
-    "سجّل الدخول أو أنشئ حسابًا للوصول إلى أكثر من 500 نموذج، واستخدم الرصيد بسعر التكلفة، أو استخدم مفتاحك الخاص.",
-  "error.paidModel.action": "تسجيل الدخول",
-  "error.promotionLimit.title": "يجب عليك التسجيل للمتابعة",
-  "error.promotionLimit.description":
-    "سجّل مجانًا للمتابعة واستكشاف أكثر من 500 نموذج. يستغرق دقيقتين، بدون بطاقة ائتمان. أو عُد لاحقًا.",
-  "error.promotionLimit.action": "التسجيل",
-
   "error.chain.unknown": "خطأ غير معروف",
   "error.chain.causedBy": "بسبب:",
   "error.chain.apiError": "خطأ API",
@@ -764,7 +755,6 @@ export const dict = {
   "settings.providers.section.popular": "الموفرون الشائعون",
   "settings.providers.search.placeholder": "البحث عن موفرين",
   "settings.providers.select.placeholder": "اختر موفرًا...",
-  "settings.providers.tag.gateway": "Gateway",
   "settings.providers.tag.environment": "البيئة",
   "settings.providers.tag.config": "التكوين",
   "settings.providers.tag.chatgpt": "ChatGPT",
@@ -939,21 +929,11 @@ export const dict = {
   "session.showHistory": "عرض السجل",
   "session.search.placeholder": "البحث في الجلسات...",
   "session.empty": "لا توجد جلسات بعد. انقر + لبدء محادثة جديدة.",
-  "session.tab.local": "محلي",
-  "session.tab.cloud": "السحابة",
-  "session.cloud.repoOnly": "هذا المستودع فقط",
-  "session.cloud.import": "استيراد من السحابة",
   "feedback.button": "التغذية الراجعة والدعم",
   "feedback.dialog.message": "يسعدنا سماع تعليقاتك أو مساعدتك في حل أي مشكلات تواجهها.",
   "feedback.dialog.github": "الإبلاغ عن مشكلة على GitHub",
   "feedback.dialog.discord": "الانضمام إلى مجتمع Discord",
   "feedback.dialog.support": "دعم العملاء",
-  "session.cloud.import.title": "استيراد من السحابة",
-  "session.cloud.import.placeholder": "معرّف الجلسة أو الرابط أو أمر kilo import",
-  "session.cloud.import.button": "استيراد",
-  "session.cloud.import.invalid": "تنسيق معرّف الجلسة غير صالح",
-  "session.cloud.import.legacy": "يبدو أن هذه جلسة قديمة لم تعد مدعومة.",
-  "session.cloud.import.failed": "فشل استيراد جلسة السحابة",
 
   "workspace.new": "مساحة عمل جديدة",
   "workspace.type.local": "محلي",
@@ -981,36 +961,8 @@ export const dict = {
   "workspace.reset.archived.many": "ستتم أرشفة {{count}} جلسات.",
   "workspace.reset.note": "سيؤدي هذا إلى إعادة تعيين مساحة العمل لتتطابق مع الفرع الافتراضي.",
 
-  "deviceAuth.toast.urlCopied": "تم نسخ الرابط إلى الحافظة",
-  "deviceAuth.toast.codeCopied": "تم نسخ الرمز إلى الحافظة",
-  "deviceAuth.toast.errorCopied": "تم نسخ الخطأ إلى الحافظة",
-  "deviceAuth.status.initiating": "جارٍ بدء تسجيل الدخول...",
-  "deviceAuth.title": "تسجيل الدخول إلى Kilo Code",
-  "deviceAuth.step1": "الخطوة 1: افتح هذا الرابط",
-  "deviceAuth.action.copyUrl": "نسخ الرابط",
-  "deviceAuth.action.openBrowser": "فتح المتصفح",
-  "deviceAuth.qrCode.alt": "رمز QR",
-  "deviceAuth.step2": "الخطوة 2: أدخل هذا الرمز",
-  "deviceAuth.action.clickToCopy": "انقر للنسخ",
-  "deviceAuth.status.waiting": "في انتظار التفويض...",
-  "deviceAuth.status.success": "تم تسجيل الدخول بنجاح!",
-  "deviceAuth.status.failed": "فشل تسجيل الدخول",
-  "deviceAuth.error.detailsTitle": "تفاصيل خطأ تسجيل الدخول",
-  "deviceAuth.status.cancelled": "تم إلغاء تسجيل الدخول",
-  "deviceAuth.action.tryAgain": "حاول مرة أخرى",
-  "deviceAuth.action.copyError": "نسخ الخطأ",
-  "deviceAuth.action.showDetails": "عرض التفاصيل",
-
   "common.retry": "إعادة المحاولة",
   "common.refresh": "تحديث",
-
-  "profile.title": "الملف الشخصي",
-  "profile.notLoggedIn": "لم يتم تسجيل الدخول",
-  "profile.action.login": "تسجيل الدخول باستخدام Kilo Code",
-  "profile.balance.title": "الرصيد",
-  "profile.balance.refresh": "تحديث الرصيد",
-  "profile.action.dashboard": "لوحة التحكم",
-  "profile.action.logout": "تسجيل الخروج",
 
   "settings.section.configuration": "الإعدادات",
   "settings.agentBehaviour.title": "سلوك الوكيل",
@@ -1305,7 +1257,6 @@ export const dict = {
   "settings.agentBehaviour.mcpDetail.args": "الوسائط",
   "settings.agentBehaviour.mcpDetail.env": "البيئة",
   "settings.agentBehaviour.mcpDetail.disabled": "هذا الخادم معطّل.",
-  "settings.agentBehaviour.mcpBrowseMarketplace": "تصفح Marketplace",
   "settings.agentBehaviour.mcpEmpty":
     "لم يتم تهيئة خوادم MCP. أضف خوادم MCP في kilo.jsonc، أو اطلب من الوكيل إضافتها لك.",
   "settings.agentBehaviour.workflowsPlaceholder": "تُدار سير العمل عبر ملفات سير العمل في مساحة العمل.",
@@ -1383,8 +1334,6 @@ export const dict = {
   "settings.providers.enabled.description": "إذا تم التعيين، فقط هؤلاء المزودون سيكونون متاحين",
   "settings.providers.notSet": "غير محدد (استخدام الافتراضي)",
   "dialog.model.notSet": "غير محدد",
-  "profile.personalAccount": "حساب شخصي",
-  "profile.switchingAccount": "جارٍ تبديل الحساب…",
 
   // Agent Manager strings live in webview-ui/agent-manager/i18n/ar.ts
 
@@ -1494,8 +1443,4 @@ export const dict = {
   "settings.saveBar.cancel": "إلغاء",
   "settings.saveBar.saving": "جارٍ الحفظ…",
   "settings.saveBar.saveFailed": "تعذر حفظ الإعدادات",
-  "notifications.action.next": "التالي",
-  "notifications.action.close": "إغلاق",
-  "notifications.action.tryModel": "جرّب {{model}}",
-  "notifications.action.tryModelGeneric": "جرّب النموذج",
 }

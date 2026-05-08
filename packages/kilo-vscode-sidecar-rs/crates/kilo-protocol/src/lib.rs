@@ -1,14 +1,34 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub const CONTRACT: &str = "kilo-vscode-sidecar.preview.0";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Numeric wire-protocol version. `1` covers the M0-frozen surface. Any
+/// breaking change to route paths, request/response shapes, error
+/// envelope, or SSE event names increments this. Additive changes do
+/// NOT bump it. Per the migration plan **Wire-protocol versioning beyond
+/// v1** section: a deprecation cycle of one full release window precedes
+/// any contract version bump in stable; preview can bump freely.
+///
+/// The extension reads this both from the readiness line and from
+/// `GET /global/health`, and refuses to use a sidecar whose version is
+/// newer than its compiled-in maximum.
+pub const CONTRACT_VERSION: u32 = 1;
 
 #[derive(Serialize)]
 pub struct Health {
     pub healthy: bool,
     pub version: &'static str,
+    /// Numeric contract version. See [`CONTRACT_VERSION`].
+    #[serde(rename = "contractVersion")]
+    pub contract_version: u32,
+    /// Human-readable contract slug. See [`CONTRACT`]. Useful for logs;
+    /// the extension's compatibility decision is based on the numeric
+    /// `contractVersion` instead.
+    pub contract: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -218,22 +238,35 @@ pub struct ConfigProvidersResult {
     pub defaults: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+/// Bus event broadcast to every SSE subscriber. Cloned once per
+/// subscriber by `tokio::sync::broadcast`, so the per-clone cost is
+/// load-bearing for fanout under heavy SSE traffic. `directory` and
+/// `project` are `Arc<str>` (not `String`) so a clone is a single
+/// atomic refcount bump rather than a fresh heap allocation.
+///
+/// The `payload` field still owns its `Value` outright; serde will see
+/// `Arc<str>` as a transparent string and produce the same JSON wire
+/// shape — the tradeoff is purely internal.
+///
+/// `Deserialize` is implemented so test harnesses (and any future
+/// SDK-side mirror) can reparse the bus's pre-serialized JSON back
+/// into a typed value. Production hot paths only serialize.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GlobalEvent {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub directory: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub directory: Option<Arc<str>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub project: Option<Arc<str>>,
     pub payload: Payload,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Payload {
     #[serde(rename = "type")]
     pub kind: String,
-    #[serde(rename = "syncEvent")]
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "syncEvent", skip_serializing_if = "Option::is_none", default)]
     pub sync_event: Option<Value>,
+    #[serde(default)]
     pub properties: Value,
 }
 
@@ -242,6 +275,8 @@ impl Health {
         Self {
             healthy: true,
             version: VERSION,
+            contract_version: CONTRACT_VERSION,
+            contract: CONTRACT,
         }
     }
 }
@@ -255,10 +290,11 @@ impl GlobalEvent {
         Self::event("server.heartbeat")
     }
 
-    pub fn session(kind: &'static str, directory: String, info: Session) -> Self {
+    pub fn session(kind: &'static str, directory: Arc<str>, info: Session) -> Self {
+        let project: Arc<str> = Arc::from(info.project_id.as_str());
         Self {
             directory: Some(directory),
-            project: Some(info.project_id.clone()),
+            project: Some(project),
             payload: Payload {
                 kind: kind.to_string(),
                 sync_event: None,
@@ -271,23 +307,23 @@ impl GlobalEvent {
     }
 
     pub fn message(
-        kind: &'static str,
-        directory: String,
-        project: String,
+        kind: impl Into<String>,
+        directory: Arc<str>,
+        project: Arc<str>,
         properties: Value,
     ) -> Self {
         Self {
             directory: Some(directory),
             project: Some(project),
             payload: Payload {
-                kind: kind.to_string(),
+                kind: kind.into(),
                 sync_event: None,
                 properties,
             },
         }
     }
 
-    pub fn sync(directory: String, project: String, event: Value) -> Self {
+    pub fn sync(directory: Arc<str>, project: Arc<str>, event: Value) -> Self {
         Self {
             directory: Some(directory),
             project: Some(project),

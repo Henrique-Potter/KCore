@@ -36,6 +36,7 @@ export class WorktreeDiffController {
   private hash: string | undefined
   private target: Target | undefined
   private applying: string | undefined
+  private seq = 0
 
   constructor(private readonly ctx: WorktreeDiffControllerContext) {}
 
@@ -146,9 +147,12 @@ export class WorktreeDiffController {
   }
 
   public async request(sessionId: string): Promise<void> {
+    const seq = this.seq
     await this.ready("stateReady rejected, continuing diff resolve:")
+    if (!this.current(seq)) return
 
     const target = await this.resolve(sessionId)
+    if (!this.current(seq)) return
     if (!target) return
 
     this.target = { sessionId, ...target }
@@ -156,6 +160,7 @@ export class WorktreeDiffController {
 
     try {
       const files = await this.ctx.localDiff(target.directory, target.baseBranch)
+      if (!this.current(seq)) return
       this.ctx.log(`Worktree diff returned ${files.length} file(s) for session ${sessionId}`)
       this.hash = hashFileDiffs(files)
       this.session = sessionId
@@ -163,23 +168,29 @@ export class WorktreeDiffController {
     } catch (error) {
       this.ctx.log("Failed to fetch worktree diff:", error)
     } finally {
+      if (!this.current(seq)) return
       this.ctx.post({ type: "agentManager.worktreeDiffLoading", sessionId, loading: false })
     }
   }
 
   public async requestFile(sessionId: string, file: string): Promise<void> {
     if (!file) return
+    const seq = this.seq
     await this.ready("stateReady rejected, continuing diff detail resolve:")
+    if (!this.current(seq)) return
 
     const target = this.target?.sessionId === sessionId ? this.target : await this.resolve(sessionId)
+    if (!this.current(seq)) return
     if (!target) return
 
     this.target = { sessionId, directory: target.directory, baseBranch: target.baseBranch }
 
     try {
       const data = await this.ctx.localDiffFile(target.directory, target.baseBranch, file)
+      if (!this.current(seq)) return
       this.ctx.post({ type: "agentManager.worktreeDiffFile", sessionId, file, diff: data })
     } catch (error) {
+      if (!this.current(seq)) return
       this.ctx.log("Failed to fetch worktree diff file:", error)
       this.ctx.post({ type: "agentManager.worktreeDiffFile", sessionId, file, diff: null })
     }
@@ -192,19 +203,21 @@ export class WorktreeDiffController {
     }
 
     this.stop()
+    const seq = this.seq
     this.session = sessionId
     this.hash = undefined
     this.ctx.log(`Starting diff polling for session ${sessionId}`)
 
     void this.request(sessionId).then(() => {
-      if (this.session !== sessionId) return
+      if (!this.current(seq, sessionId)) return
       this.interval = setInterval(() => {
-        void this.poll(sessionId)
+        void this.poll(sessionId, seq)
       }, 2500)
     })
   }
 
   public stop(): void {
+    this.seq++
     if (this.interval) {
       clearInterval(this.interval)
       this.interval = undefined
@@ -214,12 +227,14 @@ export class WorktreeDiffController {
     this.target = undefined
   }
 
-  private async poll(sessionId: string): Promise<void> {
+  private async poll(sessionId: string, seq: number): Promise<void> {
+    if (!this.current(seq, sessionId)) return
     const target = this.target?.sessionId === sessionId ? this.target : undefined
     if (!target) return
 
     try {
       const files = await this.ctx.localDiff(target.directory, target.baseBranch)
+      if (!this.current(seq, sessionId)) return
       const hash = hashFileDiffs(files)
       if (hash === this.hash && this.session === sessionId) return
       this.hash = hash
@@ -264,6 +279,11 @@ export class WorktreeDiffController {
 
   private async ready(msg: string): Promise<void> {
     await this.ctx.getStateReady()?.catch((err) => this.ctx.log(msg, err))
+  }
+
+  private current(seq: number, sessionId?: string): boolean {
+    if (this.seq !== seq) return false
+    return !sessionId || this.session === sessionId
   }
 
   private postApplyResult(

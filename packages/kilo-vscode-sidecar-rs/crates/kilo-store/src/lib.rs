@@ -1,4 +1,15 @@
-use std::{collections::BTreeMap, env, fs, path::PathBuf, sync::atomic, time::SystemTime};
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{atomic, Arc, Mutex},
+    time::SystemTime,
+};
+
+pub mod keyring;
+mod migrations;
+pub mod paths;
 
 use chrono::{DateTime, Utc};
 use kilo_protocol::{
@@ -14,12 +25,25 @@ use rusqlite::{
 use serde_json::{json, Map, Value as JsonValue};
 
 static IDS: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+static AUTH_WRITES: atomic::AtomicU64 = atomic::AtomicU64::new(0);
 
 #[derive(Clone)]
 pub struct Store {
     paths: Paths,
     directory: String,
     worktree: String,
+    /// Audit Fix 9: cached writer connection. Lazily initialized on first
+    /// write, then reused. Pragmas (`journal_mode=WAL`, `foreign_keys=ON`,
+    /// `busy_timeout=5000`) are stamped on first open. Wrapped in
+    /// `Arc<Mutex<Option<…>>>` so `Store: Clone + Send + Sync` and so we
+    /// can swap it out atomically when `for_test` builds a fresh store.
+    writer: Arc<Mutex<Option<Connection>>>,
+    /// Item 11 perf: cached read-only connection, peer to `writer`.
+    /// Lazily initialized on first `with_db` call. Held under the same
+    /// `Arc<Mutex<Option<…>>>` shape so `Store: Clone + Send + Sync`.
+    /// SQLite WAL allows concurrent reads without blocking writes, so a
+    /// long-lived reader is safe.
+    reader: Arc<Mutex<Option<Connection>>>,
 }
 
 #[derive(Clone)]
@@ -120,7 +144,18 @@ impl Store {
             paths,
             worktree: directory.clone(),
             directory,
+            writer: Arc::new(Mutex::new(None)),
+            reader: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Resolve the state directory without constructing a full `Store`.
+    /// Used at startup by the binary's tracing-subscriber init so the
+    /// log-file path doesn't pay the price of allocating a writer-mutex
+    /// + reading `current_dir()`. Callers that already hold a `Store`
+    /// should prefer [`Store::paths`] instead.
+    pub fn resolve_state_dir() -> PathBuf {
+        Paths::new().state
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -135,6 +170,8 @@ impl Store {
             },
             directory: root.join("repo").to_string_lossy().to_string(),
             worktree: root.join("repo").to_string_lossy().to_string(),
+            writer: Arc::new(Mutex::new(None)),
+            reader: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -275,6 +312,53 @@ impl Store {
         write_auths(&self.paths.data, &data)
     }
 
+    pub fn mcp_auths(&self) -> BTreeMap<String, JsonValue> {
+        read_mcp_auths(&self.paths.data)
+    }
+
+    /// Persisted "always" permission rules — Bun parity for
+    /// `PermissionTable` (`packages/opencode/src/permission/index.ts:195-201`).
+    /// Returns rules in the order they were appended; consumers should
+    /// scan with `findLast` / reverse-iter semantics to honor "later
+    /// rule wins". Values are opaque JSON (caller types them).
+    pub fn permission_rules(&self) -> Vec<JsonValue> {
+        read_permission_rules(&self.paths.data)
+    }
+
+    /// Append one or more rules to the persisted set. Each call is
+    /// strictly additive; nothing here de-dupes (Bun doesn't either) so
+    /// the caller is expected to keep the count bounded by the natural
+    /// rule namespace.
+    pub fn append_permission_rules(&self, rules: &[JsonValue]) -> std::io::Result<()> {
+        if rules.is_empty() {
+            return Ok(());
+        }
+        fs::create_dir_all(&self.paths.data)?;
+        let mut existing = read_permission_rules(&self.paths.data);
+        existing.extend(rules.iter().cloned());
+        write_permission_rules(&self.paths.data, &existing)
+    }
+
+    /// Test/admin helper — replace the entire persisted rule set. Not
+    /// used by the agent loop; exposed so callers (e.g. a future
+    /// `/permission/clear` route) can reset.
+    pub fn replace_permission_rules(&self, rules: &[JsonValue]) -> std::io::Result<()> {
+        fs::create_dir_all(&self.paths.data)?;
+        write_permission_rules(&self.paths.data, rules)
+    }
+
+    pub fn mcp_auth(&self, id: &str) -> Option<JsonValue> {
+        self.mcp_auths().remove(id)
+    }
+
+    pub fn set_mcp_auth(&self, id: &str, value: JsonValue) -> std::io::Result<JsonValue> {
+        fs::create_dir_all(&self.paths.data)?;
+        let mut data = self.mcp_auths();
+        data.insert(id.to_string(), value.clone());
+        write_mcp_auths(&self.paths.data, &data)?;
+        Ok(value)
+    }
+
     /// Resolve the current project for `Instance.project` parity with
     /// `packages/opencode/src/server/routes/instance/index.ts:project/current`.
     ///
@@ -305,9 +389,181 @@ impl Store {
         }
     }
 
+    pub fn import_project(&self, input: JsonValue) -> rusqlite::Result<String> {
+        self.with_write(|db| {
+            let data = ensure_map(input)?;
+            let id = required_str(&data, "id")?;
+            let worktree = required_str(&data, "worktree")?;
+            if worktree.trim().is_empty() {
+                return Err(rusqlite::Error::InvalidParameterName(
+                    "project worktree is required".to_string(),
+                ));
+            }
+            let time = now_millis();
+            let created = data
+                .get("timeCreated")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(time);
+            let updated = data
+                .get("timeUpdated")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(created);
+            let sandboxes = data
+                .get("sandboxes")
+                .cloned()
+                .unwrap_or_else(|| JsonValue::Array(Vec::new()));
+            let commands = data.get("commands").cloned();
+            let tx = db.transaction()?;
+            ensure_table(&tx, "project")?;
+            tx.execute(
+                "insert into project (id, worktree, vcs, name, icon_url, icon_color, time_created, \
+                 time_updated, time_initialized, sandboxes, commands) values \
+                 (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                 on conflict(id) do update set worktree = excluded.worktree, vcs = excluded.vcs, \
+                 name = excluded.name, icon_url = excluded.icon_url, icon_color = excluded.icon_color, \
+                 time_created = excluded.time_created, time_updated = excluded.time_updated, \
+                 time_initialized = excluded.time_initialized, sandboxes = excluded.sandboxes, \
+                 commands = excluded.commands",
+                params![
+                    &id,
+                    &worktree,
+                    opt_str(&data, "vcs"),
+                    opt_str(&data, "name"),
+                    opt_str(&data, "iconUrl"),
+                    opt_str(&data, "iconColor"),
+                    created,
+                    updated,
+                    data.get("timeInitialized").and_then(JsonValue::as_i64),
+                    json_value(&sandboxes)?,
+                    json_text(&commands),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(id)
+        })
+    }
+
+    pub fn import_session(&self, input: JsonValue) -> rusqlite::Result<(String, bool)> {
+        self.with_write(|db| {
+            let data = ensure_map(input)?;
+            let id = required_str(&data, "id")?;
+            let force = data.get("force").and_then(JsonValue::as_bool).unwrap_or(false);
+            let tx = db.transaction()?;
+            ensure_table(&tx, "session")?;
+            let exists = read_session(&tx, &id).is_some();
+            if exists && !force {
+                tx.commit()?;
+                return Ok((id, true));
+            }
+            if exists {
+                tx.execute("delete from session where id = ?1", [&id])?;
+            }
+
+            let summary = summary_fields(data.get("summary"));
+            tx.execute(
+                "insert into session (id, project_id, workspace_id, parent_id, slug, directory, title, version, \
+                 share_url, summary_additions, summary_deletions, summary_files, summary_diffs, revert, \
+                 permission, time_created, time_updated, time_compacting, time_archived) \
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19) \
+                 on conflict(id) do update set project_id = excluded.project_id, workspace_id = excluded.workspace_id, \
+                 parent_id = excluded.parent_id, slug = excluded.slug, directory = excluded.directory, \
+                 title = excluded.title, version = excluded.version, share_url = excluded.share_url, \
+                 summary_additions = excluded.summary_additions, summary_deletions = excluded.summary_deletions, \
+                 summary_files = excluded.summary_files, summary_diffs = excluded.summary_diffs, \
+                 revert = excluded.revert, permission = excluded.permission, time_created = excluded.time_created, \
+                 time_updated = excluded.time_updated, time_compacting = excluded.time_compacting, \
+                 time_archived = excluded.time_archived",
+                params![
+                    &id,
+                    required_str(&data, "projectID")?,
+                    opt_str(&data, "workspaceID"),
+                    opt_str(&data, "parentID"),
+                    required_str(&data, "slug")?,
+                    required_str(&data, "directory")?,
+                    required_str(&data, "title")?,
+                    required_str(&data, "version")?,
+                    opt_str(&data, "shareURL"),
+                    summary.additions,
+                    summary.deletions,
+                    summary.files,
+                    summary.diffs,
+                    json_text(&data.get("revert").cloned()),
+                    json_text(&data.get("permission").cloned()),
+                    required_i64(&data, "timeCreated")?,
+                    required_i64(&data, "timeUpdated")?,
+                    data.get("timeCompacting").and_then(JsonValue::as_i64),
+                    data.get("timeArchived").and_then(JsonValue::as_i64),
+                ],
+            )?;
+            tx.commit()?;
+            Ok((id, false))
+        })
+    }
+
+    pub fn import_message(&self, input: JsonValue) -> rusqlite::Result<String> {
+        self.with_write(|db| {
+            let data = ensure_map(input)?;
+            let id = required_str(&data, "id")?;
+            let time = required_i64(&data, "timeCreated")?;
+            let body = data.get("data").cloned().unwrap_or_else(|| json!({}));
+            let tx = db.transaction()?;
+            ensure_table(&tx, "message")?;
+            tx.execute(
+                "insert into message (id, session_id, time_created, time_updated, data) values (?1, ?2, ?3, ?4, ?5) \
+                 on conflict(id) do update set session_id = excluded.session_id, time_updated = excluded.time_updated, data = excluded.data",
+                params![
+                    &id,
+                    required_str(&data, "sessionID")?,
+                    time,
+                    time,
+                    json_value(&body)?,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(id)
+        })
+    }
+
+    pub fn import_part(&self, input: JsonValue) -> rusqlite::Result<String> {
+        self.with_write(|db| {
+            let data = ensure_map(input)?;
+            let id = required_str(&data, "id")?;
+            let time = data
+                .get("timeCreated")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or_else(now_millis);
+            let body = data.get("data").cloned().unwrap_or_else(|| json!({}));
+            let tx = db.transaction()?;
+            ensure_table(&tx, "part")?;
+            tx.execute(
+                "insert into part (id, message_id, session_id, time_created, time_updated, data) values (?1, ?2, ?3, ?4, ?5, ?6) \
+                 on conflict(id) do update set message_id = excluded.message_id, session_id = excluded.session_id, time_updated = excluded.time_updated, data = excluded.data",
+                params![
+                    &id,
+                    required_str(&data, "messageID")?,
+                    required_str(&data, "sessionID")?,
+                    time,
+                    time,
+                    json_value(&body)?,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(id)
+        })
+    }
+
     pub fn sessions(&self, query: &SessionQuery) -> Vec<Session> {
         self.with_db(|db| read_sessions(db, query))
             .unwrap_or_default()
+    }
+
+    /// Count sessions in the workspace, optionally filtered by directory.
+    /// Used by the session-quota check on `POST /session`. Distinct from
+    /// `sessions(...)` because the read path caps results at 500; this
+    /// accessor returns the true row count.
+    pub fn session_count(&self, directory: Option<&str>) -> usize {
+        self.with_db(|db| count_sessions(db, directory))
+            .unwrap_or(0)
     }
 
     pub fn session(&self, id: &str) -> Option<Session> {
@@ -824,11 +1080,18 @@ impl Store {
 
     pub fn diff(&self, id: &str) -> Option<Vec<JsonValue>> {
         self.session(id)?;
+        let stored = self
+            .session(id)
+            .and_then(|session| session.summary)
+            .and_then(|summary| summary.get("diffs").cloned())
+            .and_then(|diffs| diffs.as_array().cloned())
+            .unwrap_or_default();
+        if !stored.is_empty() {
+            return Some(stored);
+        }
+
         Some(
-            self.session(id)
-                .and_then(|session| session.summary)
-                .and_then(|summary| summary.get("diffs").cloned())
-                .and_then(|diffs| diffs.as_array().cloned())
+            self.with_db(|db| session_tool_diffs(db, id))
                 .unwrap_or_default(),
         )
     }
@@ -887,55 +1150,172 @@ impl Store {
     }
 
     fn with_db<T>(&self, f: impl FnOnce(&Connection) -> T) -> Option<T> {
+        // Pre-cache: every read opened a fresh `Connection`, ran the
+        // SQLite open syscall + URI parse, then dropped it. With ~10
+        // session/message reads per turn (sidebar refresh + agent
+        // manager + history) and several turns per minute, the open/close
+        // churn shows up in flamegraphs.
+        //
+        // Cache: a single read-only connection per `Store` clone, lazily
+        // initialized on first read, guarded by a `Mutex` for cross-thread
+        // safety. SQLite is opened with `SQLITE_OPEN_NO_MUTEX` so the
+        // outer `Mutex` is the only synchronization point — same
+        // discipline as the writer cache.
+        //
+        // The cached reader holds an open file descriptor. SQLite's WAL
+        // mode is reader-friendly: writers don't block readers and vice
+        // versa, so a long-lived reader is harmless. If the file is
+        // deleted (rare; tempdir cleanup), the next access fails the
+        // `path.exists()` precheck and we fall back to opening fresh.
         let path = self.paths.data.join("kilo.db");
         if !path.exists() {
+            // Drop any cached reader so a re-created database (test
+            // teardown / fresh-install) gets a new connection.
+            if let Ok(mut guard) = self.reader.lock() {
+                *guard = None;
+            }
             return None;
         }
 
-        match Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-                | OpenFlags::SQLITE_OPEN_URI
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ) {
-            Ok(db) => Some(f(&db)),
-            Err(err) => {
-                // Read-only DB-open failure means EVERY downstream read
-                // returns the empty placeholder, so the sidebar renders
-                // empty with no signal. Log so an operator can see the
-                // schema/permission/locked-DB cause without attaching a
-                // debugger. Once `tracing` lands as a workspace dep, swap
-                // for `tracing::warn!`.
-                eprintln!(
-                    "[kilo-store] with_db: failed to open {path}: {err}",
-                    path = path.display(),
-                );
-                None
+        let mut guard = match self.reader.lock() {
+            Ok(g) => g,
+            Err(err) => err.into_inner(),
+        };
+        if guard.is_none() {
+            match Connection::open_with_flags(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_URI
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) {
+                Ok(conn) => {
+                    *guard = Some(conn);
+                }
+                Err(err) => {
+                    // Read-only DB-open failure means EVERY downstream
+                    // read returns the empty placeholder, so the sidebar
+                    // renders empty with no signal. Log so an operator
+                    // can see the schema/permission/locked-DB cause
+                    // without attaching a debugger.
+                    eprintln!(
+                        "[kilo-store] with_db: failed to open {path}: {err}",
+                        path = path.display(),
+                    );
+                    return None;
+                }
             }
         }
+        let conn = guard.as_ref().expect("reader connection just initialized");
+        Some(f(conn))
     }
 
+    /// Audit Fix 9: cached writer connection. Previously, every write
+    /// opened a fresh `rusqlite::Connection` and re-stamped pragmas — at
+    /// hundreds of writes per turn the open/close churn was a measurable
+    /// fraction of the wall-clock time. We now lazily open one writer and
+    /// reuse it under a `Mutex` for the lifetime of the `Store`.
     fn with_write<T>(
         &self,
         f: impl FnOnce(&mut Connection) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T> {
-        let path = self.paths.data.join("kilo.db");
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)
-                .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+        let mut guard = self.writer.lock().unwrap_or_else(|err| err.into_inner());
+        if guard.is_none() {
+            let path = self.paths.data.join("kilo.db");
+            if let Some(dir) = path.parent() {
+                fs::create_dir_all(dir)
+                    .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+            }
+            let mut conn = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_CREATE
+                    | OpenFlags::SQLITE_OPEN_URI
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            conn.execute_batch(
+                "pragma journal_mode = WAL; pragma busy_timeout = 5000; pragma foreign_keys = ON;",
+            )?;
+            // First-run schema bootstrap. `init_schema` uses
+            // `create table if not exists` so it is safe to run on every
+            // open. The migration runner then walks `PRAGMA user_version`
+            // forward to the binary's `LATEST_SCHEMA_VERSION` so old
+            // databases upgrade in place. Together these two steps
+            // satisfy **Storage and process self-healing invariants** 1
+            // and 2 — bootstrap on missing/partial state, version-walk on
+            // stale state.
+            init_schema(&conn)?;
+            migrations::run(&mut conn)?;
+            *guard = Some(conn);
         }
-        let mut db = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_URI
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        db.execute_batch(
-            "pragma journal_mode = WAL; pragma busy_timeout = 5000; pragma foreign_keys = ON;",
-        )?;
-        f(&mut db)
+        let conn = guard.as_mut().expect("writer connection initialized above");
+        f(conn)
     }
+}
+
+fn init_schema(db: &Connection) -> rusqlite::Result<()> {
+    db.execute_batch(
+        "create table if not exists project (
+            id text primary key,
+            worktree text not null,
+            vcs text,
+            name text,
+            icon_url text,
+            icon_url_override text,
+            icon_color text,
+            time_created integer not null,
+            time_updated integer not null,
+            time_initialized integer,
+            sandboxes text not null,
+            commands text
+        );
+        create table if not exists session (
+            id text primary key,
+            project_id text not null references project(id) on delete cascade,
+            workspace_id text,
+            parent_id text,
+            slug text not null,
+            directory text not null,
+            title text not null,
+            version text not null,
+            share_url text,
+            summary_additions integer,
+            summary_deletions integer,
+            summary_files integer,
+            summary_diffs text,
+            revert text,
+            permission text,
+            time_created integer not null,
+            time_updated integer not null,
+            time_compacting integer,
+            time_archived integer
+        );
+        create table if not exists message (
+            id text primary key,
+            session_id text not null references session(id) on delete cascade,
+            time_created integer not null,
+            time_updated integer not null,
+            data text not null
+        );
+        create table if not exists part (
+            id text primary key,
+            message_id text not null references message(id) on delete cascade,
+            session_id text not null,
+            time_created integer not null,
+            time_updated integer not null,
+            data text not null
+        );
+        create table if not exists event_sequence (
+            aggregate_id text not null primary key,
+            seq integer not null
+        );
+        create table if not exists event (
+            id text primary key,
+            aggregate_id text not null references event_sequence(aggregate_id) on delete cascade,
+            seq integer not null,
+            type text not null,
+            data text not null
+        );",
+    )
 }
 
 impl Default for Store {
@@ -1036,6 +1416,73 @@ fn read_config(dir: &PathBuf) -> Config {
 
 fn read_auths(dir: &PathBuf) -> BTreeMap<String, JsonValue> {
     let path = dir.join("auth.json");
+    read_auth_file(&path)
+        .or_else(|| read_auth_file(&auth_backup_path(&path)))
+        .unwrap_or_default()
+}
+
+fn write_auths(dir: &PathBuf, data: &BTreeMap<String, JsonValue>) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join("auth.json");
+    let body = serde_json::to_string_pretty(data)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    write_replace(&path, body.as_bytes())
+}
+
+fn read_auth_file(path: &Path) -> Option<BTreeMap<String, JsonValue>> {
+    let text = fs::read_to_string(path).ok()?;
+    let JsonValue::Object(data) = serde_json::from_str::<JsonValue>(&text).ok()? else {
+        return None;
+    };
+    Some(data.into_iter().collect())
+}
+
+fn auth_backup_path(path: &Path) -> PathBuf {
+    path.with_extension("json.bak")
+}
+
+fn auth_temp_path(path: &Path) -> PathBuf {
+    let seq = AUTH_WRITES.fetch_add(1, atomic::Ordering::Relaxed);
+    path.with_extension(format!("json.tmp.{}.{}", std::process::id(), seq))
+}
+
+/// Write auth data through a temp file and keep the previous valid file as
+/// `auth.json.bak`. On Windows `std::fs::rename` cannot replace an existing
+/// file, so the backup gives `read_auths` a recovery point if the process dies
+/// between removing the old file and installing the new one.
+fn write_replace(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    let temp = auth_temp_path(path);
+    let bak = auth_backup_path(path);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp)?;
+        file.write_all(body)?;
+        file.sync_all()?;
+    }
+    if path.exists() {
+        let _ = fs::copy(path, &bak);
+        fs::remove_file(path)?;
+    }
+    match fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = fs::remove_file(&temp);
+            if !path.exists() && bak.exists() {
+                let _ = fs::copy(&bak, path);
+            }
+            Err(err)
+        }
+    }
+}
+
+fn read_mcp_auths(dir: &PathBuf) -> BTreeMap<String, JsonValue> {
+    let path = dir.join("mcp-auth.json");
     let Ok(text) = fs::read_to_string(&path) else {
         return BTreeMap::new();
     };
@@ -1045,8 +1492,26 @@ fn read_auths(dir: &PathBuf) -> BTreeMap<String, JsonValue> {
     data.into_iter().collect()
 }
 
-fn write_auths(dir: &PathBuf, data: &BTreeMap<String, JsonValue>) -> std::io::Result<()> {
-    let path = dir.join("auth.json");
+fn read_permission_rules(dir: &PathBuf) -> Vec<JsonValue> {
+    let path = dir.join("permissions.json");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(JsonValue::Array(data)) = serde_json::from_str::<JsonValue>(&text) else {
+        return Vec::new();
+    };
+    data
+}
+
+fn write_permission_rules(dir: &PathBuf, rules: &[JsonValue]) -> std::io::Result<()> {
+    let path = dir.join("permissions.json");
+    let body = serde_json::to_string_pretty(rules)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    fs::write(path, body)
+}
+
+fn write_mcp_auths(dir: &PathBuf, data: &BTreeMap<String, JsonValue>) -> std::io::Result<()> {
+    let path = dir.join("mcp-auth.json");
     let body = serde_json::to_string_pretty(data)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
     fs::write(path, body)
@@ -1239,6 +1704,31 @@ fn read_sessions(db: &Connection, query: &SessionQuery) -> Vec<Session> {
     };
 
     rows.filter_map(Result::ok).collect()
+}
+
+fn count_sessions(db: &Connection, directory: Option<&str>) -> usize {
+    let (sql, args): (&str, Vec<SqlValue>) = match directory {
+        Some(dir) => (
+            "select count(*) from session where directory = ?1",
+            vec![SqlValue::Text(dir.to_string())],
+        ),
+        None => ("select count(*) from session", vec![]),
+    };
+    let mut stmt = match db.prepare(sql) {
+        Ok(stmt) => stmt,
+        Err(err) => {
+            log_db_err("count_sessions.prepare", err);
+            return 0;
+        }
+    };
+    let count: i64 = match stmt.query_row(params_from_iter(args.iter()), |row| row.get(0)) {
+        Ok(n) => n,
+        Err(err) => {
+            log_db_err("count_sessions.query_row", err);
+            return 0;
+        }
+    };
+    usize::try_from(count.max(0)).unwrap_or(0)
 }
 
 fn read_session(db: &Connection, id: &str) -> Option<Session> {
@@ -1476,8 +1966,13 @@ fn message(db: &Connection, row: &Row<'_>) -> rusqlite::Result<MessageRow> {
 }
 
 fn parts(db: &Connection, id: &str) -> Vec<JsonValue> {
+    // Insertion-order semantics: sort by `time_created` (the row's first
+    // insertion timestamp; upserts keep it stable) so consumers see parts
+    // in the order they were appended by the agent loop. `id` is the
+    // tiebreaker when multiple parts land in the same millisecond, which
+    // happens during fast streaming bursts.
     let mut stmt = match db.prepare(
-        "select id, message_id, session_id, data from part where message_id = ?1 order by id",
+        "select id, message_id, session_id, data from part where message_id = ?1 order by time_created, id",
     ) {
         Ok(stmt) => stmt,
         Err(err) => {
@@ -1506,6 +2001,58 @@ fn part(row: &Row<'_>) -> rusqlite::Result<JsonValue> {
     part.insert("messageID".to_string(), JsonValue::String(mid));
     part.insert("sessionID".to_string(), JsonValue::String(sid));
     Ok(JsonValue::Object(part))
+}
+
+fn session_tool_diffs(db: &Connection, id: &str) -> Vec<JsonValue> {
+    let Some(page) = read_messages(db, id, None, None) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for msg in page.items {
+        for part in msg.parts {
+            if part.get("type").and_then(JsonValue::as_str) != Some("tool") {
+                continue;
+            }
+            if part.pointer("/state/status").and_then(JsonValue::as_str) != Some("completed") {
+                continue;
+            }
+            if let Some(item) = tool_diff(&part) {
+                out.push(item);
+            }
+        }
+    }
+    out
+}
+
+fn tool_diff(part: &JsonValue) -> Option<JsonValue> {
+    let tool = part.get("tool").and_then(JsonValue::as_str)?;
+    let meta = part.pointer("/state/metadata")?;
+    if tool == "apply_patch" {
+        let files = meta.get("files")?.as_array()?;
+        return Some(json!({
+            "tool": tool,
+            "callID": part.get("callID").cloned().unwrap_or(JsonValue::Null),
+            "files": files,
+            "patch": meta.get("diff").cloned().unwrap_or_else(|| JsonValue::String(String::new())),
+        }));
+    }
+
+    let patch = meta.get("diff").or_else(|| meta.get("filediff"))?.clone();
+    let file = meta
+        .get("file")
+        .or_else(|| meta.get("filepath"))
+        .or_else(|| meta.get("path"))
+        .cloned()
+        .or_else(|| part.pointer("/state/input/filePath").cloned())
+        .unwrap_or_else(|| JsonValue::String(tool.to_string()));
+    Some(json!({
+        "file": file,
+        "patch": patch,
+        "tool": tool,
+        "callID": part.get("callID").cloned().unwrap_or(JsonValue::Null),
+        "additions": meta.get("additions").cloned().unwrap_or_else(|| JsonValue::Number(0.into())),
+        "deletions": meta.get("deletions").cloned().unwrap_or_else(|| JsonValue::Number(0.into())),
+    }))
 }
 
 fn info_with_session(info: JsonValue, id: &str, time: i64) -> rusqlite::Result<JsonValue> {
@@ -1601,6 +2148,35 @@ fn ensure_object(value: JsonValue) -> rusqlite::Result<JsonValue> {
     ))
 }
 
+fn ensure_map(value: JsonValue) -> rusqlite::Result<Map<String, JsonValue>> {
+    let JsonValue::Object(map) = value else {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "expected json object".to_string(),
+        ));
+    };
+    Ok(map)
+}
+
+fn required_str(data: &Map<String, JsonValue>, key: &str) -> rusqlite::Result<String> {
+    data.get(key)
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| rusqlite::Error::InvalidParameterName(format!("missing {key}")))
+}
+
+fn opt_str(data: &Map<String, JsonValue>, key: &str) -> Option<String> {
+    data.get(key)
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+}
+
+fn required_i64(data: &Map<String, JsonValue>, key: &str) -> rusqlite::Result<i64> {
+    data.get(key)
+        .and_then(JsonValue::as_i64)
+        .ok_or_else(|| rusqlite::Error::InvalidParameterName(format!("missing {key}")))
+}
+
 fn id_field(value: &JsonValue, key: &str) -> Option<String> {
     value
         .get(key)
@@ -1686,10 +2262,32 @@ fn object(text: String) -> Map<String, JsonValue> {
 }
 
 fn now_millis() -> i64 {
-    SystemTime::now()
+    let raw = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|time| time.as_millis() as i64)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Audit Fix 9 follow-up: ensure the wall-clock millis we hand to the
+    // DB strictly increase across calls in the same process. Pre-Fix-9 the
+    // open/close churn around each `with_write` gave us natural ms
+    // separation; with the cached writer multiple consecutive writes can
+    // land in the same ms, which breaks `order by time_created desc, id
+    // desc` for callers that rely on insertion order (the message list
+    // pages are one). Bumping to `last+1` whenever the clock hasn't moved
+    // costs nothing in production but keeps insertion order stable.
+    static LAST_MS: atomic::AtomicI64 = atomic::AtomicI64::new(0);
+    loop {
+        let prev = LAST_MS.load(atomic::Ordering::SeqCst);
+        let next = if raw > prev { raw } else { prev + 1 };
+        match LAST_MS.compare_exchange(
+            prev,
+            next,
+            atomic::Ordering::SeqCst,
+            atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => return next,
+            Err(_) => continue,
+        }
+    }
 }
 
 fn default_title(time: i64) -> String {
@@ -1857,17 +2455,81 @@ mod tests {
     }
 
     #[test]
-    fn missing_tables_error_before_write() {
+    fn provider_auth_recovers_from_backup_when_auth_json_is_corrupt() {
+        let root = unique_root();
+        let store = store(&root);
+        fs::create_dir_all(&store.paths.data).unwrap();
+        let auth = json!({
+            "openai": {
+                "type": "oauth",
+                "refresh": "refresh-token",
+                "access": "access-token",
+                "expires": 123
+            }
+        });
+        fs::write(store.paths.data.join("auth.json"), b"{\"openai\":").unwrap();
+        fs::write(
+            store.paths.data.join("auth.json.bak"),
+            serde_json::to_string(&auth).unwrap(),
+        )
+        .unwrap();
+
+        let all = store.provider_auths();
+        assert_eq!(all["openai"]["refresh"], "refresh-token");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provider_auth_writes_backup_before_replacing_auth_json() {
+        let root = unique_root();
+        let store = store(&root);
+        fs::create_dir_all(&store.paths.data).unwrap();
+        fs::write(
+            store.paths.data.join("auth.json"),
+            serde_json::to_string(&json!({
+                "openai": {
+                    "type": "oauth",
+                    "refresh": "old-refresh",
+                    "access": "old-access",
+                    "expires": 1
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        store
+            .set_provider_auth(
+                "openai",
+                json!({
+                    "type": "oauth",
+                    "refresh": "new-refresh",
+                    "access": "new-access",
+                    "expires": 123
+                }),
+            )
+            .expect("set auth");
+        let all = store.provider_auths();
+        let bak = fs::read_to_string(store.paths.data.join("auth.json.bak")).unwrap();
+        let prev: JsonValue = serde_json::from_str(&bak).unwrap();
+
+        assert_eq!(all["openai"]["refresh"], "new-refresh");
+        assert_eq!(prev["openai"]["refresh"], "old-refresh");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn create_session_initializes_schema_on_empty_db() {
         let root = unique_root();
         let store = store(&root);
         fs::create_dir_all(&store.paths.data).unwrap();
         Connection::open(store.paths.data.join("kilo.db")).unwrap();
 
-        let err = store
+        store
             .create_session(SessionCreateInput::default())
-            .expect_err("missing tables should fail");
-
-        assert!(err.to_string().contains("missing table project"));
+            .expect("create_session should bootstrap schema on an empty db file");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2120,7 +2782,7 @@ mod tests {
     }
 
     #[test]
-    fn append_skips_sync_events_when_tables_missing() {
+    fn append_self_heals_missing_event_tables() {
         let root = unique_root();
         let store = store(&root);
         seed_without_events(&store);
@@ -2139,7 +2801,11 @@ mod tests {
             .expect("append message");
 
         assert_eq!(record.events.len(), 2);
-        assert_eq!(record.events[0].seq, -1);
+        assert!(
+            record.events.iter().all(|e| e.seq >= 0),
+            "init_schema should have created event tables; expected real seqs, got {:?}",
+            record.events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        );
         assert_eq!(record.result.info["id"], "msg_no_events");
 
         let _ = fs::remove_dir_all(root);
@@ -2289,6 +2955,54 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn diff_falls_back_to_rust_tool_metadata_without_checkpoint_summary() {
+        let root = unique_root();
+        let store = store(&root);
+        seed(&store);
+        let session = store
+            .create_session(SessionCreateInput::default())
+            .expect("create session");
+        store
+            .append_message(
+                &session.id,
+                MessageAppendInput {
+                    info: json!({ "id": "msg_tool_diff", "role": "assistant" }),
+                    parts: vec![json!({
+                        "id": "prt_tool_diff",
+                        "type": "tool",
+                        "tool": "write",
+                        "callID": "call_write_diff",
+                        "state": {
+                            "status": "completed",
+                            "input": { "filePath": "note.txt", "content": "after\n" },
+                            "output": "Wrote file successfully.",
+                            "metadata": {
+                                "file": "note.txt",
+                                "diff": "--- note.txt\n+++ note.txt\n@@ before @@\n@@ after @@\n+after",
+                                "additions": 1,
+                                "deletions": 0
+                            },
+                            "title": "note.txt",
+                            "time": { "start": 1, "end": 1 }
+                        }
+                    })],
+                },
+            )
+            .unwrap();
+
+        let diff = store.diff(&session.id).unwrap();
+
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0]["file"], "note.txt");
+        assert_eq!(diff[0]["tool"], "write");
+        assert_eq!(diff[0]["callID"], "call_write_diff");
+        assert_eq!(diff[0]["additions"], 1);
+        assert!(diff[0]["patch"].as_str().unwrap().contains("+after"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn store(root: &std::path::Path) -> Store {
         Store {
             paths: Paths {
@@ -2299,6 +3013,8 @@ mod tests {
             },
             directory: root.join("repo").to_string_lossy().to_string(),
             worktree: root.join("repo").to_string_lossy().to_string(),
+            writer: Arc::new(Mutex::new(None)),
+            reader: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2450,5 +3166,184 @@ mod tests {
         let seq = IDS.fetch_add(1, atomic::Ordering::Relaxed);
         let name = format!("kilo-store-test-{}-{seq}", now_millis());
         env::temp_dir().join(name)
+    }
+
+    /// Audit Fix 9 smoke test: 100 sequential writes share a single
+    /// cached connection. Pre-fix this opened/closed sqlite 100 times.
+    #[test]
+    fn cached_writer_handles_many_sequential_writes() {
+        let root = unique_root();
+        let store = store(&root);
+        seed(&store);
+        for i in 0..100 {
+            let session = store
+                .create_session(SessionCreateInput {
+                    title: Some(format!("session {i}")),
+                    ..Default::default()
+                })
+                .expect("create session");
+            assert!(session.id.starts_with("ses_"));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// **Storage and process self-healing invariants → 1**: a fresh
+    /// install with no `kilo.db` on disk produces a working store on
+    /// first chat. The pre-M6.1 bug shipped because schema bootstrap
+    /// was gated on file existence; this test makes the gateless
+    /// behavior load-bearing.
+    #[test]
+    fn fresh_install_creates_db_on_first_write() {
+        let root = unique_root();
+        let store = store(&root);
+        let db_path = root.join("data").join("kilo").join("kilo.db");
+        assert!(
+            !db_path.exists(),
+            "precondition: no kilo.db before first write"
+        );
+
+        // First write triggers schema bootstrap. No `seed()` call —
+        // the production code path must self-heal.
+        let session = store
+            .create_session(SessionCreateInput::default())
+            .expect("first chat creates schema and persists session");
+        assert!(session.id.starts_with("ses_"));
+        assert!(db_path.exists(), "kilo.db is created after first write");
+
+        // Reads succeed against the freshly created store.
+        let listed = store.sessions(&SessionQuery::default());
+        assert_eq!(listed.len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// **Storage and process self-healing invariants → 1**: a half-init
+    /// fixture (an empty `kilo.db` file plus orphaned `-wal` / `-shm`
+    /// siblings, the on-disk shape a crashed init leaves behind)
+    /// converges on first write rather than panicking.
+    #[test]
+    fn half_init_db_self_heals_on_first_write() {
+        let root = unique_root();
+        let data_dir = root.join("data").join("kilo");
+        fs::create_dir_all(&data_dir).unwrap();
+        // Create the on-disk artefacts of a crashed init: an empty
+        // SQLite file and orphaned WAL/SHM siblings. SQLite tolerates
+        // empty WAL/SHM and rebuilds them on next open.
+        let db_path = data_dir.join("kilo.db");
+        let wal_path = data_dir.join("kilo.db-wal");
+        let shm_path = data_dir.join("kilo.db-shm");
+        fs::write(&db_path, b"").unwrap();
+        fs::write(&wal_path, b"").unwrap();
+        fs::write(&shm_path, b"").unwrap();
+
+        let store = store(&root);
+        let session = store
+            .create_session(SessionCreateInput::default())
+            .expect("half-init store self-heals");
+        assert!(session.id.starts_with("ses_"));
+        // Schema is present and queryable.
+        assert_eq!(
+            store.sessions(&SessionQuery::default()).len(),
+            1,
+            "self-heal preserves the just-written session"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// **Storage and process self-healing invariants → 4**: column-name
+    /// parity between Rust's `init_schema` and Bun's persisted shape.
+    /// Bun is the round-trip oracle until M14 step 7 removes it; if
+    /// Rust ever reorders, renames, or omits a column the rollback
+    /// window breaks silently. This freezes the column set so any
+    /// schema change forces an explicit ack here AND in
+    /// `migrations::MIGRATIONS`.
+    #[test]
+    fn schema_columns_match_bun_compat_set() {
+        let root = unique_root();
+        let store = store(&root);
+        // First write triggers schema bootstrap.
+        store
+            .create_session(SessionCreateInput::default())
+            .expect("create session");
+
+        let conn = Connection::open(root.join("data").join("kilo").join("kilo.db")).unwrap();
+
+        let assert_columns = |table: &str, expected: &[&str]| {
+            let mut stmt = conn
+                .prepare(&format!("pragma table_info({table})"))
+                .unwrap();
+            let actual: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect();
+            assert_eq!(
+                actual,
+                expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "{table} column drift — update CONTRACT.md and migrations.rs",
+            );
+        };
+
+        assert_columns(
+            "project",
+            &[
+                "id",
+                "worktree",
+                "vcs",
+                "name",
+                "icon_url",
+                "icon_url_override",
+                "icon_color",
+                "time_created",
+                "time_updated",
+                "time_initialized",
+                "sandboxes",
+                "commands",
+            ],
+        );
+        assert_columns(
+            "session",
+            &[
+                "id",
+                "project_id",
+                "workspace_id",
+                "parent_id",
+                "slug",
+                "directory",
+                "title",
+                "version",
+                "share_url",
+                "summary_additions",
+                "summary_deletions",
+                "summary_files",
+                "summary_diffs",
+                "revert",
+                "permission",
+                "time_created",
+                "time_updated",
+                "time_compacting",
+                "time_archived",
+            ],
+        );
+        assert_columns(
+            "message",
+            &["id", "session_id", "time_created", "time_updated", "data"],
+        );
+        assert_columns(
+            "part",
+            &[
+                "id",
+                "message_id",
+                "session_id",
+                "time_created",
+                "time_updated",
+                "data",
+            ],
+        );
+        assert_columns("event_sequence", &["aggregate_id", "seq"]);
+        assert_columns("event", &["id", "aggregate_id", "seq", "type", "data"]);
+
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -20,14 +20,18 @@ It does not implement write route parity, real provider auth, tool execution, MC
 | Path | Purpose |
 |---|---|
 | `crates/kilo-vscode-sidecar` | Thin binary: command parsing, process entrypoint, signal handling. |
-| `crates/kilo-server` | HTTP/SSE skeleton, auth middleware, route composition. |
+| `crates/kilo-server` | HTTP/SSE router, middleware, route handlers, OAuth, the agent turn loop, fake-provider tools, permissions, file search. Internal module layout in [`docs/architecture.md`](docs/architecture.md). |
 | `crates/kilo-protocol` | Frozen preview wire types and version constants. |
-| `crates/kilo-store` | Future Bun-compatible store seam. |
-| `crates/kilo-session` | Future session lifecycle seam. |
-| `crates/kilo-provider` | Future provider registry seam. |
-| `crates/kilo-tools` | Future built-in tools and permission seam. |
-| `crates/kilo-mcp` | Future MCP seam. |
-| `crates/kilo-oracle` | Future Bun/Rust oracle fixture harness seam. |
+| `crates/kilo-store` | Bun-compatible session/config/auth SQLite + JSON store. |
+| `crates/kilo-provider` | Provider registry, OpenAI Responses API client, OAuth helpers. |
+| `crates/kilo-session` | Reserved (empty) — future M8/M9 extraction target for session lifecycle. |
+| `crates/kilo-tools` | Reserved (empty) — future M8/M9 extraction target for built-in tools + permission. |
+| `crates/kilo-mcp` | Reserved (empty) — future MCP transport seam. |
+| `crates/kilo-oracle` | Bun/Rust oracle fixture harness for behavioral parity. |
+
+For the internal module tree of `kilo-server` (state, http, routes, oauth, agent,
+util) and the in-flight migration sequence, see
+[`docs/architecture.md`](docs/architecture.md).
 
 ## Build and run
 
@@ -45,10 +49,9 @@ The deterministic sidebar first-chat smoke is an oracle integration test instead
 cargo test -p kilo-oracle --test m7_rust_fixtures m7_sidebar_first_chat_smoke_streams_persists_and_reads_back -- --nocapture
 ```
 
-For a manual live UI check after building the Rust binary, launch the extension with the Rust runtime selected:
+For a manual live UI check after building the Rust binary, launch the extension with the local sidecar path:
 
 ```bat
-set KILO_VSCODE_SIDECAR_RUNTIME=rust
 set KILO_VSCODE_RUST_SIDECAR_PATH=packages\kilo-vscode-sidecar-rs\target\debug\kilo-vscode-sidecar.exe
 bun run extension
 ```
@@ -58,14 +61,11 @@ The scripted smoke does not require provider credentials. The manual UI path use
 For VS Code extension development, point the extension at a locally built sidecar:
 
 ```sh
-set KILO_VSCODE_SIDECAR_RUNTIME=rust
 set KILO_VSCODE_RUST_SIDECAR_PATH=packages\kilo-vscode-sidecar-rs\target\debug\kilo-vscode-sidecar.exe
 ```
 
-Use `KILO_VSCODE_SIDECAR_RUNTIME=auto` to try Rust first and fall back to Bun only if Rust fails during startup, before any SDK request can mutate state.
-
 ## Rollback
 
-Bun remains the default runtime. Set `KILO_VSCODE_SIDECAR_RUNTIME=bun` or the VS Code setting `kilo-code.new.sidecarRuntime` to `bun` to force the existing bundled Bun sidecar.
+There is no extension runtime switch now. Roll back by reverting the Rust-only sidecar wiring and rebuilding the extension package.
 
 See `CONTRACT.md` for the frozen preview seam.

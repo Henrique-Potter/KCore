@@ -387,6 +387,34 @@ describe("i18n key validation — no missing translation keys", () => {
   })
 })
 
+describe("i18n key prune regression — removed marketplace keys must not return", () => {
+  // Tracks keys that were intentionally removed when the marketplace UI was
+  // pruned (commit edfb7e5b9). If any of these reappear in a locale dict it
+  // means a translation merge resurrected a dangling key.
+  const FORBIDDEN_SUBSTRINGS = ["mcpBrowseMarketplace"]
+  const allDicts: Record<string, Record<string, string>> = {
+    ...Object.fromEntries(Object.entries(appLocales).map(([k, v]) => [`app/${k}`, v])),
+    ...Object.fromEntries(Object.entries(uiLocales).map(([k, v]) => [`ui/${k}`, v])),
+    ...Object.fromEntries(Object.entries(kiloLocales).map(([k, v]) => [`kilo/${k}`, v])),
+    ...Object.fromEntries(Object.entries(cliLocales).map(([k, v]) => [`cli/${k}`, v])),
+  }
+
+  it("no locale dict contains a key matching a forbidden substring", () => {
+    const offenders: Array<{ dict: string; key: string }> = []
+    for (const [name, dict] of Object.entries(allDicts)) {
+      for (const key of Object.keys(dict)) {
+        if (FORBIDDEN_SUBSTRINGS.some((s) => key.includes(s))) {
+          offenders.push({ dict: name, key })
+        }
+      }
+    }
+    expect(
+      offenders,
+      `Found ${offenders.length} forbidden i18n key(s):\n${offenders.map((o) => `  [${o.dict}] ${o.key}`).join("\n")}`,
+    ).toEqual([])
+  })
+})
+
 describe("i18n locale completeness — every English key exists in all locales", () => {
   it("shared UI: every English key has a translation in all locales", () => {
     const missing = findMissingLocaleKeys(uiEn, uiLocales)

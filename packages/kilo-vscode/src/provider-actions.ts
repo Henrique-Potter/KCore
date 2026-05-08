@@ -9,7 +9,7 @@ import {
   sanitizeCustomProviderConfig,
   withCustomProviderDeletions,
 } from "./shared/custom-provider"
-import { KILO_AUTO, parseModelString } from "./shared/provider-model"
+import { parseModelString } from "./shared/provider-model"
 import { configFeatures } from "./features"
 
 /**
@@ -118,7 +118,7 @@ export function computeDefaultSelection(
   const configured = parseModelString(cachedConfig?.config?.model)
   if (configured) return configured
   if (vscodePID && vscodeMID) return { providerID: vscodePID, modelID: vscodeMID }
-  return { ...KILO_AUTO }
+  return { providerID: "openai", modelID: "" }
 }
 
 type PostMessage = (message: unknown) => void
@@ -249,10 +249,6 @@ export async function disconnectProvider(
     } catch (err) {
       if (!configured) throw err
       console.warn(`[Kilo New] auth.remove failed for configured provider ${id} (non-fatal):`, err)
-    }
-
-    if (id === "kilo") {
-      ctx.postMessage({ type: "profileData", data: null })
     }
 
     // Config-sourced providers stay "connected" after auth.remove because the

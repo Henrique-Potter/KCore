@@ -21,8 +21,6 @@ import { formatRelativeDate } from "../../utils/date"
 import { FeedbackDialog } from "./FeedbackDialog"
 import { VscodeSessionTurn } from "./VscodeSessionTurn"
 import { RevertBanner } from "./RevertBanner"
-import { AccountSwitcher } from "../shared/AccountSwitcher"
-import { KiloNotifications } from "./KiloNotifications"
 import { WorkingIndicator } from "../shared/WorkingIndicator"
 import { QuestionDock } from "./QuestionDock"
 import { Virtualizer } from "virtua/solid"
@@ -170,12 +168,6 @@ export const MessageList: Component<MessageListProps> = (props) => {
 
   return (
     <div class="message-list-container">
-      <Show when={isEmpty()}>
-        <div class="welcome-header">
-          <AccountSwitcher class="account-switcher-welcome" />
-          <KiloNotifications />
-        </div>
-      </Show>
       <div ref={setScrollRef} onScroll={handleScroll} class="message-list" role="log" aria-live="polite">
         <div ref={autoScroll.contentRef} class={isEmpty() ? "message-list-content-empty" : "message-list-content"}>
           <Show when={session.loading()}>

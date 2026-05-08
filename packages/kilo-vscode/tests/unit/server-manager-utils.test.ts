@@ -3,7 +3,7 @@ import { parseServerPort } from "../../src/services/cli-backend/server-utils"
 import { toErrorMessage } from "../../src/services/cli-backend/server-manager"
 
 describe("parseServerPort", () => {
-  it("parses port from standard CLI startup message", () => {
+  it("parses port from standard sidecar startup message", () => {
     expect(parseServerPort("kilo server listening on http://127.0.0.1:12345")).toBe(12345)
   })
 
@@ -88,14 +88,14 @@ describe("toErrorMessage", () => {
     expect(result.userDetails).toContain("startup failed")
   })
 
-  it("includes CLI path in userDetails when provided", () => {
-    const result = toErrorMessage("startup failed", [], "/usr/local/bin/kilo")
-    expect(result.userDetails).toContain("CLI path: /usr/local/bin/kilo")
+  it("includes sidecar path in userDetails when provided", () => {
+    const result = toErrorMessage("startup failed", [], "/usr/local/bin/kilo-vscode-sidecar")
+    expect(result.userDetails).toContain("Sidecar path: /usr/local/bin/kilo-vscode-sidecar")
   })
 
-  it("does not include CLI path in userDetails when not provided", () => {
+  it("does not include sidecar path in userDetails when not provided", () => {
     const result = toErrorMessage("startup failed", [])
-    expect(result.userDetails).not.toContain("CLI path:")
+    expect(result.userDetails).not.toContain("Sidecar path:")
   })
 
   it("returns original error string as error field", () => {

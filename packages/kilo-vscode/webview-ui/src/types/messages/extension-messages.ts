@@ -3,13 +3,13 @@ import type { PartBatch, PartUpdate } from "../../../../src/shared/stream-messag
 import type { SessionMode } from "../../context/worktree-mode"
 import type { ConnectionState, ServerInfo, SessionStatus } from "./connection"
 import type { FileAttachment, Part } from "./parts"
-import type { CloudSessionInfo, Message, MessageLoadMode, SessionInfo } from "./sessions"
+import type { Message, MessageLoadMode, SessionInfo } from "./sessions"
 import type { PermissionRequest } from "./permissions"
 import type { QuestionRequest, SuggestionRequest, TodoItem } from "./questions"
 import type { ModelSelection, Provider, ProviderAuthState } from "./providers"
 import type { AgentInfo, SkillInfo, SlashCommandInfo } from "./agents"
 import type { BrowserSettings, Config, FeatureFlags, IndexingStatus } from "./config"
-import type { KilocodeNotification, ProfileData } from "./profile"
+import type { CloudSessionInfo, KilocodeNotification, ProfileData, DeviceAuthState } from "./profile"
 import type {
   AgentManagerApplyWorktreeDiffConflict,
   AgentManagerApplyWorktreeDiffStatus,
@@ -189,28 +189,24 @@ export interface GitRemoteUrlLoadedMessage {
   gitUrl: string | null
 }
 
-export interface CloudSessionDataLoadedMessage {
-  type: "cloudSessionDataLoaded"
-  cloudSessionId: string
-  title: string
-  messages: Message[]
+export interface NotificationsLoadedMessage {
+  type: "notificationsLoaded"
+  notifications: KilocodeNotification[]
+  dismissedIds: string[]
 }
 
-export interface CloudSessionImportedMessage {
-  type: "cloudSessionImported"
-  cloudSessionId: string
-  session: SessionInfo
+export interface ProfileDataMessage {
+  type: "profileData"
+  data: ProfileData | null
 }
 
-export interface CloudSessionImportFailedMessage {
-  type: "cloudSessionImportFailed"
-  cloudSessionId: string
-  error: string
+export interface DeviceAuthStateMessage {
+  type: "deviceAuthState"
+  state: DeviceAuthState
 }
 
-export interface OpenCloudSessionMessage {
-  type: "openCloudSession"
-  sessionId: string
+export interface DeviceAuthCompleteMessage {
+  type: "deviceAuthComplete"
 }
 
 export interface ActionMessage {
@@ -239,34 +235,9 @@ export interface TriggerTaskMessage {
   text: string
 }
 
-export interface ProfileDataMessage {
-  type: "profileData"
-  data: ProfileData | null
-}
-
-export interface DeviceAuthStartedMessage {
-  type: "deviceAuthStarted"
-  code?: string
-  verificationUrl: string
-  expiresIn: number
-}
-
-export interface DeviceAuthCompleteMessage {
-  type: "deviceAuthComplete"
-}
-
-export interface DeviceAuthFailedMessage {
-  type: "deviceAuthFailed"
-  error: string
-}
-
-export interface DeviceAuthCancelledMessage {
-  type: "deviceAuthCancelled"
-}
-
 export interface NavigateMessage {
   type: "navigate"
-  view: "newTask" | "history" | "profile" | "settings" | "subAgentViewer"
+  view: "newTask" | "history" | "settings" | "subAgentViewer"
   tab?: string
 }
 
@@ -435,12 +406,6 @@ export interface NotificationSettingsLoadedMessage {
 export interface TimelineSettingLoadedMessage {
   type: "timelineSettingLoaded"
   visible: boolean
-}
-
-export interface NotificationsLoadedMessage {
-  type: "notificationsLoaded"
-  notifications: KilocodeNotification[]
-  dismissedIds: string[]
 }
 
 // Agent Manager worktree session metadata
@@ -778,12 +743,6 @@ export interface ContinueInWorktreeProgressMessage {
   error?: string
 }
 
-export interface RemoteStatusMessage {
-  type: "remoteStatus"
-  enabled: boolean
-  connected: boolean
-}
-
 export type ExtensionMessage =
   | ReadyMessage
   | GitStatusMessage
@@ -808,12 +767,11 @@ export type ExtensionMessage =
   | SessionsLoadedMessage
   | CloudSessionsLoadedMessage
   | GitRemoteUrlLoadedMessage
-  | ActionMessage
+  | NotificationsLoadedMessage
   | ProfileDataMessage
-  | DeviceAuthStartedMessage
+  | DeviceAuthStateMessage
   | DeviceAuthCompleteMessage
-  | DeviceAuthFailedMessage
-  | DeviceAuthCancelledMessage
+  | ActionMessage
   | NavigateMessage
   | IndexingStatusLoadedMessage
   | ProvidersLoadedMessage
@@ -841,7 +799,6 @@ export type ExtensionMessage =
   | GlobalConfigLoadedMessage
   | NotificationSettingsLoadedMessage
   | TimelineSettingLoadedMessage
-  | NotificationsLoadedMessage
   | AgentManagerSessionMetaMessage
   | AgentManagerRepoInfoMessage
   | AgentManagerWorktreeSetupMessage
@@ -859,10 +816,6 @@ export type ExtensionMessage =
   | AppendReviewCommentsMessage
   | TriggerTaskMessage
   | VariantsLoadedMessage
-  | CloudSessionDataLoadedMessage
-  | CloudSessionImportedMessage
-  | CloudSessionImportFailedMessage
-  | OpenCloudSessionMessage
   | AgentManagerBranchesMessage
   | AgentManagerExternalWorktreesMessage
   | AgentManagerImportResultMessage
@@ -905,4 +858,3 @@ export type ExtensionMessage =
   | McpStatusLoadedMessage
   | ClearPendingPromptsMessage
   | ExtensionDataReadyMessage
-  | RemoteStatusMessage

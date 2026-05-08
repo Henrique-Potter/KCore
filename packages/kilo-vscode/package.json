@@ -45,9 +45,7 @@
     "Kilo Code",
     "kilocode"
   ],
-  "activationEvents": [
-    "onStartupFinished"
-  ],
+  "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
     "taskDefinitions": [
@@ -104,11 +102,6 @@
         "command": "kilo-code.new.historyButtonClicked",
         "title": "History",
         "icon": "$(history)"
-      },
-      {
-        "command": "kilo-code.new.profileButtonClicked",
-        "title": "Profile",
-        "icon": "$(account)"
       },
       {
         "command": "kilo-code.new.settingsButtonClicked",
@@ -370,11 +363,6 @@
           "when": "view == kilo-code.SidebarProvider"
         },
         {
-          "command": "kilo-code.new.profileButtonClicked",
-          "group": "navigation@5",
-          "when": "view == kilo-code.SidebarProvider"
-        },
-        {
           "command": "kilo-code.new.settingsButtonClicked",
           "group": "navigation@6",
           "when": "view == kilo-code.SidebarProvider"
@@ -408,11 +396,6 @@
         {
           "command": "kilo-code.new.historyButtonClicked",
           "group": "navigation@1",
-          "when": "activeWebviewPanelId == kilo-code.new.TabPanel"
-        },
-        {
-          "command": "kilo-code.new.profileButtonClicked",
-          "group": "navigation@2",
           "when": "activeWebviewPanelId == kilo-code.new.TabPanel"
         },
         {
@@ -721,13 +704,13 @@
         },
         "kilo-code.new.model.providerID": {
           "type": "string",
-          "default": "kilo",
+          "default": "openai",
           "description": "Default model provider ID for new sessions"
         },
         "kilo-code.new.model.modelID": {
           "type": "string",
-          "default": "kilo-auto/free",
-          "description": "Default model ID for new sessions"
+          "default": "",
+          "description": "Default model ID for new sessions (empty means user picks on first use)"
         },
         "kilo-code.new.autocomplete.model": {
           "type": "string",
@@ -763,18 +746,35 @@
         },
         "kilo-code.new.sidecarRuntime": {
           "type": "string",
-          "default": "bun",
+          "default": "auto",
           "enum": [
-            "bun",
+            "auto",
             "rust",
-            "auto"
+            "bun"
           ],
           "enumDescriptions": [
-            "Use the existing bundled Bun sidecar.",
-            "Use the preview Rust sidecar and surface startup failures.",
-            "Try the preview Rust sidecar, then fall back to Bun only if startup fails before mutable requests."
+            "Preview default: start the Rust sidecar first and fall back to Bun only before Rust accepts a mutation.",
+            "Always use the Rust sidecar. No automatic Bun fallback.",
+            "Always use the Bun CLI sidecar."
           ],
-          "description": "Select the VS Code backend sidecar runtime. Bun remains the default while the Rust sidecar is in preview. Can be overridden for development and CI with KILO_VSCODE_SIDECAR_RUNTIME."
+          "description": "Select which bundled sidecar runtime powers the Kilo Code backend. The KILO_VSCODE_SIDECAR_RUNTIME environment variable overrides this setting. Rollout controls can still disable Rust and fall back to Bun."
+        },
+        "kilo-code.new.sidecarRollout": {
+          "type": "string",
+          "default": "preview",
+          "enum": [
+            "disabled",
+            "internal",
+            "preview",
+            "stable"
+          ],
+          "enumDescriptions": [
+            "Disable Rust sidecar selection and use the Bun sidecar rollback path.",
+            "Internal validation phase: Rust can be selected by runtime setting or auto mode.",
+            "Preview validation phase: Rust can be selected by runtime setting or auto mode, with startup-only Bun fallback.",
+            "Stable rollout phase: Rust can be selected by runtime setting or auto mode, with Bun still packaged for rollback windows."
+          ],
+          "description": "Controls the local Rust sidecar rollout phase. KILO_VSCODE_SIDECAR_ROLLOUT overrides this setting; KILO_VSCODE_SIDECAR_KILL_SWITCH=1 disables Rust for emergency rollback."
         },
         "kilo-code.new.browserAutomation.enabled": {
           "type": "boolean",
@@ -842,13 +842,12 @@
     }
   },
   "scripts": {
-    "prepare:cli-binary": "bun script/local-bin.ts",
-    "compile": "bun run prepare:cli-binary -- --force && bun run rebuild-sdk && bun run typecheck && bun run lint && node esbuild.js",
+    "prepare:sidecar": "bun script/local-bin.ts",
+    "compile": "bun run prepare:sidecar -- --force && bun run rebuild-sdk && bun run typecheck && bun run lint && node esbuild.js",
     "watch": "bun run rebuild-sdk && bun run --parallel watch:esbuild watch:tsc",
-    "watch:esbuild": "bun run prepare:cli-binary && node esbuild.js --watch",
+    "watch:esbuild": "bun run prepare:sidecar && node esbuild.js --watch",
     "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
-    "watch:cli": "bun script/watch-cli.ts",
-    "package": "bun run prepare:cli-binary && bun run rebuild-sdk && bun run typecheck && bun run lint && node esbuild.js --production",
+    "package": "bun run prepare:sidecar && bun run rebuild-sdk && bun run typecheck && bun run lint && node esbuild.js --production",
     "compile-tests": "tsc -p . --outDir out",
     "watch-tests": "tsc -p . -w --outDir out",
     "pretest": "bun run compile-tests && bun run compile && bun run lint",

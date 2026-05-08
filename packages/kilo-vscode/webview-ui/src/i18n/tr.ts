@@ -448,15 +448,6 @@ export const dict = {
 
   "error.startup.title": "Sunucu bağlantısı başarısız",
 
-  "error.paidModel.title": "Bu modeli kullanmak için giriş yapmalısınız",
-  "error.paidModel.description":
-    "500'den fazla modele erişmek, kredileri maliyetle kullanmak veya kendi anahtarınızı getirmek için giriş yapın ya da hesap oluşturun.",
-  "error.paidModel.action": "Giriş Yap",
-  "error.promotionLimit.title": "Devam etmek için kayıt olmalısınız",
-  "error.promotionLimit.description":
-    "Devam etmek ve 500'den fazla modeli keşfetmek için ücretsiz kayıt olun. 2 dakika sürer, kredi kartı gerekmez. Ya da daha sonra gelin.",
-  "error.promotionLimit.action": "Kayıt Ol",
-
   "error.chain.unknown": "Bilinmeyen hata",
   "error.chain.causedBy": "Nedeni:",
   "error.chain.apiError": "API hatası",
@@ -777,7 +768,6 @@ export const dict = {
   "settings.providers.section.connected": "Bağlı sağlayıcılar",
   "settings.providers.connected.empty": "Bağlı sağlayıcı yok",
   "settings.providers.section.popular": "Popüler sağlayıcılar",
-  "settings.providers.tag.gateway": "Gateway",
   "settings.providers.tag.environment": "Ortam",
   "settings.providers.tag.config": "Yapılandırma",
   "settings.providers.tag.chatgpt": "ChatGPT",
@@ -952,22 +942,12 @@ export const dict = {
   "session.showHistory": "Geçmişi Göster",
   "session.search.placeholder": "Oturum ara...",
   "session.empty": "Henüz oturum yok. Yeni bir sohbet başlatmak için + tıklayın.",
-  "session.tab.local": "Local",
-  "session.tab.cloud": "Cloud",
-  "session.cloud.repoOnly": "Yalnızca bu depo",
-  "session.cloud.import": "Buluttan içe aktar",
   "feedback.button": "Geri Bildirim ve Destek",
   "feedback.dialog.message":
     "Geri bildiriminizi almaktan veya yaşadığınız sorunlarda yardımcı olmaktan mutluluk duyarız.",
   "feedback.dialog.github": "GitHub'da sorun bildirin",
   "feedback.dialog.discord": "Discord topluluğumuza katılın",
   "feedback.dialog.support": "Müşteri Desteği",
-  "session.cloud.import.title": "Buluttan içe aktar",
-  "session.cloud.import.placeholder": "Oturum kimliği, URL veya kilo import komutu",
-  "session.cloud.import.button": "İçe Aktar",
-  "session.cloud.import.invalid": "Geçersiz oturum kimliği biçimi",
-  "session.cloud.import.legacy": "Bu, artık desteklenmeyen eski bir oturum gibi görünüyor.",
-  "session.cloud.import.failed": "Bulut oturumu içe aktarılamadı",
 
   "workspace.new": "Yeni çalışma alanı",
   "workspace.type.local": "yerel",
@@ -995,36 +975,8 @@ export const dict = {
   "workspace.reset.archived.many": "{{count}} oturum arşivlenecek.",
   "workspace.reset.note": "Bu işlem çalışma alanını varsayılan dalla eşleşecek şekilde sıfırlayacak.",
 
-  "deviceAuth.toast.urlCopied": "URL panoya kopyalandı",
-  "deviceAuth.toast.codeCopied": "Kod panoya kopyalandı",
-  "deviceAuth.toast.errorCopied": "Hata panoya kopyalandı",
-  "deviceAuth.status.initiating": "Giriş başlatılıyor...",
-  "deviceAuth.title": "Kilo Code'a giriş yap",
-  "deviceAuth.step1": "Adım 1: Bu URL'yi açın",
-  "deviceAuth.action.copyUrl": "URL'yi Kopyala",
-  "deviceAuth.action.openBrowser": "Tarayıcıyı Aç",
-  "deviceAuth.qrCode.alt": "QR Kodu",
-  "deviceAuth.step2": "Adım 2: Bu kodu girin",
-  "deviceAuth.action.clickToCopy": "Kopyalamak için tıklayın",
-  "deviceAuth.status.waiting": "Yetkilendirme bekleniyor...",
-  "deviceAuth.status.success": "Giriş başarılı!",
-  "deviceAuth.status.failed": "Giriş başarısız",
-  "deviceAuth.status.cancelled": "Giriş iptal edildi",
-  "deviceAuth.action.copyError": "Hatayı kopyala",
-  "deviceAuth.action.showDetails": "Ayrıntıları göster",
-  "deviceAuth.action.tryAgain": "Tekrar Dene",
-  "deviceAuth.error.detailsTitle": "Giriş hatası ayrıntıları",
-
   "common.retry": "Tekrar Dene",
   "common.refresh": "Yenile",
-
-  "profile.title": "Profil",
-  "profile.notLoggedIn": "Giriş yapılmadı",
-  "profile.action.login": "Kilo Code ile giriş yap",
-  "profile.balance.title": "Bakiye",
-  "profile.balance.refresh": "Bakiyeyi yenile",
-  "profile.action.dashboard": "Kontrol Paneli",
-  "profile.action.logout": "Çıkış Yap",
 
   "settings.section.configuration": "Yapılandırma",
   "settings.agentBehaviour.title": "Ajan Davranışı",
@@ -1295,7 +1247,6 @@ export const dict = {
   "settings.agentBehaviour.addMcp.args.placeholder": "e.g.\n-y\n@modelcontextprotocol/server-filesystem\n/tmp",
   "settings.agentBehaviour.addMcp.url": "Sunucu URL'si",
   "settings.agentBehaviour.addMcp.url.placeholder": "e.g. http://localhost:3000/sse",
-  "settings.agentBehaviour.mcpBrowseMarketplace": "Marketplace'e Göz At",
   "settings.agentBehaviour.mcpEmpty":
     "Yapılandırılmış MCP sunucusu yok. kilo.jsonc dosyasına MCP sunucuları ekleyin veya ajanın eklemesini isteyin.",
   "settings.agentBehaviour.workflowsPlaceholder": "İş akışları çalışma alanınızdaki iş akışı dosyaları ile yönetilir.",
@@ -1389,8 +1340,6 @@ export const dict = {
   "settings.providers.select.placeholder": "Sağlayıcı seç...",
 
   "dialog.model.notSet": "Ayarlanmadı",
-
-  "profile.personalAccount": "Kişisel Hesap",
 
   // Agent Manager strings live in webview-ui/agent-manager/i18n/en.ts
 
@@ -1502,12 +1451,7 @@ export const dict = {
   "settings.saveBar.cancel": "İptal",
   "settings.saveBar.saving": "Kaydediliyor…",
   "settings.saveBar.saveFailed": "Ayarlar kaydedilemedi",
-  "notifications.action.next": "Sonraki",
-  "notifications.action.close": "Kapat",
-  "notifications.action.tryModel": "Dene {{model}}",
-  "notifications.action.tryModelGeneric": "Modeli Dene",
   // Missing translations - English fallbacks until translated
-  "profile.switchingAccount": "Hesap değiştiriliyor…",
   "settings.agentBehaviour.createMode": "Yeni Mod Oluştur",
   "settings.agentBehaviour.createMode.button": "Oluştur",
   "settings.agentBehaviour.createMode.cancel": "İptal",

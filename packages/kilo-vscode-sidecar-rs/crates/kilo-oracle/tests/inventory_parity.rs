@@ -72,6 +72,12 @@ fn parse_sdk_calls(src: &str) -> HashSet<(String, String)> {
 
 /// Extract `(METHOD, /path)` pairs from inventory markdown table rows.
 /// Rows look like `| GET | \`/global/health\` | ... |`.
+///
+/// Rows whose final "Call sites" column starts with `Rust sidecar` are
+/// recognized as **Rust-only baseline routes** (M11+ surfaces that exist
+/// in the Rust sidecar but are not yet emitted by the generated SDK).
+/// Those rows are excluded from the SDK-parity check — they have no SDK
+/// counterpart by design.
 fn parse_inventory_rows(src: &str) -> Vec<(String, String, usize)> {
     static ROW: Lazy<Regex> = Lazy::new(|| {
         // Method is a known HTTP verb; path is wrapped in single backticks
@@ -79,11 +85,23 @@ fn parse_inventory_rows(src: &str) -> Vec<(String, String, usize)> {
         // table-header rows (`| M | Path | ... |`) are skipped.
         Regex::new(r#"^\|\s*(GET|POST|PUT|PATCH|DELETE|HEAD)\s*\|\s*`(/[^`]+)`"#).unwrap()
     });
+    static RUST_ONLY: Lazy<Regex> = Lazy::new(|| {
+        // Last "Call sites" cell. `\|([^|]+)\|\s*$` captures the final
+        // table cell; we then trim and check the "Rust sidecar" prefix.
+        Regex::new(r#"\|([^|]+)\|\s*$"#).unwrap()
+    });
     let mut out = Vec::new();
     for (i, line) in src.lines().enumerate() {
-        if let Some(cap) = ROW.captures(line) {
-            out.push((cap[1].to_string(), cap[2].to_string(), i + 1));
+        let Some(cap) = ROW.captures(line) else {
+            continue;
+        };
+        if let Some(last) = RUST_ONLY.captures(line) {
+            let cell = last[1].trim();
+            if cell.starts_with("Rust sidecar") || cell.starts_with("Rust-only") {
+                continue;
+            }
         }
+        out.push((cap[1].to_string(), cap[2].to_string(), i + 1));
     }
     out
 }

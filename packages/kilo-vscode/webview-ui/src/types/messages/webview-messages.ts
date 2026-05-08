@@ -75,48 +75,6 @@ export interface LoadSessionsRequest {
   type: "loadSessions"
 }
 
-export interface RequestCloudSessionsMessage {
-  type: "requestCloudSessions"
-  cursor?: string
-  limit?: number
-  gitUrl?: string
-}
-
-export interface RequestGitRemoteUrlMessage {
-  type: "requestGitRemoteUrl"
-}
-
-export interface RequestCloudSessionDataMessage {
-  type: "requestCloudSessionData"
-  sessionId: string
-}
-
-export interface ImportAndSendMessage {
-  type: "importAndSend"
-  cloudSessionId: string
-  text: string
-  messageID?: string
-  providerID?: string
-  modelID?: string
-  agent?: string
-  variant?: string
-  files?: FileAttachment[]
-  command?: string
-  commandArgs?: string
-}
-
-export interface LoginRequest {
-  type: "login"
-}
-
-export interface LogoutRequest {
-  type: "logout"
-}
-
-export interface RefreshProfileRequest {
-  type: "refreshProfile"
-}
-
 export interface OpenExternalRequest {
   type: "openExternal"
   url: string
@@ -129,21 +87,49 @@ export interface OpenFileRequest {
   column?: number
 }
 
-export interface CancelLoginRequest {
-  type: "cancelLogin"
-}
-
-export interface SetOrganizationRequest {
-  type: "setOrganization"
-  organizationId: string | null
-}
-
 export interface WebviewReadyRequest {
   type: "webviewReady"
 }
 
 export interface RequestProvidersMessage {
   type: "requestProviders"
+}
+
+export interface RequestGitRemoteUrlMessage {
+  type: "requestGitRemoteUrl"
+}
+
+export interface RequestCloudSessionsMessage {
+  type: "requestCloudSessions"
+  cursor?: string
+  limit?: number
+  gitUrl?: string
+}
+
+export interface RefreshProfileMessage {
+  type: "refreshProfile"
+}
+
+export interface SetOrganizationMessage {
+  type: "setOrganization"
+  organizationId: string | null
+}
+
+export interface LogoutMessage {
+  type: "logout"
+}
+
+export interface CancelLoginMessage {
+  type: "cancelLogin"
+}
+
+export interface RequestNotificationsMessage {
+  type: "requestNotifications"
+}
+
+export interface DismissNotificationMessage {
+  type: "dismissNotification"
+  notificationId: string
 }
 
 export interface CompactRequest {
@@ -387,15 +373,6 @@ export interface ResetAllSettingsRequest {
 export interface SettingsTabChangedMessage {
   type: "settingsTabChanged"
   tab: string
-}
-
-export interface RequestNotificationsMessage {
-  type: "requestNotifications"
-}
-
-export interface DismissNotificationMessage {
-  type: "dismissNotification"
-  notificationId: string
 }
 
 export interface SyncSessionRequest {
@@ -769,19 +746,6 @@ export interface ToggleAutoApproveMessage {
   type: "toggleAutoApprove"
 }
 
-export interface ToggleRemoteMessage {
-  type: "toggleRemote"
-}
-
-export interface SetRemoteEnabledMessage {
-  type: "setRemoteEnabled"
-  enabled: boolean
-}
-
-export interface RequestRemoteStatusMessage {
-  type: "requestRemoteStatus"
-}
-
 export interface ConnectProviderMessage {
   type: "connectProvider"
   requestId: string
@@ -922,11 +886,6 @@ export type WebviewMessage =
   | ClearSessionRequest
   | LoadMessagesRequest
   | LoadSessionsRequest
-  | RequestCloudSessionsMessage
-  | RequestGitRemoteUrlMessage
-  | LoginRequest
-  | LogoutRequest
-  | RefreshProfileRequest
   | OpenExternalRequest
   | OpenSettingsPanelRequest
   | OpenVSCodeSettingsRequest
@@ -934,10 +893,16 @@ export type WebviewMessage =
   | OpenAgentManagerRequest
   | OpenAdvancedWorktreeRequest
   | OpenFileRequest
-  | CancelLoginRequest
-  | SetOrganizationRequest
   | WebviewReadyRequest
   | RequestProvidersMessage
+  | RequestGitRemoteUrlMessage
+  | RequestCloudSessionsMessage
+  | RefreshProfileMessage
+  | SetOrganizationMessage
+  | LogoutMessage
+  | CancelLoginMessage
+  | RequestNotificationsMessage
+  | DismissNotificationMessage
   | CompactRequest
   | RequestAgentsMessage
   | RequestSkillsMessage
@@ -977,8 +942,6 @@ export type WebviewMessage =
   | SettingsTabChangedMessage
   | SyncSessionRequest
   | CreateWorktreeSessionRequest
-  | RequestNotificationsMessage
-  | DismissNotificationMessage
   | CreateWorktreeRequest
   | DeleteWorktreeRequest
   | RemoveStaleWorktreeRequest
@@ -1011,8 +974,6 @@ export type WebviewMessage =
   | SetReviewDiffStyleRequest
   | PersistVariantRequest
   | RequestVariantsMessage
-  | RequestCloudSessionDataMessage
-  | ImportAndSendMessage
   | RequestBranchesMessage
   | RequestExternalWorktreesMessage
   | ImportFromBranchRequest
@@ -1057,9 +1018,6 @@ export type WebviewMessage =
   | PersistModelSelectionRequest
   | ClearModelSelectionRequest
   | RequestModelSelectionsMessage
-  | ToggleRemoteMessage
-  | SetRemoteEnabledMessage
-  | RequestRemoteStatusMessage
   | ContinueInWorktreeRequest
   | CreateSectionRequest
   | RenameSectionRequest

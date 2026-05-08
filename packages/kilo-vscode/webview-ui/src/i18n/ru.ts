@@ -448,15 +448,6 @@ export const dict = {
 
   "error.startup.title": "Ошибка подключения к серверу",
 
-  "error.paidModel.title": "Для использования этой модели необходимо войти",
-  "error.paidModel.description":
-    "Войдите или создайте аккаунт для доступа к более чем 500 моделям, используйте кредиты по себестоимости или подключите свой ключ.",
-  "error.paidModel.action": "Войти",
-  "error.promotionLimit.title": "Для продолжения необходимо зарегистрироваться",
-  "error.promotionLimit.description":
-    "Зарегистрируйтесь бесплатно, чтобы продолжить и исследовать более 500 моделей. Займёт 2 минуты, кредитная карта не нужна. Или вернитесь позже.",
-  "error.promotionLimit.action": "Зарегистрироваться",
-
   "error.chain.unknown": "Неизвестная ошибка",
   "error.chain.causedBy": "Причина:",
   "error.chain.apiError": "Ошибка API",
@@ -804,7 +795,6 @@ export const dict = {
   "settings.providers.section.popular": "Популярные провайдеры",
   "settings.providers.search.placeholder": "Поиск провайдеров",
   "settings.providers.select.placeholder": "Выберите провайдера...",
-  "settings.providers.tag.gateway": "Gateway",
   "settings.providers.tag.environment": "Среда",
   "settings.providers.tag.config": "Конфигурация",
   "settings.providers.tag.chatgpt": "ChatGPT",
@@ -983,21 +973,11 @@ export const dict = {
   "session.showHistory": "Показать историю",
   "session.search.placeholder": "Поиск сессий...",
   "session.empty": "Сессий пока нет. Нажмите + чтобы начать новый разговор.",
-  "session.tab.local": "Локальный",
-  "session.tab.cloud": "Облако",
-  "session.cloud.repoOnly": "Только этот репозиторий",
-  "session.cloud.import": "Импорт из облака",
   "feedback.button": "Отзывы и поддержка",
   "feedback.dialog.message": "Мы будем рады услышать ваши отзывы или помочь с любыми возникающими проблемами.",
   "feedback.dialog.github": "Сообщить о проблеме на GitHub",
   "feedback.dialog.discord": "Присоединиться к нашему Discord",
   "feedback.dialog.support": "Служба поддержки",
-  "session.cloud.import.title": "Импорт из облака",
-  "session.cloud.import.placeholder": "ID сессии, URL или команда kilo import",
-  "session.cloud.import.button": "Импортировать",
-  "session.cloud.import.invalid": "Неверный формат ID сессии",
-  "session.cloud.import.legacy": "Похоже, это устаревшая сессия, которая больше не поддерживается.",
-  "session.cloud.import.failed": "Не удалось импортировать облачную сессию",
 
   "workspace.new": "Новое рабочее пространство",
   "workspace.type.local": "локальное",
@@ -1025,36 +1005,8 @@ export const dict = {
   "workspace.reset.archived.many": "{{count}} сессий будет архивировано.",
   "workspace.reset.note": "Рабочее пространство будет сброшено в соответствие с веткой по умолчанию.",
 
-  "deviceAuth.toast.urlCopied": "URL скопирован в буфер обмена",
-  "deviceAuth.toast.codeCopied": "Код скопирован в буфер обмена",
-  "deviceAuth.toast.errorCopied": "Ошибка скопирована в буфер обмена",
-  "deviceAuth.status.initiating": "Начинаем вход...",
-  "deviceAuth.title": "Войти в Kilo Code",
-  "deviceAuth.step1": "Шаг 1: Откройте этот URL",
-  "deviceAuth.action.copyUrl": "Копировать URL",
-  "deviceAuth.action.openBrowser": "Открыть браузер",
-  "deviceAuth.qrCode.alt": "QR-код",
-  "deviceAuth.step2": "Шаг 2: Введите этот код",
-  "deviceAuth.action.clickToCopy": "Нажмите, чтобы скопировать",
-  "deviceAuth.status.waiting": "Ожидание авторизации...",
-  "deviceAuth.status.success": "Вход выполнен успешно!",
-  "deviceAuth.status.failed": "Ошибка входа",
-  "deviceAuth.error.detailsTitle": "Подробности ошибки входа",
-  "deviceAuth.status.cancelled": "Вход отменён",
-  "deviceAuth.action.tryAgain": "Попробовать снова",
-  "deviceAuth.action.copyError": "Копировать ошибку",
-  "deviceAuth.action.showDetails": "Посмотреть детали",
-
   "common.retry": "Повторить",
   "common.refresh": "Обновить",
-
-  "profile.title": "Профиль",
-  "profile.notLoggedIn": "Не авторизован",
-  "profile.action.login": "Войти через Kilo Code",
-  "profile.balance.title": "Баланс",
-  "profile.balance.refresh": "Обновить баланс",
-  "profile.action.dashboard": "Панель управления",
-  "profile.action.logout": "Выйти",
 
   "settings.section.configuration": "Конфигурация",
   "settings.agentBehaviour.title": "Поведение агента",
@@ -1331,7 +1283,6 @@ export const dict = {
   "settings.agentBehaviour.mcpDetail.args": "Аргументы",
   "settings.agentBehaviour.mcpDetail.env": "Окружение",
   "settings.agentBehaviour.mcpDetail.disabled": "Этот сервер отключён.",
-  "settings.agentBehaviour.mcpBrowseMarketplace": "Обзор Marketplace",
   "settings.agentBehaviour.mcpEmpty":
     "MCP-серверы не настроены. Добавьте MCP-серверы в kilo.jsonc или попросите агента добавить их.",
   "settings.agentBehaviour.workflowsPlaceholder": "Рабочие процессы управляются через файлы рабочих процессов.",
@@ -1415,8 +1366,6 @@ export const dict = {
   "settings.providers.enabled.description": "Если установлено, только эти провайдеры будут доступны",
   "settings.providers.notSet": "Не задано (использовать значение сервера по умолчанию)",
   "dialog.model.notSet": "Не задано",
-  "profile.personalAccount": "Личный аккаунт",
-  "profile.switchingAccount": "Переключение аккаунта…",
   // Agent Manager strings live in webview-ui/agent-manager/i18n/ru.ts
 
   "question.summary": "{{n}} из {{total}} вопросов",
@@ -1525,8 +1474,4 @@ export const dict = {
   "settings.saveBar.cancel": "Отмена",
   "settings.saveBar.saving": "Сохранение…",
   "settings.saveBar.saveFailed": "Не удалось сохранить настройки",
-  "notifications.action.next": "Далее",
-  "notifications.action.close": "Закрыть",
-  "notifications.action.tryModel": "Попробовать {{model}}",
-  "notifications.action.tryModelGeneric": "Попробовать модель",
 }

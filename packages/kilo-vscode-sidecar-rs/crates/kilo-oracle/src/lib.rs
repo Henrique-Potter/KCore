@@ -26,6 +26,7 @@ pub const CRATE: &str = "kilo-oracle";
 /// `CONTRACT.md`. Bump in lockstep with the doc.
 pub const CONTRACT_VERSION: &str = "kilo-vscode-sidecar.preview.0";
 
+pub mod benchmark;
 pub mod error;
 pub mod fixture;
 pub mod http;
@@ -35,6 +36,7 @@ pub mod scenarios;
 pub mod spawn;
 pub mod sse;
 
+pub use benchmark::{BenchmarkGate, BenchmarkReport, BenchmarkThresholds, GateMetric, GateStatus};
 pub use error::{OracleError, OracleResult};
 pub use fixture::{Fixture, FixtureFile, FixtureFrame, FixtureMeta};
 pub use http::OracleClient;

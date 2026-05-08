@@ -1,10 +1,7 @@
 import type { Event } from "@kilocode/sdk/v2/client"
 
 /**
- * The HTTP methods that count as a "mutation" for the M3 fallback gate.
- * Any of these on the SDK fetch path means the sidecar may have observed
- * state, so silently switching processes after a successful one would risk
- * losing or duplicating that state.
+ * The HTTP methods that count as accepted sidecar mutations for diagnostics.
  *
  * GET/HEAD/OPTIONS are the only safe-by-default methods. Everything else
  * (POST/PUT/PATCH/DELETE) is treated as a mutation candidate.
@@ -29,16 +26,8 @@ export function methodFromFetchArgs(input: RequestInfo | URL, init?: RequestInit
 }
 
 /**
- * Wrap a `fetch` so that the M3 mutation gate (`onMutationObserved`) flips
- * exactly once, **after** the sidecar has accepted a mutation by responding
- * with a 2xx status — never on the request side.
- *
- * The earlier implementation (`packages/kilo-vscode/src/services/cli-backend/
- * connection-service.ts` pre-fix) flipped the gate on the request method
- * alone, before the response was known. That made any Rust route returning
- * 4xx (e.g. unregistered `PATCH /global/config` before M5) permanently lock
- * fallback to a broken Rust process: the SDK error never persisted state,
- * but the gate had already flipped.
+ * Wrap a `fetch` so `onMutationObserved` runs after the sidecar has accepted a
+ * mutation by responding with a 2xx status, never on the request side.
  *
  * Behavior:
  *
@@ -46,11 +35,11 @@ export function methodFromFetchArgs(input: RequestInfo | URL, init?: RequestInit
  *   `onMutationObserved()` is called once. Streaming routes (e.g.
  *   `POST /session/{id}/prompt_async`) flip on the initial 200 OK headers,
  *   which is correct: by then Rust has accepted the prompt.
- * - Mutating method with a 3xx/4xx/5xx response → gate is **not** flipped.
- *   Rust did not accept the mutation, so falling back stays safe.
- * - Mutating method with a network error (baseFetch throws) → gate is
- *   **not** flipped, error is re-thrown. Same reasoning: no acceptance.
- * - GET/HEAD/OPTIONS regardless of status → gate is **not** flipped.
+ * - Mutating method with a 3xx/4xx/5xx response → callback is **not** called.
+ *   Rust did not accept the mutation.
+ * - Mutating method with a network error (baseFetch throws) → callback is
+ *   **not** called, error is re-thrown. Same reasoning: no acceptance.
+ * - GET/HEAD/OPTIONS regardless of status → callback is **not** called.
  *
  * The returned function preserves the standard `fetch` signature so it can
  * be passed directly to `createKiloClient({ fetch })`.

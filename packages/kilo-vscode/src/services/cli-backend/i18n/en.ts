@@ -1,6 +1,6 @@
 export const dict = {
-  "server.processExited": "CLI process exited with code {{code}} before server started",
+  "server.processExited": "Sidecar process exited with code {{code}} before server started",
   "server.startupTimeout": "Server startup timeout after {{seconds}} seconds",
-  "remote.connected": "Kilo Remote: Connected",
-  "remote.connecting": "Kilo Remote: Connecting\u2026",
+  "remote.connected": "Connected to Kilo remote control",
+  "remote.connecting": "Connecting to Kilo remote control…",
 } as const

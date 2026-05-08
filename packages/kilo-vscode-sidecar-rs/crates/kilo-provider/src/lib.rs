@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, env, fmt, sync::atomic::AtomicBool, time::Duration};
+use std::{
+    collections::BTreeSet,
+    env, fmt,
+    sync::{atomic::AtomicBool, LazyLock},
+    time::Duration,
+};
 
 use futures_util::StreamExt;
 use kilo_protocol::{Config, ConfigProvidersResult, ProviderResult};
@@ -17,6 +22,20 @@ pub use openai_responses::{classify_stream, error_envelope, ResponsesStreamPart,
 
 const OPENAI_BASE: &str = "https://api.openai.com/v1";
 const CODEX_BASE: &str = "https://chatgpt.com/backend-api/codex";
+static HTTP: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|err| err.to_string())
+});
+static AGENT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "opencode/{} ({}/{})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+});
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatRequest {
@@ -24,6 +43,7 @@ pub struct ChatRequest {
     pub model: String,
     pub base: String,
     pub auth: ChatAuth,
+    pub session_id: Option<String>,
     pub instructions: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ChatTool>,
@@ -40,10 +60,18 @@ pub enum ChatAuth {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing)]
+    pub responses: Vec<ChatResponseItem>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum ChatResponseItem {
+    FunctionCall(ChatToolCall),
+    FunctionOutput { id: String, output: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -53,7 +81,7 @@ pub struct ChatTool {
     pub parameters: Value,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ChatToolCall {
     pub id: String,
     pub name: String,
@@ -70,11 +98,14 @@ pub struct ChatOutput {
     pub finish: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChatUsage {
     pub input: u64,
     pub output: u64,
     pub total: u64,
+    pub reasoning: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -125,6 +156,11 @@ pub enum ProviderError {
     /// [`post_stream`] when the `until_cancel` race wins. kilo-server maps
     /// this to the `MessageAbortedError` envelope via `aborted_error()`.
     Aborted,
+    /// The model rejected the input as too long (Bun parity: triggers
+    /// compaction in `prompt.ts:1654-1675`). Detected at HTTP-status time
+    /// by [`api_is_context_window`] from upstream error bodies. The agent
+    /// loop catches this, summarizes the session, and retries.
+    ContextWindow(String),
 }
 
 impl fmt::Display for ProviderError {
@@ -136,6 +172,7 @@ impl fmt::Display for ProviderError {
             Self::MissingKey { provider } => write!(f, "missing apiKey for provider {provider}"),
             Self::Http(err) => write!(f, "provider HTTP error: {err}"),
             Self::Api(err) => write!(f, "provider API error: {err}"),
+            Self::ContextWindow(err) => write!(f, "provider context window exceeded: {err}"),
             Self::Response(err) => write!(f, "provider response error: {err}"),
             Self::Aborted => write!(f, "provider request aborted"),
         }
@@ -199,6 +236,7 @@ pub async fn responses_stream(
         cfg,
         auths,
         model,
+        None,
         instructions,
         messages,
         tools,
@@ -212,13 +250,15 @@ pub async fn stream_openai_oauth(
     cfg: &Config,
     auths: &Value,
     model: Option<&Value>,
+    session_id: Option<&str>,
     instructions: Option<String>,
     messages: Vec<ChatMessage>,
     tools: Vec<ChatTool>,
     cancel: &AtomicBool,
     mut emit: impl FnMut(StreamEvent),
 ) -> Result<ChatOutput, ProviderError> {
-    let req = resolve_tools_with_auth(cfg, auths, model, instructions, messages, tools)?;
+    let mut req = resolve_tools_with_auth(cfg, auths, model, instructions, messages, tools)?;
+    req.session_id = session_id.map(str::to_string);
     if !req.is_openai_oauth() {
         return Err(ProviderError::MissingKey {
             provider: req.provider,
@@ -269,9 +309,14 @@ pub fn resolve_tools_with_auth(
         .ok_or_else(|| ProviderError::MissingModel {
             provider: provider.clone(),
         })?;
-    let auth = provider_option(cfg, &provider, "apiKey")
-        .map(|key| ChatAuth::Api { key })
-        .or_else(|| auth_value(auths, &provider))
+    // Audit Fix 6: auth.json wins over `cfg.options.apiKey`. Bun's
+    // precedence is "persisted auth blob first, then config-only api key,
+    // then env". The previous chain checked `provider_option(...,
+    // "apiKey")` first, which let a stale or low-priority config-supplied
+    // api key shadow an OAuth token in `auths` and silently demote the
+    // OpenAI request from Codex back to the api.openai.com chat path.
+    let auth = auth_value(auths, &provider)
+        .or_else(|| provider_option(cfg, &provider, "apiKey").map(|key| ChatAuth::Api { key }))
         .or_else(|| env_auth(&provider))
         .or_else(|| {
             first([
@@ -306,6 +351,7 @@ pub fn resolve_tools_with_auth(
         model,
         base,
         auth,
+        session_id: None,
         instructions,
         messages,
         tools,
@@ -313,10 +359,19 @@ pub fn resolve_tools_with_auth(
 }
 
 pub fn parse(body: &Value) -> Result<ChatParsed, ProviderError> {
+    let calls = parse_response_tool_calls(body);
     if let Some(text) = parse_response_text(body) {
         return Ok(ChatParsed {
             text,
-            tool_calls: parse_response_tool_calls(body),
+            tool_calls: calls,
+            usage: parse_usage(body),
+            finish: parse_finish(body),
+        });
+    }
+    if !calls.is_empty() {
+        return Ok(ChatParsed {
+            text: String::new(),
+            tool_calls: calls,
             usage: parse_usage(body),
             finish: parse_finish(body),
         });
@@ -343,29 +398,29 @@ pub fn parse(body: &Value) -> Result<ChatParsed, ProviderError> {
 }
 
 pub fn list(cfg: &Config) -> ProviderResult {
-    let enabled = strings(cfg.data.get("enabled_providers"));
-    let disabled = strings(cfg.data.get("disabled_providers"));
-    let mut all = vec![
-        provider(
-            "kilo",
-            "Kilo",
-            "big-pickle",
-            "Big Pickle",
-            "@kilocode/kilo-gateway",
-        ),
-        provider(
-            "openai",
-            "OpenAI",
-            "gpt-5.1-codex",
-            "GPT-5.1 Codex",
-            "openai",
-        ),
-    ];
+    list_with_auth(cfg, &Value::Null)
+}
 
-    all.retain(|item| {
-        let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
-        (enabled.is_empty() || enabled.contains(id)) && !disabled.contains(id)
-    });
+/// `GET /provider` enriched with the persisted auth blob. Audit Fix 5:
+/// when openai's auth indicates `oauth`, run the OpenAI model list through
+/// [`openai_models::filter_codex_models`] so models outside the Codex
+/// allow-list are dropped and per-token cost is zeroed (the ChatGPT
+/// subscription covers it). Bun's source of truth is
+/// [`packages/opencode/src/plugin/codex.ts:373-400`](../../../../../opencode/src/plugin/codex.ts:373).
+/// API-key auth bypasses the filter entirely.
+pub fn list_with_auth(cfg: &Config, auths: &Value) -> ProviderResult {
+    let mut all = vec![openai_provider("openai")];
+
+    if openai_auth_kind(auths) == Some(AuthKind::Oauth) {
+        for item in all.iter_mut() {
+            if item.get("id").and_then(Value::as_str) != Some("openai") {
+                continue;
+            }
+            if let Some(models) = item.get_mut("models").and_then(Value::as_object_mut) {
+                openai_models::filter_codex_models(models);
+            }
+        }
+    }
 
     let defaults = all
         .iter()
@@ -376,12 +431,40 @@ pub fn list(cfg: &Config) -> ProviderResult {
             Some((id.to_string(), first))
         })
         .collect();
+    let connected = all
+        .iter()
+        .filter_map(|item| {
+            let id = item.get("id")?.as_str()?;
+            connected(cfg, auths, id).then(|| id.to_string())
+        })
+        .collect();
 
     ProviderResult {
         all,
         defaults,
-        connected: vec![],
+        connected,
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AuthKind {
+    Oauth,
+    Api,
+}
+
+fn openai_auth_kind(auths: &Value) -> Option<AuthKind> {
+    match auths.get("openai")?.get("type")?.as_str()? {
+        "oauth" => Some(AuthKind::Oauth),
+        "api" => Some(AuthKind::Api),
+        _ => None,
+    }
+}
+
+fn connected(cfg: &Config, auths: &Value, id: &str) -> bool {
+    if auths.get(id).and_then(|value| value.get("type")).is_some() {
+        return true;
+    }
+    provider_option(cfg, id, "apiKey").is_some() || env_auth(id).is_some()
 }
 
 /// `GET /provider/{providerID}`. Returns the per-provider record from the
@@ -397,74 +480,44 @@ pub fn detail(cfg: &Config, id: &str) -> Option<Value> {
 }
 
 pub fn config(cfg: &Config) -> ConfigProvidersResult {
-    let data = list(cfg);
+    config_with_auth(cfg, &Value::Null)
+}
+
+/// Audit Fix 5: same OAuth-aware filtering as [`list_with_auth`], for the
+/// `GET /config/providers` shape. Used by the sidebar to render the model
+/// picker after sign-in.
+pub fn config_with_auth(cfg: &Config, auths: &Value) -> ConfigProvidersResult {
+    let data = list_with_auth(cfg, auths);
     ConfigProvidersResult {
         providers: data.all,
         defaults: data.defaults,
     }
 }
 
-fn provider(id: &str, name: &str, model: &str, label: &str, npm: &str) -> Value {
+fn openai_provider(npm: &str) -> Value {
     json!({
-        "id": id,
-        "name": name,
+        "id": "openai",
+        "name": "OpenAI",
         "source": "custom",
-        "env": [],
+        "env": ["OPENAI_API_KEY"],
         "options": {},
-        "models": {
-            model: {
-                "id": model,
-                "providerID": id,
-                "api": { "id": model, "url": "", "npm": npm },
-                "name": label,
-                "capabilities": {
-                    "temperature": true,
-                    "reasoning": false,
-                    "attachment": true,
-                    "toolcall": true,
-                    "input": { "text": true, "audio": false, "image": true, "video": false, "pdf": true },
-                    "output": { "text": true, "audio": false, "image": false, "video": false, "pdf": false },
-                    "interleaved": false
-                },
-                "cost": { "input": 0, "output": 0, "cache": { "read": 0, "write": 0 } },
-                "limit": { "context": 200000, "input": 200000, "output": 8192 },
-                "status": "active",
-                "options": {},
-                "headers": {},
-                "release_date": "",
-                "variants": {}
-            }
-        }
+        "models": openai_models::registry(npm)
     })
 }
 
-fn strings(value: Option<&Value>) -> BTreeSet<&str> {
-    value
-        .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default()
-}
-
 async fn post(req: &ChatRequest) -> Result<ChatParsed, ProviderError> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .build()
-        .map_err(|err| ProviderError::Http(err.to_string()))?;
+    let client = http()?;
     let res = match &req.auth {
         ChatAuth::Oauth { access, account } if req.provider == "openai" => {
             let url = format!("{}/responses", req.base.trim_end_matches('/'));
-            let mut call = client
-                .post(url)
-                .bearer_auth(access)
-                .header("originator", "opencode")
-                .header("User-Agent", "opencode/rust-sidecar")
-                .json(&json!({
-                    "model": req.model,
-                    "instructions": req.instructions,
-                    "input": responses_input(&req.messages),
-                    "stream": false,
-                    "store": false,
-                }));
+            let mut call = client.post(url).bearer_auth(access).json(&json!({
+                "model": req.model,
+                "instructions": req.instructions,
+                "input": responses_input(&req.messages),
+                "stream": false,
+                "store": false,
+            }));
+            call = openai_oauth_headers(call, req.session_id.as_deref());
             if let Some(account) = account {
                 call = call.header("ChatGPT-Account-Id", account);
             }
@@ -484,23 +537,68 @@ async fn post(req: &ChatRequest) -> Result<ChatParsed, ProviderError> {
             });
             if !req.tools.is_empty() {
                 body["tools"] = json!(openai_tools(&req.tools));
-                body["tool_choice"] = json!("auto");
+                body["tool_choice"] = json!(tool_choice(&req.tools));
             }
             client.post(url).bearer_auth(key).json(&body).send().await
         }
     }
     .map_err(|err| ProviderError::Http(err.to_string()))?;
     let status = res.status();
-    let body = res
-        .json::<Value>()
+    let raw = res
+        .text()
         .await
+        .map_err(|err| ProviderError::Response(err.to_string()))?;
+    let body = serde_json::from_str::<Value>(&raw)
         .map_err(|err| ProviderError::Response(err.to_string()))?;
 
     if !status.is_success() {
-        return Err(ProviderError::Api(api_message(&body)));
+        let msg = api_status_message(status.as_u16(), &raw);
+        if api_is_context_window(status.as_u16(), &raw) {
+            return Err(ProviderError::ContextWindow(msg));
+        }
+        return Err(ProviderError::Api(msg));
     }
 
     parse(&body)
+}
+
+/// Detect "model context window exceeded" responses across the provider
+/// shapes we currently call. OpenAI Responses API surfaces this as
+/// `error.code = "context_length_exceeded"` (or
+/// `error.type = "invalid_request_error"` with a message containing
+/// `"context length"` / `"too long"` / `"maximum context"`). Bun does
+/// the same matching in `provider/error.ts`. Status is usually 400 but
+/// some gateways return 413; we accept both.
+fn api_is_context_window(status: u16, raw: &str) -> bool {
+    if status != 400 && status != 413 && status != 422 {
+        return false;
+    }
+    if let Ok(body) = serde_json::from_str::<Value>(raw) {
+        let code = body.pointer("/error/code").and_then(Value::as_str);
+        if matches!(
+            code,
+            Some("context_length_exceeded")
+                | Some("string_above_max_length")
+                | Some("max_tokens_exceeded"),
+        ) {
+            return true;
+        }
+        let message = body
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let lower = message.to_ascii_lowercase();
+        return lower.contains("context length")
+            || lower.contains("context window")
+            || lower.contains("maximum context")
+            || lower.contains("input is too long")
+            || lower.contains("token limit");
+    }
+    let lower = raw.to_ascii_lowercase();
+    lower.contains("context_length_exceeded")
+        || lower.contains("context length")
+        || lower.contains("context window")
+        || lower.contains("token limit")
 }
 
 /// Polling helper used by [`post_stream`] to race against cancellation.
@@ -520,10 +618,7 @@ async fn post_stream(
     cancel: &AtomicBool,
     emit: &mut impl FnMut(StreamEvent),
 ) -> Result<ChatParsed, ProviderError> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .build()
-        .map_err(|err| ProviderError::Http(err.to_string()))?;
+    let client = http()?;
     let ChatAuth::Oauth { access, account } = &req.auth else {
         return Err(ProviderError::MissingKey {
             provider: req.provider.clone(),
@@ -539,14 +634,10 @@ async fn post_stream(
     });
     if !req.tools.is_empty() {
         body["tools"] = json!(responses_tools(&req.tools));
-        body["tool_choice"] = json!("auto");
+        body["tool_choice"] = json!(tool_choice(&req.tools));
     }
-    let mut call = client
-        .post(url)
-        .bearer_auth(access)
-        .header("originator", "opencode")
-        .header("User-Agent", "opencode/rust-sidecar")
-        .json(&body);
+    let mut call = client.post(url).bearer_auth(access).json(&body);
+    call = openai_oauth_headers(call, req.session_id.as_deref());
     if let Some(account) = account {
         call = call.header("ChatGPT-Account-Id", account);
     }
@@ -560,12 +651,24 @@ async fn post_stream(
     };
     let status = res.status();
     if !status.is_success() {
-        let body = res.json::<Value>().await.unwrap_or_else(|_| json!({}));
-        return Err(ProviderError::Api(api_message(&body)));
+        let raw = res.text().await.unwrap_or_default();
+        let msg = api_status_message(status.as_u16(), &raw);
+        if api_is_context_window(status.as_u16(), &raw) {
+            return Err(ProviderError::ContextWindow(msg));
+        }
+        return Err(ProviderError::Api(msg));
     }
 
     let mut state = StreamState::default();
     let mut buf = String::new();
+    // Audit Fix 1: Codex chunks may split a multi-byte UTF-8 codepoint
+    // across two `bytes_stream()` items. Eagerly calling
+    // `std::str::from_utf8(&chunk)` panicked the turn whenever a 3- or 4-byte
+    // sequence (em-dash, emoji, etc.) landed across a chunk boundary. We
+    // accumulate raw bytes in `pending` and peel off only the longest
+    // valid UTF-8 prefix per iteration via [`decode_utf8_lossy_streaming`],
+    // retaining trailing partial bytes for the next chunk.
+    let mut pending: Vec<u8> = Vec::new();
     let mut bytes = res.bytes_stream();
     loop {
         // M7 Fix 4 (b): cancel can land any time, including while awaiting
@@ -584,10 +687,11 @@ async fn post_stream(
             break;
         }
         let chunk = item.map_err(|err| ProviderError::Http(err.to_string()))?;
-        let text =
-            std::str::from_utf8(&chunk).map_err(|err| ProviderError::Response(err.to_string()))?;
-        buf.push_str(text);
-        for event in drain_sse(&mut buf) {
+        pending.extend_from_slice(&chunk);
+        let decoded = decode_utf8_streaming(&mut pending)
+            .map_err(|err| ProviderError::Response(err.to_string()))?;
+        buf.push_str(&decoded);
+        while let Some(event) = next_sse(&mut buf) {
             for out in parse_stream_event(&event, &mut state)? {
                 let err = match &out {
                     StreamEvent::Error(err) => Some(err.clone()),
@@ -600,6 +704,9 @@ async fn post_stream(
             }
         }
     }
+    // Audit Fix 1: at end-of-stream, any bytes still in `pending` must be a
+    // truncated trailing codepoint (the connection died mid-codepoint). Drop
+    // them rather than panicking, but only after we've drained `buf`.
     if !buf.trim().is_empty() {
         for out in parse_stream_event(&buf, &mut state)? {
             let err = match &out {
@@ -619,6 +726,30 @@ async fn post_stream(
         usage: state.usage,
         finish: state.finish,
     })
+}
+
+fn http() -> Result<reqwest::Client, ProviderError> {
+    match &*HTTP {
+        Ok(client) => Ok(client.clone()),
+        Err(err) => Err(ProviderError::Http(err.clone())),
+    }
+}
+
+fn openai_user_agent() -> &'static str {
+    &AGENT
+}
+
+fn openai_oauth_headers(
+    call: reqwest::RequestBuilder,
+    session: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let call = call
+        .header("originator", "opencode")
+        .header("User-Agent", openai_user_agent());
+    if let Some(session) = session {
+        return call.header("session_id", session);
+    }
+    call
 }
 
 fn openai_tools(tools: &[ChatTool]) -> Vec<Value> {
@@ -651,35 +782,68 @@ fn responses_tools(tools: &[ChatTool]) -> Vec<Value> {
         .collect()
 }
 
+fn tool_choice(tools: &[ChatTool]) -> &'static str {
+    if tools.iter().any(|tool| tool.name == "StructuredOutput") {
+        return "required";
+    }
+    "auto"
+}
+
 fn responses_input(messages: &[ChatMessage]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|msg| {
-            json!({
+    let cap = messages.iter().fold(0, |sum, msg| {
+        sum + msg.responses.len()
+            + if !msg.content.is_empty() || msg.responses.is_empty() {
+                1
+            } else {
+                0
+            }
+    });
+    let mut out = Vec::with_capacity(cap);
+    for msg in messages {
+        if !msg.content.is_empty() || msg.responses.is_empty() {
+            out.push(json!({
                 "role": msg.role,
                 "content": [{
                     "type": if msg.role == "assistant" { "output_text" } else { "input_text" },
                     "text": msg.content,
                 }]
-            })
-        })
-        .collect()
+            }));
+        }
+        for item in &msg.responses {
+            out.push(responses_item(item));
+        }
+    }
+    out
+}
+
+fn responses_item(item: &ChatResponseItem) -> Value {
+    match item {
+        ChatResponseItem::FunctionCall(call) => json!({
+            "type": "function_call",
+            "call_id": call.id,
+            "name": call.name,
+            "arguments": serde_json::to_string(&call.input).unwrap_or_else(|_| "{}".to_string()),
+        }),
+        ChatResponseItem::FunctionOutput { id, output } => json!({
+            "type": "function_call_output",
+            "call_id": id,
+            "output": output,
+        }),
+    }
 }
 
 fn parse_response_text(body: &Value) -> Option<String> {
-    let text = body
-        .get("output")?
-        .as_array()?
-        .iter()
-        .flat_map(|item| {
-            item.get("content")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-        })
-        .filter_map(|item| item.get("text").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join("");
+    let mut text = String::new();
+    for item in body.get("output")?.as_array()? {
+        let Some(items) = item.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            if let Some(value) = item.get("text").and_then(Value::as_str) {
+                text.push_str(value);
+            }
+        }
+    }
 
     (!text.is_empty()).then_some(text)
 }
@@ -689,6 +853,7 @@ struct StreamState {
     text: String,
     tools: Vec<PartialTool>,
     calls: Vec<ChatToolCall>,
+    ids: BTreeSet<String>,
     usage: Option<ChatUsage>,
     finish: Option<String>,
 }
@@ -698,6 +863,7 @@ struct PartialTool {
     id: String,
     name: Option<String>,
     args: String,
+    done: bool,
 }
 
 pub fn parse_stream(input: &str) -> Result<Vec<StreamEvent>, ProviderError> {
@@ -709,8 +875,54 @@ pub fn parse_stream(input: &str) -> Result<Vec<StreamEvent>, ProviderError> {
     Ok(out)
 }
 
+/// Audit Fix 1: streaming UTF-8 decoder. Drains the longest valid UTF-8
+/// prefix from `pending`, leaving trailing partial-codepoint bytes (1-3
+/// bytes) in `pending` for the next chunk to complete. Returns
+/// `Err(string)` on a hard decode error (an invalid byte sequence that
+/// isn't merely a truncated trailing codepoint).
+///
+/// Called per-chunk in [`post_stream`]. Codex chunks routinely split a
+/// 3-byte codepoint (e.g. em-dash `e2 80 94`, U+2014) across two
+/// `bytes_stream()` items; the prior eager `from_utf8(&chunk)` call site
+/// panicked the turn the moment that happened.
+fn decode_utf8_streaming(pending: &mut Vec<u8>) -> Result<String, String> {
+    match std::str::from_utf8(pending) {
+        Ok(s) => {
+            let out = s.to_string();
+            pending.clear();
+            Ok(out)
+        }
+        Err(err) => {
+            let valid_up_to = err.valid_up_to();
+            // If there's an explicit error_len, the bytes from
+            // valid_up_to..valid_up_to+error_len are genuinely invalid —
+            // not just a truncated trailing codepoint. That's a hard error.
+            if err.error_len().is_some() {
+                return Err(format!(
+                    "invalid UTF-8 in stream at byte {valid_up_to}: {err}"
+                ));
+            }
+            // Trailing partial codepoint: peel off the valid prefix and
+            // retain the trailing 1-3 bytes for the next chunk.
+            let valid_bytes = pending[..valid_up_to].to_vec();
+            let trailing = pending.split_off(valid_up_to);
+            *pending = trailing;
+            // valid_bytes is, by construction, a valid UTF-8 sequence.
+            Ok(String::from_utf8(valid_bytes).expect("valid_up_to is utf-8 boundary"))
+        }
+    }
+}
+
+#[cfg(test)]
 fn drain_sse(buf: &mut String) -> Vec<String> {
     let mut out = Vec::new();
+    while let Some(event) = next_sse(buf) {
+        out.push(event);
+    }
+    out
+}
+
+fn next_sse(buf: &mut String) -> Option<String> {
     while let Some(idx) = sse_break(buf) {
         let tail = if buf[idx..].starts_with("\r\n\r\n") {
             4
@@ -719,9 +931,9 @@ fn drain_sse(buf: &mut String) -> Vec<String> {
         };
         let event = buf[..idx].to_string();
         buf.drain(..idx + tail);
-        out.push(event);
+        return Some(event);
     }
-    out
+    None
 }
 
 fn sse_break(text: &str) -> Option<usize> {
@@ -732,12 +944,13 @@ fn parse_stream_event(
     raw: &str,
     state: &mut StreamState,
 ) -> Result<Vec<StreamEvent>, ProviderError> {
-    let data = raw
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(str::trim_start)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut data = String::new();
+    for line in raw.lines().filter_map(|line| line.strip_prefix("data:")) {
+        if !data.is_empty() {
+            data.push('\n');
+        }
+        data.push_str(line.trim_start());
+    }
     if data.is_empty() || data == "[DONE]" {
         return Ok(Vec::new());
     }
@@ -822,10 +1035,21 @@ fn stream_tool(value: &Value, state: &mut StreamState) -> Vec<StreamEvent> {
                 part.name = Some(name.to_string());
             }
             if let Some(args) = item.get("arguments").and_then(Value::as_str) {
-                part.args.push_str(args);
+                if kind.ends_with("done") {
+                    if !args.is_empty() {
+                        part.args = args.to_string();
+                    }
+                } else {
+                    part.args.push_str(args);
+                }
             }
             if kind.ends_with("done") {
-                let call = finish_tool(part);
+                if part.done {
+                    return Vec::new();
+                }
+                part.done = true;
+                let call = finish_tool(part, idx);
+                let call = unique_tool_call(call, &mut state.ids);
                 state.calls.push(call.clone());
                 return vec![StreamEvent::ToolCall(call)];
             }
@@ -848,15 +1072,25 @@ fn stream_tool(value: &Value, state: &mut StreamState) -> Vec<StreamEvent> {
     if let Some(name) = value.get("name").and_then(Value::as_str) {
         part.name = Some(name.to_string());
     }
+    if kind.ends_with("done") {
+        if let Some(args) = first_str(value, &["arguments", "arguments_delta"]) {
+            if !args.is_empty() {
+                part.args = args.to_string();
+            }
+        }
+        if part.done {
+            return Vec::new();
+        }
+        part.done = true;
+        let call = finish_tool(part, idx);
+        let call = unique_tool_call(call, &mut state.ids);
+        state.calls.push(call.clone());
+        return vec![StreamEvent::ToolCall(call)];
+    }
     let delta = first_str(value, &["delta", "arguments_delta", "arguments"])
         .unwrap_or_default()
         .to_string();
     part.args.push_str(&delta);
-    if kind.ends_with("done") {
-        let call = finish_tool(part);
-        state.calls.push(call.clone());
-        return vec![StreamEvent::ToolCall(call)];
-    }
     vec![StreamEvent::ToolDelta {
         id: part.id.clone(),
         name: part.name.clone(),
@@ -870,15 +1104,74 @@ fn ensure_tool(state: &mut StreamState, idx: usize) {
     }
 }
 
-fn finish_tool(part: &PartialTool) -> ChatToolCall {
+fn finish_tool(part: &PartialTool, idx: usize) -> ChatToolCall {
     let name = part.name.clone().unwrap_or_else(|| "unknown".to_string());
     let id = if part.id.is_empty() {
-        name.clone()
+        format!("call_{name}_{idx}")
     } else {
         part.id.clone()
     };
-    let input = serde_json::from_str(&part.args).unwrap_or_else(|_| json!({}));
+    let (name, input) = parse_tool_input(&name, Some(&part.args));
     ChatToolCall { id, name, input }
+}
+
+fn parse_tool_input(name: &str, raw: Option<&str>) -> (String, Value) {
+    let Some(args) = raw else {
+        return invalid_tool_input(name, "Missing tool arguments".to_string(), "");
+    };
+    if args.trim().is_empty() {
+        return invalid_tool_input(name, "Missing tool arguments".to_string(), args);
+    }
+    match serde_json::from_str::<Value>(args) {
+        Ok(value @ Value::Object(_)) => (name.to_string(), value),
+        Ok(value) => invalid_tool_input(
+            name,
+            format!(
+                "Tool arguments must be a JSON object, got {}",
+                json_type(&value)
+            ),
+            args,
+        ),
+        Err(err) => invalid_tool_input(name, format!("Invalid tool arguments JSON: {err}"), args),
+    }
+}
+
+fn invalid_tool_input(name: &str, err: String, raw: &str) -> (String, Value) {
+    (
+        "invalid".to_string(),
+        json!({
+            "tool": name,
+            "error": err,
+            "arguments": raw,
+        }),
+    )
+}
+
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn unique_tool_call(mut call: ChatToolCall, ids: &mut BTreeSet<String>) -> ChatToolCall {
+    if ids.insert(call.id.clone()) {
+        return call;
+    }
+    let raw = call.id.clone();
+    let mut idx = 1;
+    loop {
+        let next = format!("{raw}_{idx}");
+        if ids.insert(next.clone()) {
+            call.id = next;
+            return call;
+        }
+        idx += 1;
+    }
 }
 
 fn stream_finish(value: &Value) -> Option<String> {
@@ -897,11 +1190,19 @@ fn first_str<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
 fn parse_response_tool_calls(body: &Value) -> Vec<ChatToolCall> {
     body.get("output")
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(parse_response_tool_call).collect())
+        .map(|items| {
+            let mut ids = BTreeSet::new();
+            items
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, item)| parse_response_tool_call(item, idx))
+                .map(|call| unique_tool_call(call, &mut ids))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
-fn parse_response_tool_call(item: &Value) -> Option<ChatToolCall> {
+fn parse_response_tool_call(item: &Value, idx: usize) -> Option<ChatToolCall> {
     if item.get("type").and_then(Value::as_str)? != "function_call" {
         return None;
     }
@@ -910,13 +1211,9 @@ fn parse_response_tool_call(item: &Value) -> Option<ChatToolCall> {
         .get("call_id")
         .or_else(|| item.get("id"))
         .and_then(Value::as_str)
-        .unwrap_or(&name)
-        .to_string();
-    let input = item
-        .get("arguments")
-        .and_then(Value::as_str)
-        .and_then(|args| serde_json::from_str(args).ok())
-        .unwrap_or_else(|| json!({}));
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("call_{name}_{idx}"));
+    let (name, input) = parse_tool_input(&name, item.get("arguments").and_then(Value::as_str));
     Some(ChatToolCall { id, name, input })
 }
 
@@ -938,10 +1235,31 @@ fn parse_usage(body: &Value) -> Option<ChatUsage> {
         .get("total_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(input + output);
+    // OpenAI Responses API exposes cached input under `input_tokens_details.cached_tokens`
+    // and reasoning output under `output_tokens_details.reasoning_tokens`. Older shapes
+    // surface `cached_tokens` flat on the usage object.
+    let reasoning = usage
+        .pointer("/output_tokens_details/reasoning_tokens")
+        .or_else(|| usage.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .or_else(|| usage.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_write = usage
+        .pointer("/input_tokens_details/cache_creation_input_tokens")
+        .or_else(|| usage.get("cache_creation_input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     Some(ChatUsage {
         input,
         output,
         total,
+        reasoning,
+        cache_read,
+        cache_write,
     })
 }
 
@@ -967,38 +1285,42 @@ fn message_text(msg: &Value) -> String {
     if let Some(text) = content.as_str() {
         return text.to_string();
     }
-    content
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("")
-        })
-        .unwrap_or_default()
+    let Some(items) = content.as_array() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for item in items {
+        if let Some(text) = item.get("text").and_then(Value::as_str) {
+            out.push_str(text);
+        }
+    }
+    out
 }
 
 fn parse_tool_calls(msg: &Value) -> Vec<ChatToolCall> {
     msg.get("tool_calls")
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(parse_tool_call).collect())
+        .map(|items| {
+            let mut ids = BTreeSet::new();
+            items
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, item)| parse_tool_call(item, idx))
+                .map(|call| unique_tool_call(call, &mut ids))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
-fn parse_tool_call(item: &Value) -> Option<ChatToolCall> {
+fn parse_tool_call(item: &Value, idx: usize) -> Option<ChatToolCall> {
     let fun = item.get("function")?;
     let name = fun.get("name")?.as_str()?.to_string();
     let id = item
         .get("id")
         .and_then(Value::as_str)
-        .unwrap_or(&name)
-        .to_string();
-    let input = fun
-        .get("arguments")
-        .and_then(Value::as_str)
-        .and_then(|args| serde_json::from_str(args).ok())
-        .unwrap_or_else(|| json!({}));
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("call_{name}_{idx}"));
+    let (name, input) = parse_tool_input(&name, fun.get("arguments").and_then(Value::as_str));
 
     Some(ChatToolCall { id, name, input })
 }
@@ -1010,6 +1332,20 @@ fn api_message(body: &Value) -> String {
         .or_else(|| body.get("message").and_then(Value::as_str))
         .unwrap_or("provider request failed")
         .to_string()
+}
+
+fn api_status_message(status: u16, raw: &str) -> String {
+    let snippet = raw.trim().chars().take(500).collect::<String>();
+    let body = serde_json::from_str::<Value>(&snippet).unwrap_or(Value::Null);
+    let msg = if body.is_null() {
+        snippet.clone()
+    } else {
+        api_message(&body)
+    };
+    if msg.trim().is_empty() {
+        return format!("provider request failed (status {status})");
+    }
+    format!("{msg} (status {status}; body: {snippet})")
 }
 
 fn first<const N: usize>(items: [Option<String>; N]) -> Option<String> {
@@ -1090,7 +1426,108 @@ fn text<'a>(value: Option<&'a Value>, keys: &[&str]) -> Option<&'a str> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::thread;
+
+    const CODEX_TOOL_CALL_STREAM: &str =
+        include_str!("../../../fixtures/openai-responses/codex-tool-call.sse");
+    const CODEX_FINAL_TEXT_STREAM: &str =
+        include_str!("../../../fixtures/openai-responses/codex-final-text.sse");
+
+    fn fixture_stream(raw: &str) -> String {
+        raw.replace("\r\n", "\n")
+    }
+
+    #[test]
+    fn parse_usage_reads_cached_and_reasoning_from_responses_api() {
+        let body = json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "total_tokens": 150,
+                "input_tokens_details": {
+                    "cached_tokens": 30,
+                    "cache_creation_input_tokens": 12,
+                },
+                "output_tokens_details": { "reasoning_tokens": 20 }
+            }
+        });
+        let u = parse_usage(&body).unwrap();
+        assert_eq!(u.input, 100);
+        assert_eq!(u.output, 50);
+        assert_eq!(u.total, 150);
+        assert_eq!(u.cache_read, 30);
+        assert_eq!(u.cache_write, 12);
+        assert_eq!(u.reasoning, 20);
+    }
+
+    #[test]
+    fn api_is_context_window_detects_openai_context_length_exceeded() {
+        let body = r#"{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 128000 tokens."}}"#;
+        assert!(api_is_context_window(400, body));
+        assert!(api_is_context_window(422, body));
+        assert!(!api_is_context_window(500, body)); // wrong status
+        assert!(!api_is_context_window(
+            400,
+            r#"{"error":{"message":"unrelated"}}"#
+        ));
+    }
+
+    #[test]
+    fn api_is_context_window_falls_back_to_substring_match() {
+        // Plain text body, no JSON.
+        assert!(api_is_context_window(
+            400,
+            "request rejected: token limit exceeded"
+        ));
+        // JSON shape but only message mentions the limit.
+        assert!(api_is_context_window(
+            400,
+            r#"{"error":{"message":"Input is too long for context window."}}"#
+        ));
+    }
+
+    #[test]
+    fn parse_usage_falls_back_to_flat_keys() {
+        let body = json!({
+            "usage": {
+                "prompt_tokens": 42,
+                "completion_tokens": 13,
+                "cached_tokens": 7,
+                "reasoning_tokens": 4
+            }
+        });
+        let u = parse_usage(&body).unwrap();
+        assert_eq!(u.input, 42);
+        assert_eq!(u.output, 13);
+        assert_eq!(u.total, 55);
+        assert_eq!(u.cache_read, 7);
+        assert_eq!(u.reasoning, 4);
+        assert_eq!(u.cache_write, 0);
+    }
+
+    fn header_server() -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0; 8192];
+            let got = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..got]).to_string();
+            let body =
+                r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}"#;
+            let res = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(res.as_bytes()).unwrap();
+            req
+        });
+        (url, handle)
+    }
 
     #[test]
     fn resolves_model_config_and_key() {
@@ -1116,6 +1553,7 @@ mod tests {
             vec![ChatMessage {
                 role: "user".to_string(),
                 content: "hello".to_string(),
+                responses: Vec::new(),
             }],
         )
         .unwrap();
@@ -1130,6 +1568,40 @@ mod tests {
             }
         );
         assert_eq!(req.messages[0].content, "hello");
+    }
+
+    #[tokio::test]
+    async fn openai_oauth_post_sends_session_and_bun_shaped_user_agent() {
+        let (url, handle) = header_server();
+        let req = ChatRequest {
+            provider: "openai".to_string(),
+            model: "gpt-5.1-codex".to_string(),
+            base: url,
+            auth: ChatAuth::Oauth {
+                access: "access".to_string(),
+                account: None,
+            },
+            session_id: Some("ses_123".to_string()),
+            instructions: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+        };
+
+        let out = post(&req).await.unwrap();
+        let raw = handle.join().unwrap();
+
+        assert_eq!(out.text, "ok");
+        assert!(raw.contains("session_id: ses_123"));
+        assert!(!raw.contains("User-Agent: opencode/rust-sidecar"));
+        assert!(raw.contains(&format!(
+            "user-agent: opencode/{}",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(raw.contains(&format!(
+            "({}/{})",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )));
     }
 
     #[test]
@@ -1202,6 +1674,23 @@ mod tests {
     }
 
     #[test]
+    fn api_status_message_keeps_status_and_body() {
+        let err = api_status_message(400, r#"{"error":{"message":"bad transcript"}}"#);
+
+        assert!(err.contains("bad transcript"));
+        assert!(err.contains("status 400"));
+        assert!(err.contains("body:"));
+    }
+
+    #[test]
+    fn api_status_message_keeps_non_json_body() {
+        let err = api_status_message(502, "upstream unavailable");
+
+        assert!(err.contains("upstream unavailable"));
+        assert!(err.contains("status 502"));
+    }
+
+    #[test]
     fn parses_openai_responses_stream_events() {
         let events = parse_stream(
             r#"data: {"type":"response.output_text.delta","delta":"Hel"}
@@ -1247,10 +1736,160 @@ data: [DONE]
                 input: 7,
                 output: 3,
                 total: 10,
+                ..Default::default()
             })));
         assert!(events
             .iter()
             .any(|event| event == &StreamEvent::Finish("stop".to_string())));
+    }
+
+    #[test]
+    fn replays_recorded_codex_tool_call_stream_fixture() {
+        let raw = fixture_stream(CODEX_TOOL_CALL_STREAM);
+        let events = parse_stream(&raw).unwrap();
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "I'll inspect the file.");
+
+        let calls = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_read_note");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(
+            calls[0].input,
+            json!({ "filePath": "repo/note.txt", "limit": 20 })
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Usage(ChatUsage {
+                input: 111,
+                output: 22,
+                total: 133,
+                ..
+            })
+        )));
+        assert!(events
+            .iter()
+            .any(|event| event == &StreamEvent::Finish("stop".to_string())));
+
+        let parts = classify_stream(&raw).unwrap();
+        assert!(parts
+            .iter()
+            .any(|part| matches!(part, ResponsesStreamPart::ToolCallArgsDelta { id, .. } if id == "call_read_note")));
+        assert!(parts.iter().any(|part| matches!(
+            part,
+            ResponsesStreamPart::ToolCallComplete { id, name, args }
+                if id == "call_read_note"
+                    && name == "read"
+                    && args == &json!({ "filePath": "repo/note.txt", "limit": 20 })
+        )));
+        assert!(parts.iter().any(|part| matches!(
+            part,
+            ResponsesStreamPart::Finish { reason, usage: Some(usage) }
+                if reason == "stop" && usage.input == 111 && usage.output == 22 && usage.total == 133
+        )));
+    }
+
+    #[test]
+    fn replays_recorded_codex_final_text_stream_fixture() {
+        let raw = fixture_stream(CODEX_FINAL_TEXT_STREAM);
+        let events = parse_stream(&raw).unwrap();
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "The file says: `fixture ok`.");
+        assert!(events.iter().any(|event| event
+            == &StreamEvent::Usage(ChatUsage {
+                input: 55,
+                output: 11,
+                total: 66,
+                ..Default::default()
+            })));
+        assert!(events
+            .iter()
+            .any(|event| event == &StreamEvent::Finish("stop".to_string())));
+    }
+
+    #[tokio::test]
+    #[ignore = "live OpenAI Pro OAuth smoke; set KILO_OPENAI_PRO_LIVE_TEST=1 and KILO_OPENAI_PRO_ACCESS_TOKEN"]
+    async fn live_openai_pro_oauth_responses_smoke_skips_without_explicit_env() {
+        if env::var("KILO_OPENAI_PRO_LIVE_TEST").as_deref() != Ok("1") {
+            eprintln!("live smoke skipped: KILO_OPENAI_PRO_LIVE_TEST is not 1");
+            return;
+        }
+        let access = match env::var("KILO_OPENAI_PRO_ACCESS_TOKEN") {
+            Ok(value) if !value.trim().is_empty() => value,
+            _ => {
+                eprintln!("live smoke skipped: KILO_OPENAI_PRO_ACCESS_TOKEN is not set");
+                return;
+            }
+        };
+        let model = env::var("KILO_OPENAI_PRO_MODEL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "gpt-5.1-codex".to_string());
+        let mut auth = json!({
+            "type": "oauth",
+            "access": access,
+            "refresh": "redacted-live-smoke-refresh-not-used",
+            "expires": 9999999999999i64,
+        });
+        if let Ok(account) = env::var("KILO_OPENAI_PRO_ACCOUNT_ID") {
+            if !account.trim().is_empty() {
+                auth["accountId"] = json!(account);
+            }
+        }
+        let cfg = Config {
+            data: BTreeMap::new(),
+        };
+        let auths = json!({ "openai": auth });
+        let cancel = AtomicBool::new(false);
+        let mut events = Vec::new();
+        let out = responses_stream(
+            &cfg,
+            &auths,
+            Some(&json!({ "providerID": "openai", "modelID": model })),
+            Some("Respond with a short smoke-test acknowledgement.".to_string()),
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "Say KILO_SMOKE_OK and nothing sensitive.".to_string(),
+                responses: Vec::new(),
+            }],
+            Vec::new(),
+            &cancel,
+            |event| events.push(event),
+        )
+        .await
+        .expect("live OpenAI Pro OAuth Responses smoke");
+
+        assert_eq!(out.provider, "openai");
+        assert!(
+            !out.text.trim().is_empty()
+                || events
+                    .iter()
+                    .any(|event| matches!(event, StreamEvent::TextDelta(_)))
+        );
+        assert!(
+            out.finish.is_some()
+                || events
+                    .iter()
+                    .any(|event| matches!(event, StreamEvent::Finish(_)))
+        );
     }
 
     #[test]
@@ -1302,6 +1941,203 @@ data: [DONE]
         assert_eq!(out.text, "");
         assert_eq!(out.tool_calls[0].name, "grep");
         assert_eq!(out.tool_calls[0].input["pattern"], "needle");
+    }
+
+    #[test]
+    fn malformed_tool_arguments_become_invalid_tool_call() {
+        let out = parse(&json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_bad",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": "{\"filePath\":"
+                        }
+                    }]
+                }
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].id, "call_bad");
+        assert_eq!(out.tool_calls[0].name, "invalid");
+        assert_eq!(out.tool_calls[0].input["tool"], "read");
+        assert!(out.tool_calls[0].input["error"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid tool arguments JSON"));
+    }
+
+    #[test]
+    fn response_tool_calls_have_deterministic_ids() {
+        let out = parse(&json!({
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "read",
+                    "arguments": "{\"filePath\":\"a.txt\"}"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_read_0",
+                    "name": "read",
+                    "arguments": "{\"filePath\":\"b.txt\"}"
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(out.tool_calls[0].id, "call_read_0");
+        assert_eq!(out.tool_calls[1].id, "call_read_0_1");
+    }
+
+    #[test]
+    fn stream_malformed_tool_arguments_become_invalid_tool_call() {
+        let events = parse_stream(
+            r#"data: {"type":"response.function_call_arguments.delta","output_index":0,"call_id":"call_bad","name":"read","delta":"{\"filePath\":"}
+
+data: {"type":"response.function_call_arguments.done","output_index":0,"call_id":"call_bad","name":"read"}
+
+"#,
+        )
+        .unwrap();
+
+        let call = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .expect("tool call");
+        assert_eq!(call.id, "call_bad");
+        assert_eq!(call.name, "invalid");
+        assert_eq!(call.input["tool"], "read");
+        assert!(call.input["error"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid tool arguments JSON"));
+    }
+
+    #[test]
+    fn stream_done_arguments_replace_deltas_instead_of_appending() {
+        let events = parse_stream(
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_read","type":"function_call","call_id":"call_read","name":"read","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":0,"call_id":"call_read","name":"read","delta":"{\"filePath\":"}
+
+data: {"type":"response.function_call_arguments.delta","output_index":0,"call_id":"call_read","name":"read","delta":"\"src/main.rs\"}"}
+
+data: {"type":"response.function_call_arguments.done","output_index":0,"call_id":"call_read","name":"read","arguments":"{\"filePath\":\"src/main.rs\"}"}
+
+"#,
+        )
+        .unwrap();
+
+        let calls = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_read");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].input["filePath"], "src/main.rs");
+    }
+
+    #[test]
+    fn stream_output_item_done_does_not_duplicate_completed_tool_call() {
+        let events = parse_stream(
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_read","type":"function_call","call_id":"call_read","name":"read","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":0,"call_id":"call_read","name":"read","delta":"{\"filePath\":\"src/main.rs\"}"}
+
+data: {"type":"response.function_call_arguments.done","output_index":0,"call_id":"call_read","name":"read"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_read","type":"function_call","call_id":"call_read","name":"read","arguments":"{\"filePath\":\"src/main.rs\"}"}}
+
+"#,
+        )
+        .unwrap();
+
+        let calls = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_read");
+        assert_eq!(calls[0].input["filePath"], "src/main.rs");
+    }
+
+    #[test]
+    fn responses_input_uses_structured_tool_continuation_items() {
+        let input = responses_input(&[
+            ChatMessage {
+                role: "user".to_string(),
+                content: "inspect file".to_string(),
+                responses: Vec::new(),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "I'll read it.".to_string(),
+                responses: vec![ChatResponseItem::FunctionCall(ChatToolCall {
+                    id: "call_read".to_string(),
+                    name: "read".to_string(),
+                    input: json!({ "filePath": "src/main.rs" }),
+                })],
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: String::new(),
+                responses: vec![ChatResponseItem::FunctionOutput {
+                    id: "call_read".to_string(),
+                    output: "file contents".to_string(),
+                }],
+            },
+        ]);
+
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[1]["content"][0]["type"], "output_text");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "call_read");
+        assert_eq!(input[2]["name"], "read");
+        assert_eq!(input[2]["arguments"], r#"{"filePath":"src/main.rs"}"#);
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call_read");
+        assert_eq!(input[3]["output"], "file contents");
+        assert!(!serde_json::to_string(&input)
+            .unwrap()
+            .contains("[Tool results]"));
+    }
+
+    #[test]
+    fn tool_choice_requires_structured_output_tool() {
+        let tools = vec![ChatTool {
+            name: "StructuredOutput".to_string(),
+            description: "Final JSON".to_string(),
+            parameters: json!({ "type": "object" }),
+        }];
+
+        assert_eq!(tool_choice(&tools), "required");
+    }
+
+    #[test]
+    fn tool_choice_defaults_to_auto_for_regular_tools() {
+        let tools = vec![ChatTool {
+            name: "read".to_string(),
+            description: "Read file".to_string(),
+            parameters: json!({ "type": "object" }),
+        }];
+
+        assert_eq!(tool_choice(&tools), "auto");
     }
 
     #[test]
@@ -1396,5 +2232,211 @@ data: [DONE]
     fn env_guard() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn decode_utf8_streaming_handles_split_em_dash() {
+        // Audit Fix 1: em-dash U+2014 is `e2 80 94`. Split across chunks
+        // such that one ends at `e2` and the next starts at `80 94`.
+        let payload = "hello \u{2014} world\n";
+        let bytes = payload.as_bytes();
+        let split = bytes.iter().position(|b| *b == 0xe2).unwrap();
+        let (a, b) = bytes.split_at(split + 1);
+        let mut pending = Vec::new();
+        let mut assembled = String::new();
+
+        // First chunk: contains everything up to and including `e2`. The
+        // decoder must defer the trailing `e2` and emit "hello ".
+        pending.extend_from_slice(a);
+        assembled.push_str(&decode_utf8_streaming(&mut pending).unwrap());
+        assert!(!pending.is_empty(), "trailing e2 must be retained");
+
+        // Second chunk: `80 94 ' world\n'`. Now the decoder can emit the
+        // em-dash and the rest of the line.
+        pending.extend_from_slice(b);
+        assembled.push_str(&decode_utf8_streaming(&mut pending).unwrap());
+        assert!(pending.is_empty(), "no leftover bytes at end");
+        assert_eq!(assembled, payload);
+
+        // And the SSE drain on the assembled buffer should produce a clean
+        // text-delta event matching the unsplit payload.
+        let mut buf = String::new();
+        let frame = format!("data: {{\"type\":\"response.output_text.delta\",\"delta\":\"hello \u{2014} world\\n\"}}\n\n");
+        buf.push_str(&frame);
+        let events = drain_sse(&mut buf);
+        let mut state = StreamState::default();
+        let parsed = parse_stream_event(&events[0], &mut state).unwrap();
+        assert_eq!(
+            parsed[0],
+            StreamEvent::TextDelta("hello \u{2014} world\n".to_string())
+        );
+    }
+
+    #[test]
+    fn decode_utf8_streaming_rejects_invalid_sequence() {
+        // Hard error path: a continuation byte (`80`) with no leading byte
+        // is unambiguously invalid, not just a truncated trailing codepoint.
+        let mut pending = vec![b'a', 0x80, b'b'];
+        assert!(decode_utf8_streaming(&mut pending).is_err());
+    }
+
+    #[test]
+    fn decode_utf8_streaming_handles_clean_chunks() {
+        let mut pending = b"plain ascii".to_vec();
+        let out = decode_utf8_streaming(&mut pending).unwrap();
+        assert_eq!(out, "plain ascii");
+        assert!(pending.is_empty());
+    }
+
+    /// Audit Fix 5: when openai's auth row indicates `oauth`, the model
+    /// list is filtered through `filter_codex_models` (admit-list +
+    /// zero-cost stamp). API-key auth keeps the unfiltered list.
+    #[test]
+    fn list_with_oauth_auth_filters_codex_and_zeroes_cost() {
+        let cfg = Config {
+            data: BTreeMap::new(),
+        };
+        let auths = json!({
+            "openai": {
+                "type": "oauth",
+                "access": "AT",
+                "refresh": "RT",
+                "expires": 1
+            }
+        });
+        let result = list_with_auth(&cfg, &auths);
+        let openai = result
+            .all
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some("openai"))
+            .expect("openai entry");
+        let models = openai["models"].as_object().unwrap();
+        assert!(
+            models.len() > 1,
+            "OAuth registry should expose real choices"
+        );
+        assert_eq!(result.connected, vec!["openai"]);
+        assert!(models.contains_key("gpt-5.1-codex"));
+        assert!(models.contains_key("gpt-5.1-codex-max"));
+        assert!(models.contains_key("gpt-5.1-codex-mini"));
+        assert!(models.contains_key("gpt-5.2"));
+        assert!(models.contains_key("gpt-5.4-mini"));
+        assert!(models.contains_key("gpt-5.5"));
+        assert!(!models.contains_key("gpt-5.1"));
+        assert!(!models.contains_key("gpt-4.1"));
+        assert!(!models.contains_key("o1-preview"));
+        for model in models.values() {
+            assert_eq!(model["cost"]["input"], 0);
+            assert_eq!(model["cost"]["output"], 0);
+            assert_eq!(model["cost"]["cache"]["read"], 0);
+            assert_eq!(model["cost"]["cache"]["write"], 0);
+        }
+    }
+
+    #[test]
+    fn list_without_oauth_auth_does_not_zero_cost_or_filter() {
+        let cfg = Config {
+            data: BTreeMap::new(),
+        };
+        // No `auths` blob — API-key path.
+        let result = list_with_auth(&cfg, &Value::Null);
+        let openai = result
+            .all
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some("openai"))
+            .expect("openai entry");
+        let models = openai["models"].as_object().unwrap();
+        assert!(result.connected.is_empty());
+        assert!(models.contains_key("gpt-5.1-codex"));
+        assert!(models.contains_key("gpt-5.1"));
+        assert!(models.contains_key("gpt-4.1"));
+        assert!(models.contains_key("o1-preview"));
+        assert_ne!(models["gpt-5.1-codex"]["cost"]["input"], 0);
+        assert_ne!(models["gpt-4.1"]["cost"]["input"], 0);
+    }
+
+    #[test]
+    fn list_keeps_openai_even_if_config_hides_it() {
+        let cfg = Config {
+            data: BTreeMap::from([
+                ("disabled_providers".to_string(), json!(["openai"])),
+                ("enabled_providers".to_string(), json!(["kilo"])),
+            ]),
+        };
+        let result = list_with_auth(&cfg, &Value::Null);
+        assert_eq!(result.all.len(), 1);
+        assert_eq!(result.all[0]["id"], "openai");
+        assert!(result.defaults.contains_key("openai"));
+    }
+
+    #[test]
+    fn list_with_api_auth_does_not_filter_openai_registry() {
+        let cfg = Config {
+            data: BTreeMap::new(),
+        };
+        let auths = json!({
+            "openai": {
+                "type": "api",
+                "key": "sk-test"
+            }
+        });
+        let result = list_with_auth(&cfg, &auths);
+        let openai = result
+            .all
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some("openai"))
+            .expect("openai entry");
+        let models = openai["models"].as_object().unwrap();
+        assert_eq!(result.connected, vec!["openai"]);
+        assert!(models.contains_key("gpt-5.1-codex"));
+        assert!(models.contains_key("gpt-4.1"));
+        assert!(models.contains_key("o1-preview"));
+        assert_ne!(models["gpt-5.1-codex"]["cost"]["input"], 0);
+    }
+
+    /// Audit Fix 6: auth.json wins over `cfg.options.apiKey`. Both
+    /// sources present → resolver returns OAuth and CODEX_BASE.
+    #[test]
+    fn resolver_prefers_oauth_in_auths_over_config_api_key() {
+        let _g = env_guard();
+        env::remove_var("KILO_AUTH_CONTENT");
+        env::remove_var("OPENAI_API_KEY");
+        env::remove_var("OPENAI_BASE_URL");
+        let cfg = Config {
+            data: BTreeMap::from([(
+                "provider".to_string(),
+                json!({
+                    "openai": {
+                        "options": { "apiKey": "config-key" }
+                    }
+                }),
+            )]),
+        };
+        let auths = json!({
+            "openai": {
+                "type": "oauth",
+                "access": "stored-access",
+                "refresh": "rt",
+                "expires": 1,
+                "accountId": "acct_oauth"
+            }
+        });
+        let req = resolve_tools_with_auth(
+            &cfg,
+            &auths,
+            Some(&json!({ "providerID": "openai", "modelID": "gpt-5.1-codex" })),
+            None,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            req.auth,
+            ChatAuth::Oauth {
+                access: "stored-access".to_string(),
+                account: Some("acct_oauth".to_string())
+            }
+        );
+        assert_eq!(req.base, CODEX_BASE);
     }
 }

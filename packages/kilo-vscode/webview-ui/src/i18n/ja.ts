@@ -445,15 +445,6 @@ export const dict = {
 
   "error.startup.title": "サーバー接続に失敗しました",
 
-  "error.paidModel.title": "このモデルを使用するにはサインインが必要です",
-  "error.paidModel.description":
-    "サインインまたはアカウントを作成して、500以上のモデルにアクセスし、原価でクレジットを使用するか、独自のキーを持ち込みましょう。",
-  "error.paidModel.action": "サインイン",
-  "error.promotionLimit.title": "続けるにはサインアップが必要です",
-  "error.promotionLimit.description":
-    "無料でサインアップして、500以上のモデルを探索しましょう。2分で完了、クレジットカード不要。または後でお戻りください。",
-  "error.promotionLimit.action": "サインアップ",
-
   "error.chain.unknown": "不明なエラー",
   "error.chain.causedBy": "原因:",
   "error.chain.apiError": "APIエラー",
@@ -797,7 +788,6 @@ export const dict = {
   "settings.providers.section.popular": "人気のプロバイダー",
   "settings.providers.search.placeholder": "プロバイダーを検索",
   "settings.providers.select.placeholder": "プロバイダーを選択...",
-  "settings.providers.tag.gateway": "Gateway",
   "settings.providers.tag.environment": "環境",
   "settings.providers.tag.config": "設定",
   "settings.providers.tag.chatgpt": "ChatGPT",
@@ -972,22 +962,11 @@ export const dict = {
   "session.showHistory": "履歴を表示",
   "session.search.placeholder": "セッションを検索...",
   "session.empty": "セッションがありません。+ をクリックして新しい会話を始めましょう。",
-  "session.tab.local": "ローカル",
-  "session.tab.cloud": "クラウド",
-  "session.cloud.repoOnly": "このリポジトリのみ",
-  "session.cloud.import": "クラウドからインポート",
   "feedback.button": "フィードバック & サポート",
   "feedback.dialog.message": "フィードバックをお聞かせいただくか、問題がある場合はお気軽にご相談ください。",
   "feedback.dialog.github": "GitHubで問題を報告する",
   "feedback.dialog.discord": "Discordコミュニティに参加する",
   "feedback.dialog.support": "カスタマーサポート",
-  "session.cloud.import.title": "クラウドからインポート",
-  "session.cloud.import.placeholder": "セッションID、URL、またはkilo importコマンド",
-  "session.cloud.import.button": "インポート",
-  "session.cloud.import.invalid": "セッションIDの形式が無効です",
-  "session.cloud.import.legacy":
-    "これは以前のバージョンのセッションのようです。このセッションはサポートされなくなりました。",
-  "session.cloud.import.failed": "クラウドセッションのインポートに失敗しました",
 
   "workspace.new": "新しいワークスペース",
   "workspace.type.local": "ローカル",
@@ -1015,36 +994,8 @@ export const dict = {
   "workspace.reset.archived.many": "{{count}}個のセッションがアーカイブされます。",
   "workspace.reset.note": "これにより、ワークスペースはデフォルトブランチと一致するようにリセットされます。",
 
-  "deviceAuth.toast.urlCopied": "URLをクリップボードにコピーしました",
-  "deviceAuth.toast.codeCopied": "コードをクリップボードにコピーしました",
-  "deviceAuth.toast.errorCopied": "エラーがクリップボードにコピーされました",
-  "deviceAuth.status.initiating": "ログインを開始しています...",
-  "deviceAuth.title": "Kilo Codeにサインイン",
-  "deviceAuth.step1": "ステップ1：このURLを開く",
-  "deviceAuth.action.copyUrl": "URLをコピー",
-  "deviceAuth.action.openBrowser": "ブラウザを開く",
-  "deviceAuth.qrCode.alt": "QRコード",
-  "deviceAuth.step2": "ステップ2：このコードを入力",
-  "deviceAuth.action.clickToCopy": "クリックしてコピー",
-  "deviceAuth.status.waiting": "認証を待っています...",
-  "deviceAuth.status.success": "ログイン成功！",
-  "deviceAuth.status.failed": "ログイン失敗",
-  "deviceAuth.error.detailsTitle": "ログインエラーの詳細",
-  "deviceAuth.status.cancelled": "ログインがキャンセルされました",
-  "deviceAuth.action.tryAgain": "再試行",
-  "deviceAuth.action.copyError": "エラーをコピー",
-  "deviceAuth.action.showDetails": "詳細を表示",
-
   "common.retry": "再試行",
   "common.refresh": "更新",
-
-  "profile.title": "プロフィール",
-  "profile.notLoggedIn": "ログインしていません",
-  "profile.action.login": "Kilo Codeでログイン",
-  "profile.balance.title": "残高",
-  "profile.balance.refresh": "残高を更新",
-  "profile.action.dashboard": "ダッシュボード",
-  "profile.action.logout": "ログアウト",
 
   "settings.section.configuration": "設定",
   "settings.agentBehaviour.title": "エージェントの動作",
@@ -1322,7 +1273,6 @@ export const dict = {
   "settings.agentBehaviour.mcpDetail.args": "引数",
   "settings.agentBehaviour.mcpDetail.env": "環境",
   "settings.agentBehaviour.mcpDetail.disabled": "このサーバーは無効です。",
-  "settings.agentBehaviour.mcpBrowseMarketplace": "マーケットプレイスを閲覧",
   "settings.agentBehaviour.mcpEmpty":
     "MCPサーバーが設定されていません。kilo.jsoncでMCPサーバーを追加するか、エージェントに追加を依頼してください。",
   "settings.agentBehaviour.workflowsPlaceholder":
@@ -1405,8 +1355,6 @@ export const dict = {
   "settings.providers.enabled.description": "設定された場合、これらのプロバイダーのみが利用可能",
   "settings.providers.notSet": "未設定（サーバーのデフォルトを使用）",
   "dialog.model.notSet": "未設定",
-  "profile.personalAccount": "個人アカウント",
-  "profile.switchingAccount": "アカウントを切り替え中…",
   // Agent Manager strings live in webview-ui/agent-manager/i18n/ja.ts
 
   "question.summary": "{{total}} 問中 {{n}} 問目",
@@ -1515,8 +1463,4 @@ export const dict = {
   "settings.saveBar.cancel": "キャンセル",
   "settings.saveBar.saving": "保存中…",
   "settings.saveBar.saveFailed": "設定を保存できませんでした",
-  "notifications.action.next": "次へ",
-  "notifications.action.close": "閉じる",
-  "notifications.action.tryModel": "{{model}}を試す",
-  "notifications.action.tryModelGeneric": "モデルを試す",
 }

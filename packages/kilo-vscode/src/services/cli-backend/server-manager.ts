@@ -4,59 +4,36 @@ import * as crypto from "crypto"
 import * as fs from "fs"
 import * as vscode from "vscode"
 import { t } from "./i18n"
-import { parseServerPort } from "./server-utils"
-import { resolveSidecar, type SidecarCandidate, type SidecarKind, type SidecarPlan } from "./sidecar-runtime"
-
-function describeError(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message
-  }
-  return String(error)
-}
+import { isContractVersionCompatible, MAX_SUPPORTED_CONTRACT_VERSION, parseContractVersion, parseServerPort } from "./server-utils"
+import { resolveSidecar, type SidecarCandidate, type SidecarKind, type SidecarRuntime } from "./sidecar-runtime"
 
 export interface ServerInstance {
   port: number
   password: string
   process: ChildProcess
-  /** Which sidecar runtime is actually running (after any auto-fallback). */
+  /** Which sidecar runtime is actually running. */
   runtime: SidecarKind
 }
-
-const STARTUP_TIMEOUT_SECONDS = 30
 
 export class ServerManager {
   private instance: ServerInstance | null = null
   private startupPromise: Promise<ServerInstance> | null = null
 
-  /**
-   * Set to `true` the first time the host has issued a mutating SDK request
-   * against the running sidecar. While this flag is `false`, an `auto`-mode
-   * Rust startup failure is allowed to fall back to Bun. Once `true`,
-   * fallback is forbidden — falling back after Rust may have observed
-   * mutations would silently lose state.
-   *
-   * Wired by `KiloConnectionService`: the SDK fetch wrapper calls
-   * {@link markMutationAttempted} on every POST/PUT/PATCH/DELETE.
-   */
+  /** Set to `true` after the Rust sidecar accepts a mutating SDK request. */
   private hasAttemptedMutation = false
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
   /**
-   * Mark that a mutating SDK request has been observed against this
-   * sidecar. After this is called, automatic fallback from Rust to Bun is
-   * disabled and a Rust startup or runtime failure is surfaced.
-   *
-   * Called from the SDK fetch wrapper in `KiloConnectionService` on every
-   * POST/PUT/PATCH/DELETE — that is the contract path the SDK takes for
-   * mutating routes. Idempotent and cheap.
+   * Mark that the Rust sidecar accepted a mutating SDK request. Auto runtime
+   * fallback to Bun is allowed only before this gate flips.
    */
   markMutationAttempted(): void {
     if (this.hasAttemptedMutation) {
       return
     }
     this.hasAttemptedMutation = true
-    console.log("[Kilo New] ServerManager: ✏️ Mutation observed — auto-fallback disabled for the rest of this session")
+    console.log("[Kilo New] ServerManager: Mutation observed")
   }
 
   /**
@@ -98,89 +75,64 @@ export class ServerManager {
 
   private async startServer(): Promise<ServerInstance> {
     const plan = resolveSidecar(this.context)
-    console.log("[Kilo New] ServerManager: 🧭 Sidecar plan:", {
-      requested: plan.requested,
-      candidates: plan.candidates.map((c) => ({ runtime: c.runtime, path: c.path })),
-    })
+    const candidates = this.startupCandidates(plan.requested, plan.candidates)
+      console.log("[Kilo New] ServerManager: 🧭 Sidecar plan:", {
+        requested: plan.requested,
+        rollout: plan.rollout,
+        candidates: plan.candidates.map((c) => ({ runtime: c.runtime, path: c.path })),
+        blocked: plan.blocked,
+        startupCandidates: candidates.map((c) => c.runtime),
+        mutationObserved: this.hasAttemptedMutation,
+      })
 
-    return await this.tryCandidates(plan)
-  }
-
-  /**
-   * Walk the resolver's candidate list, honoring fallback rules:
-   *
-   * - `requested === "bun"` or `"rust"`: only that single candidate is
-   *   tried; failure is surfaced.
-   * - `requested === "auto"`: candidates are tried in order. Fallback to
-   *   the next candidate is only allowed when (a) the current candidate is
-   *   the Rust sidecar and (b) `hasAttemptedMutation` is `false`. Bun
-   *   failure is always surfaced.
-   *
-   * The fallback gate is conservative: once `hasAttemptedMutation` flips,
-   * we never silently swap to a different process again.
-   */
-  private async tryCandidates(plan: SidecarPlan): Promise<ServerInstance> {
-    const errors: Array<{ candidate: SidecarCandidate; error: unknown }> = []
-    for (let i = 0; i < plan.candidates.length; i++) {
-      const candidate = plan.candidates[i]!
-      const isLast = i === plan.candidates.length - 1
+    const failures: { runtime: SidecarKind; error: unknown }[] = []
+    for (const candidate of candidates) {
       try {
         return await this.spawnCandidate(candidate)
-      } catch (error) {
-        errors.push({ candidate, error })
-        const fallbackAllowed =
-          plan.requested === "auto" &&
-          candidate.runtime === "rust" &&
-          !this.hasAttemptedMutation &&
-          !isLast
-        if (!fallbackAllowed) {
-          throw error
-        }
-        console.warn(
-          `[Kilo New] ServerManager: ⤵️ Rust sidecar failed to start (${describeError(error)}); falling back to next candidate`,
-        )
+      } catch (err) {
+        failures.push({ runtime: candidate.runtime, error: err })
+        console.warn("[Kilo New] ServerManager: Sidecar candidate failed:", {
+          runtime: candidate.runtime,
+          error: err instanceof Error ? err.message : String(err),
+        })
       }
     }
-    // Should be unreachable: the loop always either returns or throws.
-    throw new ServerStartupError(
-      "No sidecar candidate succeeded",
-      errors.map((e) => `${e.candidate.runtime}@${e.candidate.path}: ${describeError(e.error)}`).join("\n"),
-    )
+    throw aggregateStartupError(failures)
+  }
+
+  private startupCandidates(requested: SidecarRuntime, candidates: SidecarCandidate[]): SidecarCandidate[] {
+    if (requested !== "auto") return candidates
+    if (this.hasAttemptedMutation) return candidates.slice(0, 1)
+    return candidates
   }
 
   private async spawnCandidate(candidate: SidecarCandidate): Promise<ServerInstance> {
     const password = crypto.randomBytes(32).toString("hex")
     const cliPath = candidate.path
-    console.log("[Kilo New] ServerManager: 📍 CLI path:", cliPath, "(runtime:", candidate.runtime + ")")
+    console.log("[Kilo New] ServerManager: Sidecar path:", cliPath, "(runtime:", candidate.runtime + ")")
     console.log("[Kilo New] ServerManager: 🔐 Generated password (length):", password.length)
 
-    // Verify the CLI binary exists
+    // Verify the sidecar binary exists before spawning.
     if (!fs.existsSync(cliPath)) {
-      throw new Error(
-        `CLI binary not found at expected path: ${cliPath}. Please ensure the CLI is built and bundled with the extension.`,
+      throw new ServerStartupError(
+        `${candidate.runtime} sidecar binary not found`,
+        `Sidecar path: ${cliPath}\n${candidate.runtime} sidecar binary not found. Please ensure the sidecar is built and bundled with the extension.`,
       )
     }
 
     const stat = fs.statSync(cliPath)
-    console.log("[Kilo New] ServerManager: 📄 CLI isFile:", stat.isFile())
-    console.log("[Kilo New] ServerManager: 📄 CLI mode (octal):", (stat.mode & 0o777).toString(8))
+    console.log("[Kilo New] ServerManager: Sidecar isFile:", stat.isFile())
+    console.log("[Kilo New] ServerManager: Sidecar mode (octal):", (stat.mode & 0o777).toString(8))
 
     return new Promise((resolve, reject) => {
-      console.log("[Kilo New] ServerManager: 🎬 Spawning CLI process:", cliPath, candidate.args)
+      console.log("[Kilo New] ServerManager: Spawning sidecar process:", cliPath, candidate.args)
       const claudeCompat = vscode.workspace.getConfiguration("kilo-code.new").get<boolean>("claudeCodeCompat", false)
-      // Pin cwd so the CLI doesn't inherit the extension host's cwd ("/" under F5 debug)
+      // Pin cwd so the sidecar doesn't inherit the extension host's cwd ("/" under F5 debug)
       const spawnCwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.env.HOME ?? require("os").homedir()
       const serverProcess = spawn(cliPath, candidate.args, {
         cwd: spawnCwd,
         env: {
           ...process.env,
-          // Force mimalloc (the allocator Bun ships with) to return freed pages
-          // to the OS immediately instead of retaining them in its arenas.
-          // Without this, Bun.spawn's piped stdio accumulates ~2 MB of native
-          // RSS per call on Windows, causing the Agent Manager (which polls git
-          // once per second per worktree) to reach multi-GB RSS in minutes.
-          // See oven-sh/bun#18265 and Jarred's workaround note in #21560.
-          MIMALLOC_PURGE_DELAY: "0",
           KILO_SERVER_PASSWORD: password,
           KILO_CLIENT: "vscode",
           KILO_ENABLE_QUESTION_TOOL: "true",
@@ -205,19 +157,46 @@ export class ServerManager {
 
       serverProcess.stdout?.on("data", (data: Buffer) => {
         const output = data.toString()
-        console.log("[Kilo New] ServerManager: 📥 CLI Server stdout:", output)
+        console.log("[Kilo New] ServerManager: Sidecar stdout:", output)
 
         const port = parseServerPort(output)
         if (port !== null && !resolved) {
+          // Migration plan invariant (Wire-protocol versioning beyond v1):
+          // refuse a sidecar whose contractVersion is newer than this
+          // extension build's compiled-in maximum. Older sidecars (Bun and
+          // pre-versioned Rust) report null and are accepted by default —
+          // Bun is the oracle.
+          const contractVersion = parseContractVersion(output)
+          if (!isContractVersionCompatible(contractVersion)) {
+            resolved = true
+            console.error(
+              "[Kilo New] ServerManager: ❌ Sidecar contract version too new:",
+              contractVersion,
+              "(extension max:",
+              MAX_SUPPORTED_CONTRACT_VERSION,
+              ")",
+            )
+            try {
+              serverProcess.kill()
+            } catch {
+              // best-effort
+            }
+            reject(
+              new Error(
+                `Sidecar reports contract version ${contractVersion}, but this extension supports up to ${MAX_SUPPORTED_CONTRACT_VERSION}. Update the Kilo Code extension.`,
+              ),
+            )
+            return
+          }
           resolved = true
-          console.log("[Kilo New] ServerManager: 🎯 Port detected:", port)
+          console.log("[Kilo New] ServerManager: 🎯 Port detected:", port, "contract:", contractVersion ?? "unversioned")
           resolve({ port, password, process: serverProcess, runtime: candidate.runtime })
         }
       })
 
       serverProcess.stderr?.on("data", (data: Buffer) => {
         const errorOutput = data.toString()
-        console.error("[Kilo New] ServerManager: ⚠️ CLI Server stderr:", errorOutput)
+        console.error("[Kilo New] ServerManager: Sidecar stderr:", errorOutput)
         stderrLines.push(errorOutput)
       })
 
@@ -243,18 +222,22 @@ export class ServerManager {
         }
       })
 
+      const timeoutMs = candidate.startupTimeoutMs
+      const timeoutSeconds = Math.ceil(timeoutMs / 1000)
       setTimeout(() => {
         if (!resolved) {
-          console.error(`[Kilo New] ServerManager: ⏰ Server startup timeout (${STARTUP_TIMEOUT_SECONDS}s)`)
+          console.error(
+            `[Kilo New] ServerManager: ⏰ Server startup timeout (${timeoutSeconds}s, runtime=${candidate.runtime})`,
+          )
           ServerManager.killProcess(serverProcess)
           const { userMessage, userDetails } = toErrorMessage(
-            t("server.startupTimeout", { seconds: STARTUP_TIMEOUT_SECONDS }),
+            t("server.startupTimeout", { seconds: timeoutSeconds }),
             stderrLines,
             cliPath,
           )
           reject(new ServerStartupError(userMessage, userDetails))
         }
-      }, STARTUP_TIMEOUT_SECONDS * 1000)
+      }, timeoutMs)
     })
   }
 
@@ -308,12 +291,42 @@ export class ServerManager {
 export class ServerStartupError extends Error {
   readonly userMessage: string
   readonly userDetails: string
-  constructor(userMessage: string, userDetails: string) {
+  /** Retained for compatibility with tests that inspect startup errors. */
+  readonly candidates: ReadonlyArray<{ runtime: SidecarKind; error: unknown }>
+  constructor(
+    userMessage: string,
+    userDetails: string,
+    candidates: ReadonlyArray<{ runtime: SidecarKind; error: unknown }> = [],
+  ) {
     super(userDetails)
     this.name = "ServerStartupError"
     this.userMessage = userMessage
     this.userDetails = userDetails
+    this.candidates = candidates
   }
+}
+
+function aggregateStartupError(failures: ReadonlyArray<{ runtime: SidecarKind; error: unknown }>): ServerStartupError {
+  const last = failures.at(-1)
+  const message = last ? errorMessage(last.error) : "Sidecar startup failed"
+  const lines = ["Sidecar startup failed."]
+  for (const failure of failures) {
+    lines.push(`\n[${failure.runtime}]`)
+    lines.push(errorDetails(failure.error))
+  }
+  return new ServerStartupError(message, lines.join("\n").trim(), failures)
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof ServerStartupError) return err.userMessage
+  if (err instanceof Error) return err.message
+  return String(err)
+}
+
+function errorDetails(err: unknown): string {
+  if (err instanceof ServerStartupError) return err.userDetails
+  if (err instanceof Error) return err.stack ?? err.message
+  return String(err)
 }
 
 function stripAnsi(str: string): string {
@@ -338,7 +351,7 @@ export function toErrorMessage(
 
   lines = [error, ...lines]
   if (cliPath && cliPath.trim() !== "") {
-    lines = [`CLI path: ${cliPath}`, ...lines]
+    lines = [`Sidecar path: ${cliPath}`, ...lines]
   }
 
   const detailsText = lines.map(stripAnsi).join("\n").trim()

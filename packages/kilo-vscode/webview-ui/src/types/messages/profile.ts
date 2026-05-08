@@ -27,3 +27,20 @@ export interface ProfileData {
   balance: KilocodeBalance | null
   currentOrgId: string | null
 }
+
+export type DeviceAuthStatus = "idle" | "initiating" | "pending" | "success" | "error" | "cancelled"
+
+export interface DeviceAuthState {
+  status: DeviceAuthStatus
+  code?: string
+  verificationUrl?: string
+  expiresIn?: number
+  error?: string
+}
+
+export interface CloudSessionInfo {
+  session_id: string
+  title?: string
+  created_at: string
+  updated_at: string
+}

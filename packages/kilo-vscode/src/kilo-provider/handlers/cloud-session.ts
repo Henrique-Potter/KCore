@@ -5,10 +5,20 @@
  * flow that clones a cloud session locally on first message. No vscode dependency.
  */
 
-import type { KiloClient, Session, TextPartInput, FilePartInput } from "@kilocode/sdk/v2/client"
-import type { CloudSessionData, EditorContext } from "../../services/cli-backend/types"
-import { getErrorMessage, sessionToWebview, mapCloudSessionMessageToWebviewMessage } from "../../kilo-provider-utils"
+import type { KiloClient, Session, TextPartInput, FilePartInput, Message, Part } from "@kilocode/sdk/v2/client"
+import type { EditorContext } from "../../services/cli-backend/types"
+import { getErrorMessage, sessionToWebview } from "../../kilo-provider-utils"
 import type { MessageFile } from "../message-files"
+
+interface CloudSessionData {
+  info: Session
+  messages?: CloudMessage[]
+}
+
+interface CloudMessage {
+  info?: Message
+  parts?: Part[]
+}
 
 export interface CloudSessionContext {
   readonly client: KiloClient | null
@@ -84,7 +94,13 @@ export async function handleRequestCloudSessionData(ctx: CloudSessionContext, se
       return
     }
 
-    const messages = (data.messages ?? []).filter((m) => m.info).map(mapCloudSessionMessageToWebviewMessage)
+    const messages = (data.messages ?? [])
+      .filter((m): m is CloudMessage & { info: Message } => Boolean(m.info))
+      .map((m) => ({
+        ...m.info,
+        parts: m.parts ?? [],
+        createdAt: new Date(m.info.time.created).toISOString(),
+      }))
 
     ctx.postMessage({
       type: "cloudSessionDataLoaded",

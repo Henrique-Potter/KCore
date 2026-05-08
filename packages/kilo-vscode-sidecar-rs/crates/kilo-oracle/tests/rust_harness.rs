@@ -26,9 +26,49 @@ pub struct RustSidecar {
     pub client: OracleClient,
     stop: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    /// Audit Fix 12: panic-safe env + cwd restore. The previous shape did
+    /// the restore manually inside `shutdown()` between the timeout block
+    /// and the env restore — if any code in that window panicked, the
+    /// guard dropped via stack unwind but env stayed dirty for the next
+    /// test under the same poisoned ENV_LOCK. `EnvScope`'s Drop runs the
+    /// restore unconditionally.
+    scope: Option<EnvScope>,
+    guard: Option<MutexGuard<'static, ()>>,
+}
+
+/// Audit Fix 12: RAII env+cwd restore. Captures the parent's
+/// `EnvRestore` + cwd; on `Drop`, set the cwd and restore the env
+/// variables — unless `mark_restored()` ran first (the happy path).
+struct EnvScope {
     prev_env: Option<EnvRestore>,
     prev_cwd: Option<PathBuf>,
-    guard: Option<MutexGuard<'static, ()>>,
+}
+
+impl EnvScope {
+    fn new(prev_env: EnvRestore, prev_cwd: PathBuf) -> Self {
+        Self {
+            prev_env: Some(prev_env),
+            prev_cwd: Some(prev_cwd),
+        }
+    }
+
+    fn mark_restored(&mut self) {
+        if let Some(cwd) = self.prev_cwd.take() {
+            let _ = std::env::set_current_dir(cwd);
+        }
+        if let Some(env) = self.prev_env.take() {
+            env.restore();
+        }
+    }
+}
+
+impl Drop for EnvScope {
+    fn drop(&mut self) {
+        // If mark_restored() didn't run (panic between timeout and
+        // restore in shutdown()), the next test that picks up the
+        // poisoned ENV_LOCK still sees clean state.
+        self.mark_restored();
+    }
 }
 
 impl RustSidecar {
@@ -122,8 +162,7 @@ impl RustSidecar {
             client,
             stop: Some(tx),
             task,
-            prev_env: Some(prev_env),
-            prev_cwd: Some(prev_cwd),
+            scope: Some(EnvScope::new(prev_env, prev_cwd)),
             guard: Some(guard),
         })
     }
@@ -141,13 +180,11 @@ impl RustSidecar {
             .map_err(|_| OracleError::ScenarioAborted("rust sidecar shutdown timed out"))?
             .map_err(|err| OracleError::Other(format!("rust sidecar task join: {err}")))?
             .map_err(|err| OracleError::Other(format!("rust sidecar serve: {err}")));
-        // Restore cwd + env BEFORE releasing the guard so the next test sees
-        // a clean process state.
-        if let Some(cwd) = self.prev_cwd.take() {
-            let _ = std::env::set_current_dir(cwd);
-        }
-        if let Some(env) = self.prev_env.take() {
-            env.restore();
+        // Audit Fix 12: explicit happy-path restore. `EnvScope::Drop`
+        // backs us up if anything between here and the function return
+        // panics.
+        if let Some(mut scope) = self.scope.take() {
+            scope.mark_restored();
         }
         self.guard.take();
         res
@@ -233,14 +270,11 @@ impl Drop for RustSidecar {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
-        // If shutdown() didn't run (test panicked), still restore env + cwd so
-        // the next test that picks up the poisoned ENV_LOCK sees clean state.
-        if let Some(cwd) = self.prev_cwd.take() {
-            let _ = std::env::set_current_dir(cwd);
-        }
-        if let Some(env) = self.prev_env.take() {
-            env.restore();
-        }
+        // Audit Fix 12: env + cwd restore now lives in `EnvScope::Drop`
+        // — drop the scope here (or rely on field drop order) so a panic
+        // anywhere in the path between `shutdown()`'s timeout and the
+        // env restore can't leave env state dirty for the next test.
+        drop(self.scope.take());
     }
 }
 
@@ -522,12 +556,35 @@ pub fn sync_data(frame: &FixtureFrame) -> Option<&Value> {
 }
 
 pub fn sync_type(frame: &FixtureFrame) -> Option<&str> {
-    frame
+    let raw = frame
         .payload
         .as_ref()?
         .get("syncEvent")?
         .get("type")?
-        .as_str()
+        .as_str()?;
+    // Bun emits `<type>.1`; the older Rust harness emitted `<type>.v1`.
+    // Normalize to the legacy `.v1` form so the existing test helpers
+    // ([`tool_names`], the M7 fixture filters) keep matching across the
+    // two formats.
+    if raw.ends_with(".1") && !raw.ends_with(".v1") {
+        if let Some(stripped) = raw.strip_suffix(".1") {
+            return Some(translate_to_v1(stripped));
+        }
+    }
+    Some(raw)
+}
+
+fn translate_to_v1(base: &str) -> &'static str {
+    match base {
+        "message.updated" => "message.updated.v1",
+        "message.removed" => "message.removed.v1",
+        "message.part.updated" => "message.part.updated.v1",
+        "message.part.removed" => "message.part.removed.v1",
+        "session.created" => "session.created.v1",
+        "session.updated" => "session.updated.v1",
+        "session.deleted" => "session.deleted.v1",
+        _ => "unknown.v1",
+    }
 }
 
 pub fn part_type(frame: &FixtureFrame) -> Option<&str> {

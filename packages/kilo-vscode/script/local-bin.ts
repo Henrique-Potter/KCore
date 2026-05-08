@@ -1,189 +1,215 @@
 #!/usr/bin/env bun
 import { $ } from "bun"
-import { join, relative, dirname, basename } from "node:path"
-import { chmodSync, statSync, rmSync, readdirSync, existsSync } from "node:fs"
+import { join, relative } from "node:path"
+import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync, statSync } from "node:fs"
+import { artifact, manifest, type Kind, type SidecarArtifact } from "./sidecar-metadata"
 
-const forceRebuild = process.argv.includes("--force")
+const force = process.argv.includes("--force")
 
 /**
- * Ensures the VS Code extension has a CLI binary at `packages/kilo-vscode/bin/kilo`.
- *
- * Strategy:
- * 1) If `bin/kilo` already exists -> ok.
- * 2) Else try to locate a prebuilt binary produced by `packages/opencode` build.
- * 3) Else try to build it via `bun run build --single` in `packages/opencode`.
- * 4) Copy the resulting binary into `packages/kilo-vscode/bin/kilo` and chmod +x.
- *
- * This script is intended to be run from `packages/kilo-vscode` as part of build/package.
+ * Ensures the VS Code extension has both preview sidecar binaries under
+ * `packages/kilo-vscode/bin`.
  */
 
-const kiloVscodeDir = join(import.meta.dir, "..")
-const packagesDir = join(kiloVscodeDir, "..")
-const opencodeDir = join(packagesDir, "opencode")
-
-const targetBinDir = join(kiloVscodeDir, "bin")
-const binName = process.platform === "win32" ? "kilo.exe" : "kilo"
-const targetBinPath = join(targetBinDir, binName)
-const versionFile = join(targetBinDir, ".cli-version")
+const root = join(import.meta.dir, "..")
+const packages = join(root, "..")
+const cli = join(packages, "opencode")
+const rust = join(packages, "kilo-vscode-sidecar-rs")
+const out = join(root, "bin")
+const cliName = process.platform === "win32" ? "kilo.exe" : "kilo"
+const rustName = process.platform === "win32" ? "kilo-vscode-sidecar.exe" : "kilo-vscode-sidecar"
+const cliTarget = join(out, cliName)
+const rustTarget = join(out, rustName)
+const cliVersion = join(out, ".cli-version")
+const rustVersion = join(out, ".rust-sidecar-version")
+const legacyVersion = join(out, ".rust-version")
+const sidecars = join(out, "sidecars.json")
 
 function log(msg: string) {
   console.log(`[local-bin] ${msg}`)
 }
 
-async function cliSourceHash(): Promise<string | null> {
+async function hash(): Promise<string | null> {
   try {
-    const result = await $`git log -1 --format=%H -- .`.cwd(opencodeDir).quiet()
+    const result = await $`git log -1 --format=%H -- .`.cwd(rust).quiet()
     return result.text().trim() || null
   } catch {
     return null
   }
 }
 
-async function isDirty(): Promise<boolean> {
+async function cliHash(): Promise<string | null> {
   try {
-    const result = await $`git status --porcelain -- .`.cwd(opencodeDir).quiet()
+    const result = await $`git log -1 --format=%H -- .`.cwd(cli).quiet()
+    return result.text().trim() || null
+  } catch {
+    return null
+  }
+}
+
+async function cliDirty(): Promise<boolean> {
+  try {
+    const result = await $`git status --porcelain -- .`.cwd(cli).quiet()
     return result.text().trim().length > 0
   } catch {
     return false
   }
 }
 
-async function isStale(): Promise<boolean> {
-  if (await isDirty()) return true
-  const hash = await cliSourceHash()
-  if (!hash) return false // can't determine — assume fresh
+async function cliStale(): Promise<boolean> {
+  if (await cliDirty()) return true
+  const rev = await cliHash()
+  if (!rev) return false
   try {
-    const stored = (await Bun.file(versionFile).text()).trim()
-    return stored !== hash
+    const stored = (await Bun.file(cliVersion).text()).trim()
+    return stored !== rev
   } catch {
-    return true // no version file — treat as stale
+    return true
   }
 }
 
-function platformTag(): string {
+async function dirty(): Promise<boolean> {
+  try {
+    const result = await $`git status --porcelain -- .`.cwd(rust).quiet()
+    return result.text().trim().length > 0
+  } catch {
+    return false
+  }
+}
+
+async function stale(): Promise<boolean> {
+  if (await dirty()) return true
+  const rev = await hash()
+  if (!rev) return false
+  try {
+    const stored = (await Bun.file(rustVersion).text()).trim()
+    return stored !== rev
+  } catch {
+    return true
+  }
+}
+
+function built(): string {
+  return join(rust, "target", "release", rustName)
+}
+
+function builtCli(): string {
+  const dir = join(cli, "dist", "@kilocode", `cli-${bunTarget()}`, "bin")
+  const bin = join(dir, cliName)
+  if (existsSync(bin)) return bin
+  return join(dir, "kilo")
+}
+
+function bunTarget(): string {
   const os = process.platform === "win32" ? "windows" : process.platform
-  return `cli-${os}-${process.arch}`
+  return `${os}-${process.arch}`
 }
 
-async function findKiloBinaryInOpencodeDist(): Promise<string | null> {
-  const distDir = join(opencodeDir, "dist")
-
-  try {
-    readdirSync(distDir)
-  } catch {
-    return null
-  }
-
-  // Prefer the binary matching the current platform (e.g. cli-darwin-arm64)
-  const tag = platformTag()
-  const preferred = join(distDir, `@kilocode`, tag, "bin", binName)
-  try {
-    statSync(preferred)
-    return preferred
-  } catch {
-    // fall through to generic search
-  }
-
-  // Fallback: find any dist/**/bin/kilo or kilo.exe
-  const queue = [distDir]
-  while (queue.length) {
-    const dir = queue.pop()
-    if (!dir) continue
-
-    let entries
-    try {
-      entries = readdirSync(dir, { withFileTypes: true })
-    } catch {
-      continue
-    }
-
-    for (const e of entries) {
-      const p = join(dir, e.name)
-      if (e.isDirectory()) {
-        queue.push(p)
-        continue
-      }
-      if (e.isFile() && (e.name === "kilo" || e.name === "kilo.exe") && basename(dirname(p)) === "bin") {
-        return p
-      }
-    }
-  }
-  return null
+function target(): string {
+  if (process.platform === "win32") return `win32-${process.arch}`
+  return `${process.platform}-${process.arch}`
 }
 
-async function ensureBuiltBinary(): Promise<string> {
-  const found = await findKiloBinaryInOpencodeDist()
-  if (found) return found
+async function ensure(): Promise<string> {
+  const bin = built()
+  if (existsSync(bin) && !force && !(await stale())) return bin
 
-  log(
-    `No prebuilt binary found under ${relative(kiloVscodeDir, join(opencodeDir, "dist"))} - attempting build via bun.`,
-  )
-
-  const bunFile = Bun.file(await Bun.which("bun"))
-  if (!(await bunFile.exists())) {
-    throw new Error(
-      `Bun is required to build the CLI binary, but was not found on PATH. ` +
-        `Install bun, or build the CLI separately in ${opencodeDir} and re-run.`,
-    )
+  const pkg = Bun.file(join(rust, "Cargo.toml"))
+  if (!(await pkg.exists())) {
+    throw new Error(`Expected Rust sidecar package at ${rust}, but it does not exist.`)
   }
 
-  // Ensure dependencies are installed before building.
-  log("Installing dependencies in opencode package...")
-  await $`bun install --frozen-lockfile`.cwd(opencodeDir)
+  log("Building Rust VS Code sidecar...")
+  await $`cargo build --release -p kilo-vscode-sidecar`.cwd(rust)
 
-  // Build using the opencode package script.
-  await $`bun run build --single`.cwd(opencodeDir)
-
-  const built = await findKiloBinaryInOpencodeDist()
-  if (!built) {
-    throw new Error(
-      `CLI build completed but no binary was found in ${join(opencodeDir, "dist")} (expected dist/**/bin/kilo).`,
-    )
+  if (!existsSync(bin)) {
+    throw new Error(`Rust sidecar build completed but no binary was found at ${bin}.`)
   }
-  return built
+  return bin
+}
+
+async function ensureCli(): Promise<string> {
+  const bin = builtCli()
+  if (existsSync(bin) && !force && !(await cliStale())) return bin
+
+  const pkg = Bun.file(join(cli, "package.json"))
+  if (!(await pkg.exists())) {
+    throw new Error(`Expected Bun CLI package at ${cli}, but it does not exist.`)
+  }
+
+  log("Building Bun CLI sidecar...")
+  await $`bun run script/build.ts --single --skip-install --skip-embed-web-ui`.cwd(cli)
+
+  if (!existsSync(bin)) {
+    throw new Error(`Bun CLI build completed but no binary was found at ${bin}.`)
+  }
+  return bin
+}
+
+function cleanup(): void {
+  if (existsSync(legacyVersion)) {
+    rmSync(legacyVersion)
+  }
+}
+
+async function stage(source: string, target: string, version: string, hash: () => Promise<string | null>, label: string): Promise<void> {
+  copyFileSync(source, target)
+  chmodSync(target, 0o755)
+
+  const rev = await hash()
+  if (rev) await Bun.write(version, rev + "\n")
+
+  log(`Copied ${label} from ${relative(packages, source)} -> ${relative(root, target)}`)
+}
+
+async function describe(kind: Kind, file: string, version: string): Promise<SidecarArtifact> {
+  const rev = existsSync(version) ? (await Bun.file(version).text()).trim() || null : null
+  return artifact({ kind, file, target: target(), version: rev })
+}
+
+async function writeMetadata(): Promise<void> {
+  const items = []
+  if (existsSync(cliTarget)) items.push(await describe("bun-cli", cliTarget, cliVersion))
+  if (existsSync(rustTarget)) items.push(await describe("rust-sidecar", rustTarget, rustVersion))
+  await manifest(sidecars, items)
+  log(`Wrote sidecar metadata to ${relative(root, sidecars)}`)
 }
 
 async function main() {
-  const targetFile = Bun.file(targetBinPath)
-  const exists = await targetFile.exists()
+  mkdirSync(out, { recursive: true })
+  cleanup()
 
-  const stale = exists && !forceRebuild && (await isStale())
-  const rebuild = forceRebuild || stale
+  const cliExists = await Bun.file(cliTarget).exists()
+  const cliRebuild = force || (cliExists && (await cliStale()))
+
+  if (cliExists && !cliRebuild) {
+    const st = statSync(cliTarget)
+    log(`Bun CLI sidecar already present at ${relative(root, cliTarget)} (${Math.round(st.size / 1024 / 1024)}MB). Use --force to rebuild.`)
+  } else {
+    if (cliExists) {
+      log(force ? "Removing existing Bun CLI binary (--force)." : "Bun CLI source has changed; rebuilding.")
+      rmSync(cliTarget)
+    }
+    await stage(await ensureCli(), cliTarget, cliVersion, cliHash, "Bun CLI sidecar")
+  }
+
+  const exists = await Bun.file(rustTarget).exists()
+  const rebuild = force || (exists && (await stale()))
 
   if (exists && !rebuild) {
-    const st = statSync(targetBinPath)
-    log(
-      `CLI binary already present at ${relative(kiloVscodeDir, targetBinPath)} (${Math.round(st.size / 1024 / 1024)}MB). Use --force to rebuild.`,
-    )
+    const st = statSync(rustTarget)
+    log(`Rust sidecar already present at ${relative(root, rustTarget)} (${Math.round(st.size / 1024 / 1024)}MB). Use --force to rebuild.`)
+    await writeMetadata()
     return
   }
 
   if (exists && rebuild) {
-    log(stale ? `CLI source has changed — rebuilding.` : `Removing existing binary (--force).`)
-    rmSync(targetBinPath)
-    // Also remove the prebuilt dist so ensureBuiltBinary() triggers a fresh build
-    const distDir = join(opencodeDir, "dist")
-    if (existsSync(distDir)) {
-      rmSync(distDir, { recursive: true })
-      log(`Removed ${relative(kiloVscodeDir, distDir)} to force rebuild.`)
-    }
+    log(force ? "Removing existing Rust sidecar binary (--force)." : "Rust sidecar source has changed; rebuilding.")
+    rmSync(rustTarget)
   }
 
-  const opencodePkgFile = Bun.file(join(opencodeDir, "package.json"))
-  if (!(await opencodePkgFile.exists())) {
-    throw new Error(`Expected opencode package at ${opencodeDir}, but it does not exist.`)
-  }
-
-  const sourceBinPath = await ensureBuiltBinary()
-  await $`mkdir -p ${targetBinDir}`
-  await $`cp ${sourceBinPath} ${targetBinPath}`
-  chmodSync(targetBinPath, 0o755)
-
-  // Record the CLI source version so future runs detect when a rebuild is needed
-  const hash = await cliSourceHash()
-  if (hash) await Bun.write(versionFile, hash + "\n")
-
-  log(`Copied CLI binary from ${relative(packagesDir, sourceBinPath)} -> ${relative(kiloVscodeDir, targetBinPath)}`)
+  await stage(await ensure(), rustTarget, rustVersion, hash, "Rust sidecar")
+  await writeMetadata()
 }
 
 try {

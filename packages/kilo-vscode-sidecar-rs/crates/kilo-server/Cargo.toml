@@ -9,17 +9,23 @@ version.workspace = true
 async-stream.workspace = true
 axum.workspace = true
 base64.workspace = true
+chrono.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 kilo-protocol.workspace = true
+kilo-mcp = { path = "../kilo-mcp" }
 kilo-provider.workspace = true
 kilo-store.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+portable-pty.workspace = true
 rusqlite.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+http-body-util = "0.1"
 kilo-store = { path = "../kilo-store", features = ["test-utils"] }
+tower = { version = "0.5", features = ["util"] }

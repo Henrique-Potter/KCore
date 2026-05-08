@@ -449,15 +449,6 @@ export const dict = {
 
   "error.startup.title": "Server connection failed",
 
-  "error.paidModel.title": "You need to sign in to use this model",
-  "error.paidModel.description":
-    "Sign in or create an account to access over 500 models, use credits at cost, or bring your own key.",
-  "error.paidModel.action": "Sign In",
-  "error.promotionLimit.title": "You need to sign up to keep going",
-  "error.promotionLimit.description":
-    "Sign up for free to continue and explore 500 other models. Takes 2 minutes, no credit card required. Or come back later.",
-  "error.promotionLimit.action": "Sign Up",
-
   "error.chain.unknown": "Unknown error",
   "error.chain.causedBy": "Caused by:",
   "error.chain.apiError": "API error",
@@ -746,7 +737,6 @@ export const dict = {
   "settings.providers.section.connected": "Connected providers",
   "settings.providers.connected.empty": "No connected providers",
   "settings.providers.section.popular": "Popular providers",
-  "settings.providers.tag.gateway": "Gateway",
   "settings.providers.tag.environment": "Environment",
   "settings.providers.tag.config": "Config",
   "settings.providers.tag.chatgpt": "ChatGPT",
@@ -918,21 +908,11 @@ export const dict = {
   "session.showHistory": "Show History",
   "session.search.placeholder": "Search sessions...",
   "session.empty": "No sessions yet. Click + to start a new conversation.",
-  "session.tab.local": "Local",
-  "session.tab.cloud": "Cloud",
-  "session.cloud.repoOnly": "Only this repository",
-  "session.cloud.import": "Import session",
   "feedback.button": "Feedback & Support",
   "feedback.dialog.message": "We'd love to hear your feedback or help with any issues you're experiencing.",
   "feedback.dialog.github": "Report an issue on GitHub",
   "feedback.dialog.discord": "Join our Discord community",
   "feedback.dialog.support": "Customer Support",
-  "session.cloud.import.title": "Import session",
-  "session.cloud.import.placeholder": "Session ID, URL, or kilo import command",
-  "session.cloud.import.button": "Import",
-  "session.cloud.import.invalid": "Invalid session ID format",
-  "session.cloud.import.legacy": "This appears to be a legacy session that is no longer supported.",
-  "session.cloud.import.failed": "Failed to import cloud session",
 
   "workspace.new": "New workspace",
   "workspace.type.local": "local",
@@ -960,36 +940,8 @@ export const dict = {
   "workspace.reset.archived.many": "{{count}} sessions will be archived.",
   "workspace.reset.note": "This will reset the workspace to match the default branch.",
 
-  "deviceAuth.toast.urlCopied": "URL copied to clipboard",
-  "deviceAuth.toast.codeCopied": "Code copied to clipboard",
-  "deviceAuth.toast.errorCopied": "Error copied to clipboard",
-  "deviceAuth.status.initiating": "Starting login...",
-  "deviceAuth.title": "Sign in to Kilo Code",
-  "deviceAuth.step1": "Step 1: Open this URL",
-  "deviceAuth.action.copyUrl": "Copy URL",
-  "deviceAuth.action.openBrowser": "Open Browser",
-  "deviceAuth.qrCode.alt": "QR Code",
-  "deviceAuth.step2": "Step 2: Enter this code",
-  "deviceAuth.action.clickToCopy": "Click to copy",
-  "deviceAuth.status.waiting": "Waiting for authorization...",
-  "deviceAuth.status.success": "Login successful!",
-  "deviceAuth.status.failed": "Login failed",
-  "deviceAuth.status.cancelled": "Login cancelled",
-  "deviceAuth.action.copyError": "Copy error",
-  "deviceAuth.action.showDetails": "View details",
-  "deviceAuth.action.tryAgain": "Try Again",
-  "deviceAuth.error.detailsTitle": "Login error details",
-
   "common.retry": "Retry",
   "common.refresh": "Refresh",
-
-  "profile.title": "Profile",
-  "profile.notLoggedIn": "Not logged in",
-  "profile.action.login": "Login with Kilo Code",
-  "profile.balance.title": "Balance",
-  "profile.balance.refresh": "Refresh balance",
-  "profile.action.dashboard": "Dashboard",
-  "profile.action.logout": "Log Out",
 
   "settings.section.configuration": "Configuration",
   "settings.agentBehaviour.title": "Agent Behaviour",
@@ -1276,7 +1228,6 @@ export const dict = {
   "settings.agentBehaviour.addMcp.args.placeholder": "e.g.\n-y\n@modelcontextprotocol/server-filesystem\n/tmp",
   "settings.agentBehaviour.addMcp.url": "Server URL",
   "settings.agentBehaviour.addMcp.url.placeholder": "e.g. http://localhost:3000/sse",
-  "settings.agentBehaviour.mcpBrowseMarketplace": "Browse Marketplace",
   "settings.agentBehaviour.mcpEmpty":
     "No MCP servers configured. Add MCP servers in kilo.jsonc, or ask the agent to add them for you.",
   "settings.agentBehaviour.workflowsPlaceholder": "Workflows are managed via workflow files in your workspace.",
@@ -1410,9 +1361,6 @@ export const dict = {
 
   "dialog.model.notSet": "Not set",
 
-  "profile.personalAccount": "Personal Account",
-  "profile.switchingAccount": "Switching account…",
-
   // Agent Manager strings live in webview-ui/agent-manager/i18n/en.ts
 
   "question.summary": "{{n}} of {{total}} questions",
@@ -1522,8 +1470,4 @@ export const dict = {
   "settings.saveBar.cancel": "Cancel",
   "settings.saveBar.saveFailed": "Couldn't save settings",
 
-  "notifications.action.next": "Next",
-  "notifications.action.close": "Close",
-  "notifications.action.tryModel": "Try {{model}}",
-  "notifications.action.tryModelGeneric": "Try Model",
 }

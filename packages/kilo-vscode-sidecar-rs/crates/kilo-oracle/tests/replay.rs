@@ -61,12 +61,34 @@ fn frame_session(frame: &FixtureFrame) -> Option<&str> {
 }
 
 fn sync_type(frame: &FixtureFrame) -> Option<&str> {
-    frame
+    let raw = frame
         .payload
         .as_ref()?
         .get("syncEvent")?
         .get("type")?
-        .as_str()
+        .as_str()?;
+    // Bun emits `<type>.1`; older Rust harness emitted `<type>.v1`.
+    // Translate `.1` → `.v1` so existing string-literal matchers keep
+    // working across both wire formats.
+    if raw.ends_with(".1") && !raw.ends_with(".v1") {
+        if let Some(stripped) = raw.strip_suffix(".1") {
+            return Some(translate_to_v1(stripped));
+        }
+    }
+    Some(raw)
+}
+
+fn translate_to_v1(base: &str) -> &'static str {
+    match base {
+        "message.updated" => "message.updated.v1",
+        "message.removed" => "message.removed.v1",
+        "message.part.updated" => "message.part.updated.v1",
+        "message.part.removed" => "message.part.removed.v1",
+        "session.created" => "session.created.v1",
+        "session.updated" => "session.updated.v1",
+        "session.deleted" => "session.deleted.v1",
+        _ => "unknown.v1",
+    }
 }
 
 fn sync_data(frame: &FixtureFrame) -> Option<&Value> {

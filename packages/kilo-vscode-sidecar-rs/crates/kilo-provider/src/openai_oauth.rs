@@ -45,7 +45,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// [`codex.ts:12`](../../../../../opencode/src/plugin/codex.ts:12).
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const ISSUER: &str = "https://auth.openai.com";
-pub const REDIRECT_URI: &str = "http://127.0.0.1:1455/auth/callback";
+pub const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 pub const LOOPBACK_PORT: u16 = 1455;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,7 +325,7 @@ pub fn validate_callback(
 
 /// Loopback `redirect_uri` for the default port.
 pub fn default_redirect_uri() -> String {
-    format!("http://127.0.0.1:{LOOPBACK_PORT}/auth/callback")
+    format!("http://localhost:{LOOPBACK_PORT}/auth/callback")
 }
 
 fn unix_millis() -> i64 {
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn authorize_url_carries_codex_specific_params() {
-        let url = build_authorize_url("http://127.0.0.1:1455/auth/callback", "challenge", "state");
+        let url = build_authorize_url("http://localhost:1455/auth/callback", "challenge", "state");
         assert!(url.starts_with("https://auth.openai.com/oauth/authorize?"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains(&format!("client_id={CLIENT_ID}")));
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn begin_oauth_round_trips_pkce() {
-        let begin = begin_oauth("http://127.0.0.1:1455/auth/callback");
+        let begin = begin_oauth("http://localhost:1455/auth/callback");
         assert_eq!(begin.challenge, compute_challenge(&begin.verifier));
         assert!(!begin.state.is_empty());
         assert!(begin.url.contains(&begin.state));
@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn validate_callback_rejects_csrf_mismatch() {
-        let begin = begin_oauth("http://127.0.0.1:1455/auth/callback");
+        let begin = begin_oauth("http://localhost:1455/auth/callback");
         let res = validate_callback(&begin, "the-code", "wrong-state");
         assert_eq!(res, Err(OAuthError::StateMismatch));
         let ok = validate_callback(&begin, "the-code", &begin.state).unwrap();

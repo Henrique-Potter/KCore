@@ -452,15 +452,6 @@ export const dict = {
 
   "error.startup.title": "Servertilkobling mislyktes",
 
-  "error.paidModel.title": "Du må logge inn for å bruke denne modellen",
-  "error.paidModel.description":
-    "Logg inn eller opprett en konto for å få tilgang til over 500 modeller, bruk kreditter til kostpris, eller ta med din egen nøkkel.",
-  "error.paidModel.action": "Logg inn",
-  "error.promotionLimit.title": "Du må registrere deg for å fortsette",
-  "error.promotionLimit.description":
-    "Registrer deg gratis for å fortsette og utforske over 500 modeller. Tar 2 minutter, ingen kredittkort nødvendig. Eller kom tilbake senere.",
-  "error.promotionLimit.action": "Registrer deg",
-
   "error.chain.unknown": "Ukjent feil",
   "error.chain.causedBy": "Forårsaket av:",
   "error.chain.apiError": "API-feil",
@@ -778,7 +769,6 @@ export const dict = {
   "settings.providers.section.popular": "Populære leverandører",
   "settings.providers.search.placeholder": "Søk etter leverandører",
   "settings.providers.select.placeholder": "Velg leverandør...",
-  "settings.providers.tag.gateway": "Gateway",
   "settings.providers.tag.environment": "Miljø",
   "settings.providers.tag.config": "Konfigurasjon",
   "settings.providers.tag.chatgpt": "ChatGPT",
@@ -955,21 +945,11 @@ export const dict = {
   "session.showHistory": "Vis historikk",
   "session.search.placeholder": "Søk i sesjoner...",
   "session.empty": "Ingen sesjoner ennå. Klikk + for å starte en ny samtale.",
-  "session.tab.local": "Lokal",
-  "session.tab.cloud": "Sky",
-  "session.cloud.repoOnly": "Kun dette repositoriet",
-  "session.cloud.import": "Importer fra skyen",
   "feedback.button": "Tilbakemelding & støtte",
   "feedback.dialog.message": "Vi vil gjerne høre tilbakemeldingene dine eller hjelpe med problemer du opplever.",
   "feedback.dialog.github": "Rapporter et problem på GitHub",
   "feedback.dialog.discord": "Bli med i Discord-fellesskapet vårt",
   "feedback.dialog.support": "Kundestøtte",
-  "session.cloud.import.title": "Importer fra skyen",
-  "session.cloud.import.placeholder": "Økt-ID, URL eller kilo import-kommando",
-  "session.cloud.import.button": "Importer",
-  "session.cloud.import.invalid": "Ugyldig økt-ID-format",
-  "session.cloud.import.legacy": "Dette ser ut til å være en eldre økt som ikke lenger støttes.",
-  "session.cloud.import.failed": "Kunne ikke importere skyøkt",
 
   "workspace.new": "Nytt arbeidsområde",
   "workspace.type.local": "lokal",
@@ -997,36 +977,8 @@ export const dict = {
   "workspace.reset.archived.many": "{{count}} sesjoner vil bli arkivert.",
   "workspace.reset.note": "Dette vil tilbakestille arbeidsområdet til å samsvare med standardgrenen.",
 
-  "deviceAuth.toast.urlCopied": "URL kopiert til utklippstavlen",
-  "deviceAuth.toast.codeCopied": "Kode kopiert til utklippstavlen",
-  "deviceAuth.toast.errorCopied": "Feil kopiert til utklippstavlen",
-  "deviceAuth.status.initiating": "Starter pålogging...",
-  "deviceAuth.title": "Logg inn på Kilo Code",
-  "deviceAuth.step1": "Trinn 1: Åpne denne URLen",
-  "deviceAuth.action.copyUrl": "Kopier URL",
-  "deviceAuth.action.openBrowser": "Åpne nettleser",
-  "deviceAuth.qrCode.alt": "QR-kode",
-  "deviceAuth.step2": "Trinn 2: Skriv inn denne koden",
-  "deviceAuth.action.clickToCopy": "Klikk for å kopiere",
-  "deviceAuth.status.waiting": "Venter på autorisasjon...",
-  "deviceAuth.status.success": "Pålogging vellykket!",
-  "deviceAuth.status.failed": "Pålogging mislyktes",
-  "deviceAuth.error.detailsTitle": "Detaljer om påloggingsfeil",
-  "deviceAuth.status.cancelled": "Pålogging avbrutt",
-  "deviceAuth.action.tryAgain": "Prøv igjen",
-  "deviceAuth.action.copyError": "Kopier feil",
-  "deviceAuth.action.showDetails": "Vis detaljer",
-
   "common.retry": "Prøv igjen",
   "common.refresh": "Oppdater",
-
-  "profile.title": "Profil",
-  "profile.notLoggedIn": "Ikke pålogget",
-  "profile.action.login": "Logg inn med Kilo Code",
-  "profile.balance.title": "Saldo",
-  "profile.balance.refresh": "Oppdater saldo",
-  "profile.action.dashboard": "Kontrollpanel",
-  "profile.action.logout": "Logg ut",
 
   "settings.section.configuration": "Konfigurasjon",
   "settings.agentBehaviour.title": "Agentoppførsel",
@@ -1324,7 +1276,6 @@ export const dict = {
   "settings.agentBehaviour.mcpDetail.args": "Argumenter",
   "settings.agentBehaviour.mcpDetail.env": "Miljø",
   "settings.agentBehaviour.mcpDetail.disabled": "Denne serveren er deaktivert.",
-  "settings.agentBehaviour.mcpBrowseMarketplace": "Bla gjennom Marketplace",
   "settings.agentBehaviour.mcpEmpty":
     "Ingen MCP-servere konfigurert. Legg til MCP-servere i kilo.jsonc, eller be agenten om å legge dem til.",
   "settings.agentBehaviour.workflowsPlaceholder": "Arbeidsflyter administreres via arbeidsflytfiler i arbeidsområdet.",
@@ -1406,8 +1357,6 @@ export const dict = {
   "settings.providers.enabled.description": "Hvis angitt, er bare disse leverandørene tilgjengelige",
   "settings.providers.notSet": "Ikke angitt (bruk serverstandard)",
   "dialog.model.notSet": "Ikke angitt",
-  "profile.personalAccount": "Personlig konto",
-  "profile.switchingAccount": "Bytter konto…",
   // Agent Manager strings live in webview-ui/agent-manager/i18n/no.ts
 
   "question.summary": "{{n}} av {{total}} spørsmål",
@@ -1514,8 +1463,4 @@ export const dict = {
   "settings.saveBar.cancel": "Avbryt",
   "settings.saveBar.saving": "Lagrer…",
   "settings.saveBar.saveFailed": "Kunne ikke lagre innstillinger",
-  "notifications.action.next": "Neste",
-  "notifications.action.close": "Lukk",
-  "notifications.action.tryModel": "Prøv {{model}}",
-  "notifications.action.tryModelGeneric": "Prøv modell",
 } satisfies Partial<Record<Keys, string>>

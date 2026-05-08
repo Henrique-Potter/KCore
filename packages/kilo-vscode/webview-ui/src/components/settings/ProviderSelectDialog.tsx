@@ -4,21 +4,10 @@ import { List } from "@kilocode/kilo-ui/list"
 import { ProviderIcon } from "@kilocode/kilo-ui/provider-icon"
 import { Tag } from "@kilocode/kilo-ui/tag"
 import { Show, createMemo } from "solid-js"
-import { useConfig } from "../../context/config"
 import { useLanguage } from "../../context/language"
 import { useProvider } from "../../context/provider"
-import { useServer } from "../../context/server"
-import type { Provider } from "../../types/messages"
 import ProviderConnectDialog from "./ProviderConnectDialog"
-import {
-  CUSTOM_PROVIDER_ID,
-  isPopularProvider,
-  kiloFallbackProvider,
-  popularProviderIndex,
-  providerIcon,
-} from "./provider-catalog"
-import CustomProviderDialog from "./CustomProviderDialog"
-import { KILO_PROVIDER_ID } from "../../../../src/shared/provider-model"
+import { providerIcon } from "./provider-catalog"
 
 type ProviderItem = {
   id: string
@@ -27,45 +16,23 @@ type ProviderItem = {
 
 const ProviderSelectDialog = () => {
   const dialog = useDialog()
-  const { config } = useConfig()
   const provider = useProvider()
-  const server = useServer()
   const language = useLanguage()
 
   const items = createMemo<ProviderItem[]>(() => {
     language.locale()
 
-    const disabled = new Set(config().disabled_providers ?? [])
-    const connected = new Set(provider.connected())
     const all = Object.values(provider.providers())
-    const withKilo = all.some((item) => item.id === KILO_PROVIDER_ID) ? all : [kiloFallbackProvider(), ...all]
-    const available = withKilo.filter((item) => !disabled.has(item.id) && !connected.has(item.id))
+    const available = all.filter((item) => item.id === "openai")
 
-    return [
-      {
-        id: CUSTOM_PROVIDER_ID,
-        name: language.t("settings.providers.tag.customProvider"),
-      },
-      ...available.map((item) => ({
-        id: item.id,
-        name: item.name,
-      })),
-    ]
+    return available.map((item) => ({
+      id: item.id,
+      name: item.name,
+    }))
   })
 
   function open(item: ProviderItem) {
-    if (item.id === CUSTOM_PROVIDER_ID) {
-      dialog.show(() => <CustomProviderDialog onBack={() => dialog.show(() => <ProviderSelectDialog />)} />)
-      return
-    }
-
-    if (item.id === KILO_PROVIDER_ID) {
-      dialog.close()
-      server.startLogin()
-      return
-    }
-
-    dialog.show(() => <ProviderConnectDialog providerID={item.id} />)
+    dialog.show(() => <ProviderConnectDialog providerID={item.id} oauthOnly />)
   }
 
   return (
@@ -77,25 +44,8 @@ const ProviderSelectDialog = () => {
         key={(item) => item.id}
         items={items()}
         filterKeys={["id", "name"]}
-        groupBy={(item) =>
-          item.id !== CUSTOM_PROVIDER_ID && isPopularProvider(item.id)
-            ? language.t("dialog.provider.group.recommended")
-            : language.t("dialog.provider.group.other")
-        }
-        sortBy={(a, b) => {
-          if (a.id === CUSTOM_PROVIDER_ID) return -1
-          if (b.id === CUSTOM_PROVIDER_ID) return 1
-
-          const rank = popularProviderIndex(a.id) - popularProviderIndex(b.id)
-          if (rank !== 0) return rank
-          return a.name.localeCompare(b.name)
-        }}
-        sortGroupsBy={(a, b) => {
-          const recommended = language.t("dialog.provider.group.recommended")
-          if (a.category === recommended && b.category !== recommended) return -1
-          if (b.category === recommended && a.category !== recommended) return 1
-          return 0
-        }}
+        groupBy={() => language.t("dialog.provider.group.popular")}
+        sortBy={(a, b) => a.name.localeCompare(b.name)}
         onSelect={(item) => {
           if (!item) return
           open(item)
@@ -117,11 +67,8 @@ const ProviderSelectDialog = () => {
               <span style={{ "font-size": "14px", "line-height": "20px", color: "var(--vscode-foreground)" }}>
                 {item.name}
               </span>
-              <Show when={item.id === KILO_PROVIDER_ID}>
-                <Tag>{language.t("dialog.provider.tag.recommended")}</Tag>
-              </Show>
-              <Show when={item.id === CUSTOM_PROVIDER_ID}>
-                <Tag>{language.t("settings.providers.tag.custom")}</Tag>
+              <Show when={item.id === "openai"}>
+                <Tag>{language.t("settings.providers.tag.chatgpt")}</Tag>
               </Show>
             </div>
           </div>

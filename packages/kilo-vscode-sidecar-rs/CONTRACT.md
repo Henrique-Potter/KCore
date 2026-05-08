@@ -39,10 +39,10 @@ Implemented routes:
 | `GET` | `/path` | Returns the Rust-resolved Kilo path snapshot. |
 | `GET` | `/config` | Returns a shallow read-only config snapshot. |
 | `GET` | `/global/config` | Preview alias for the same shallow config snapshot. |
-| `GET` | `/config/providers` | Returns the static preview provider catalog. Envelope `{ providers, default }` matches `Provider.ConfigProvidersResult.zod`. |
+| `GET` | `/config/providers` | Returns the OpenAI-only preview provider catalog. Envelope `{ providers, default }` matches `Provider.ConfigProvidersResult.zod`. |
 | `GET` | `/config/warnings` | Returns an empty warning list. |
-| `GET` | `/provider` | Returns the static preview provider catalog. Envelope `{ all, default, connected }` matches `Provider.ListResult.zod`; `Info`/`Model` field set matches the Bun schema (optional fields are omitted, never null). |
-| `GET` | `/provider/auth` | Returns an empty provider auth map. |
+| `GET` | `/provider` | Returns the OpenAI-only preview provider catalog. Envelope `{ all, default, connected }` matches `Provider.ListResult.zod`; `Info`/`Model` field set matches the Bun schema (optional fields are omitted, never null). |
+| `GET` | `/provider/auth` | Returns only the OpenAI ChatGPT Pro/Plus browser OAuth method. |
 | `GET` | `/agent` | Returns static preview agent entries. |
 | `GET` | `/skill` | Returns an empty skill list. |
 | `GET` | `/command` | Returns an empty command list. |
@@ -77,15 +77,11 @@ Then every 10 seconds:
 
 The stream intentionally does not emit session, provider, permission, tool, MCP, or Agent Manager events yet.
 
-## Runtime switch contract
+## Runtime contract
 
-- VS Code setting: `kilo-code.new.sidecarRuntime`
-  - `bun`: existing bundled sidecar.
-  - `rust`: Rust sidecar only; startup failure is surfaced.
-  - `auto`: try Rust, then fall back to Bun only if Rust fails before any SDK request can mutate state.
-- Environment override: `KILO_VSCODE_SIDECAR_RUNTIME=bun|rust|auto`.
+- The VS Code extension launches the Rust sidecar only.
+- Startup failure is surfaced directly; there is no Bun fallback candidate.
 - Rust binary override: `KILO_VSCODE_RUST_SIDECAR_PATH=<absolute-or-relative-path>`.
-- Bun remains default until later rollout milestones explicitly change it.
 
 ## Determinism contract
 
@@ -175,6 +171,176 @@ session store BEFORE publishing the SSE event. This is the rule that makes
   `AsyncQueue` for tens of milliseconds under load.
 - Stable iteration order of `Record<string, T>` payload fields beyond what
   JSON serialization happens to produce. Consumers must key by ID, not index.
+
+## Stable error-name set
+
+Every non-2xx response body is a `NamedError`-shaped envelope:
+
+```json
+{ "name": "<stable-name>", "data": { "message": "<safe-for-toast>" } }
+```
+
+The allowed `name` values are enforced by `ALLOWED_INTERNAL_ERROR_NAMES` in
+`crates/kilo-server/src/error.rs` and a `debug_assert!` in `internal_error_named`/`named_response`. Adding a new error name requires
+appending it to that constant *and* this table in the same commit.
+
+| Name | Convention | Status | Trigger |
+|---|---|---|---|
+| `InternalError` | PascalCase | 500 | Default fallback for unwrapped server errors |
+| `BusyError` | PascalCase | 409 | A second prompt arriving on a busy session |
+| `UnsupportedProviderError` | PascalCase | 400 | A provider path that's still on Bun |
+| `OauthCallbackError` | PascalCase | 500 | OAuth callback exchange failure |
+| `OauthCallbackListenerError` | PascalCase | 500 | OAuth callback listener bind failure |
+| `request_too_large` | snake_case | 413 | Request body over `MAX_REQUEST_BODY_BYTES` |
+| `sse_capacity_exceeded` | snake_case | 503 | More than `MAX_SSE_CLIENTS` concurrent streams |
+| `session_quota_exceeded` | snake_case | 507 | More than `MAX_SESSIONS_PER_WORKSPACE` sessions |
+| `message_part_too_large` | snake_case | 413 | Message part over `MAX_MESSAGE_PART_BYTES` |
+| `shell_unavailable` | snake_case | 500 | bash tool with no resolvable shell on Windows |
+| `schema_migration_failed` | snake_case | 500 | `PRAGMA user_version` walk failed mid-migration |
+| `store_unavailable` | snake_case | 500 | Writer connection cannot be opened |
+
+The two case conventions are deliberate. `PascalCase` predates the
+operational-invariant work and matches Bun's `NamedError` class names. New
+boundary/policy errors specified by the migration plan's "Operational
+invariants" section use `snake_case`. The SDK type union accepts both.
+
+Truncation sentinel for tool-output capture is the literal string
+`"\n…[output truncated by sidecar]\n"` (`limits::TRUNCATION_SENTINEL`).
+
+## Assistant message error envelopes
+
+A separate stable name set lives on `assistant.info.error` (NOT the HTTP
+response body — those go through `ALLOWED_INTERNAL_ERROR_NAMES`). These
+are surfaced to the client when a turn ends in a recoverable failure and
+must round-trip across reconnect.
+
+| Name | Trigger |
+|---|---|
+| `MessageAbortedError` | The runner cancel flag tripped mid-turn (user abort, sidecar shutdown, or upstream `ProviderError::Aborted`). |
+| `MaxIterationsError` | The OpenAI OAuth tool loop hit `OPENAI_OAUTH_MAX_ITERATIONS` (16) without a terminal stop. |
+| `MalformedToolArgumentsError` | The model emitted the same JSON-parse-failed tool call twice in a turn. |
+| `StructuredOutputError` | `format.type == "json_schema"` but the model never invoked the synthesized `StructuredOutput` tool. |
+| `PermissionRejectedError` | A tool's `ask_permission` call returned `Reject`. Carried inside the tool part's `state.metadata.error`, not on the assistant `info.error`. |
+
+## Agent loop contract
+
+The OpenAI OAuth Codex loop (`crates/kilo-server/src/agent/openai_stream.rs`)
+must reproduce Bun's `streamText` step semantics
+([`packages/opencode/src/session/processor.ts:402-473`](../../opencode/src/session/processor.ts)).
+
+### Per-iteration step parts (strict)
+
+Every iteration of the agent loop emits a `step-start` part at the top
+and a `step-finish` part at the bottom, persisted to the assistant
+message in append order. A turn with N iterations therefore has N
+`step-start` parts, N `step-finish` parts, and any tool parts produced
+that iteration sandwiched between them. Bun parity ratio: one
+`step-start` per `start-step` event, one `step-finish` per `finish-step`
+event.
+
+`step-finish` shape:
+
+```json
+{
+  "id": "<pid>_step_finish_<iter>",
+  "type": "step-finish",
+  "messageID": "<mid>",
+  "sessionID": "<sid>",
+  "reason": "stop",
+  "cost": 0,
+  "tokens": {
+    "input": 0, "output": 0, "reasoning": 0, "total": 0,
+    "cache": { "read": 0, "write": 0 }
+  }
+}
+```
+
+`tokens` carries that iteration's usage, NOT the cumulative turn total.
+The cumulative total appears on `assistant.info.tokens` and is the sum
+of every iteration's usage (Bun: `processor.ts:443-447`).
+
+### Token usage fields (Bun parity)
+
+`assistant.info.tokens` and per-step `step-finish.tokens` are populated
+from `kilo_provider::ChatUsage` with these fields read from the OpenAI
+Responses API:
+
+| JSON path | Maps to |
+|---|---|
+| `usage.input_tokens` (or legacy `usage.prompt_tokens`) | `input` |
+| `usage.output_tokens` (or `usage.completion_tokens`) | `output` |
+| `usage.total_tokens` (defaults to `input + output`) | `total` |
+| `usage.input_tokens_details.cached_tokens` (or flat `cached_tokens`) | `cache.read` |
+| `usage.input_tokens_details.cache_creation_input_tokens` (or flat) | `cache.write` |
+| `usage.output_tokens_details.reasoning_tokens` (or flat) | `reasoning` |
+
+Provider-specific cache_write keys (`anthropic.cacheCreationInputTokens`,
+`vertex.*`, `bedrock.*`, `venice.*`) that Bun's `Session.getUsage` reads
+are NOT parsed in this slice — M10 narrows to the OpenAI Responses path.
+
+### Structured output tool
+
+When `PromptInput.format.type == "json_schema"` the loop:
+
+1. Synthesizes a `StructuredOutput` tool with `parameters = format.schema`
+   and includes it in the per-turn tool catalog.
+2. Prepends `STRUCTURED_OUTPUT_SYSTEM_PROMPT` to the instructions block.
+3. Intercepts any tool call named `StructuredOutput` — does NOT spawn a
+   tool runner; captures the input.
+4. On capture, sets `last_finish = "stop"` and breaks the loop.
+5. On terminal write, sets `assistant.info.structured = <captured input>`.
+6. If the loop ends without capture, the assistant message is failed
+   with `StructuredOutputError`.
+
+### Doom-loop guard
+
+After every iteration's tool drain, the loop inspects the trailing
+`DOOM_LOOP_THRESHOLD = 3` *completed* tool parts (`tool_parts` tail,
+ignoring text/step parts and pending tools). If all three share the
+same tool name AND the same `state.input` JSON, `ask_doom_loop` is
+called with:
+
+- `permission = "doom_loop"`
+- `pattern = <tool name>`
+- `metadata = { "tool": <name>, "input": <last input> }`
+
+A user reply of `Allow` / `Always` lets the loop continue; `Reject` (or
+a session/global rule `"doom_loop": "deny"` or
+`"doom_loop": { "<tool>": "deny" }`) breaks the loop gracefully. A rule
+`"doom_loop": "allow"` (or scoped to a tool) skips the prompt.
+
+### MCP tool dispatch
+
+Connected MCP servers (any client whose `Status::Connected { tools: [..] }`
+is non-empty) contribute namespaced entries to the per-turn tool catalog:
+each tool is exposed as `<client>_<tool>` (Bun parity: `mcp/index.ts:685`).
+A tool call against a name not in the built-in catalog is reverse-resolved
+against the live connected MCP catalog before being declared unknown;
+matches dispatch through `mcp_invoke` (local stdio or remote HTTP).
+
+Permission gate (`ask_mcp_permission`):
+
+- `permission = "mcp"`
+- `pattern = <namespaced tool name>`
+
+A blanket `"mcp": "deny"` blocks every MCP server; per-tool rules like
+`"mcp": { "context7_resolve_library_id": "allow" }` work as expected.
+
+### Permission rule evaluation
+
+`evaluate_permission_layered(permission, pattern, soft, hard)` is the
+single entry point. Bun's two-layer model
+(`permission/index.ts:217-271`):
+
+- **Hard layer** (agent-derived; only `ask` and `plan` agents have one):
+  scanned first. A matching `deny` is unbeatable; a matching `allow`
+  short-circuits the prompt; a matching `ask` is treated as no-match
+  and falls through.
+- **Soft layer** (`state.approvals` ∪ `session.permission`): scanned
+  with `findLast` semantics — later rules win.
+
+`wildcard_match` supports full glob (`*` anywhere, `?` for one char),
+not just prefix/suffix.
 
 ## Preview limitations
 

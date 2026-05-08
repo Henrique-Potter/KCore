@@ -452,15 +452,6 @@ export const dict = {
 
   "error.startup.title": "Підключення до сервера не вдалося",
 
-  "error.paidModel.title": "Для використання цієї моделі потрібно увійти",
-  "error.paidModel.description":
-    "Увійдіть або створіть акаунт для доступу до 500+ моделей, використання кредитів за вартістю або підключення власного ключа.",
-  "error.paidModel.action": "Увійти",
-  "error.promotionLimit.title": "Для продовження потрібна реєстрація",
-  "error.promotionLimit.description":
-    "Зареєструйтеся безкоштовно для продовження та доступу до 500+ моделей. Займе 2 хвилини, кредитна картка не потрібна. Або поверніться пізніше.",
-  "error.promotionLimit.action": "Зареєструватися",
-
   "error.chain.unknown": "Невідома помилка",
   "error.chain.causedBy": "Спричинено:",
   "error.chain.apiError": "Помилка API",
@@ -777,7 +768,6 @@ export const dict = {
   "settings.providers.section.connected": "Підключені провайдери",
   "settings.providers.connected.empty": "Підключених провайдерів немає",
   "settings.providers.section.popular": "Популярні провайдери",
-  "settings.providers.tag.gateway": "Gateway",
   "settings.providers.tag.environment": "Середовище",
   "settings.providers.tag.config": "Конфігурація",
   "settings.providers.tag.chatgpt": "ChatGPT",
@@ -953,21 +943,11 @@ export const dict = {
   "session.showHistory": "Показати історію",
   "session.search.placeholder": "Пошук сесій...",
   "session.empty": "Сесій поки немає. Натисніть +, щоб почати новий чат.",
-  "session.tab.local": "Локальний",
-  "session.tab.cloud": "Хмарний",
-  "session.cloud.repoOnly": "Лише цей репозиторій",
-  "session.cloud.import": "Імпортувати з хмари",
   "feedback.button": "Зворотний зв'язок і підтримка",
   "feedback.dialog.message": "Ми раді отримати ваш відгук або допомогти з будь-якими проблемами, які у вас виникли.",
   "feedback.dialog.github": "Повідомити про проблему на GitHub",
   "feedback.dialog.discord": "Приєднатися до нашої спільноти Discord",
   "feedback.dialog.support": "Служба підтримки клієнтів",
-  "session.cloud.import.title": "Імпортувати з хмари",
-  "session.cloud.import.placeholder": "Ідентифікатор сесії, URL або команда kilo import",
-  "session.cloud.import.button": "Імпортувати",
-  "session.cloud.import.invalid": "Недійсний формат ідентифікатора сесії",
-  "session.cloud.import.legacy": "Схоже, це застаріла сесія, яка більше не підтримується.",
-  "session.cloud.import.failed": "Не вдалося імпортувати хмарну сесію",
 
   "workspace.new": "Новий робочий простір",
   "workspace.type.local": "локальний",
@@ -995,36 +975,8 @@ export const dict = {
   "workspace.reset.archived.many": "{{count}} сесій буде архівовано.",
   "workspace.reset.note": "Ця дія скине робочий простір відповідно до основної гілки.",
 
-  "deviceAuth.toast.urlCopied": "URL скопійовано до буфера обміну",
-  "deviceAuth.toast.codeCopied": "Код скопійовано до буфера обміну",
-  "deviceAuth.toast.errorCopied": "Помилку скопійовано до буфера обміну",
-  "deviceAuth.status.initiating": "Ініціалізація входу...",
-  "deviceAuth.title": "Увійти до Kilo Code",
-  "deviceAuth.step1": "Крок 1: Відкрийте цей URL",
-  "deviceAuth.action.copyUrl": "Копіювати URL",
-  "deviceAuth.action.openBrowser": "Відкрити браузер",
-  "deviceAuth.qrCode.alt": "QR-код",
-  "deviceAuth.step2": "Крок 2: Введіть цей код",
-  "deviceAuth.action.clickToCopy": "Клацніть для копіювання",
-  "deviceAuth.status.waiting": "Очікування авторизації...",
-  "deviceAuth.status.success": "Вхід виконано успішно!",
-  "deviceAuth.status.failed": "Вхід не вдався",
-  "deviceAuth.status.cancelled": "Вхід скасовано",
-  "deviceAuth.action.copyError": "Копіювати помилку",
-  "deviceAuth.action.showDetails": "Показати деталі",
-  "deviceAuth.action.tryAgain": "Спробувати ще раз",
-  "deviceAuth.error.detailsTitle": "Деталі помилки входу",
-
   "common.retry": "Спробувати ще раз",
   "common.refresh": "Оновити",
-
-  "profile.title": "Профіль",
-  "profile.notLoggedIn": "Не увійшов",
-  "profile.action.login": "Увійти через Kilo Code",
-  "profile.balance.title": "Баланс",
-  "profile.balance.refresh": "Оновити баланс",
-  "profile.action.dashboard": "Панель керування",
-  "profile.action.logout": "Вийти",
 
   "settings.section.configuration": "Конфігурація",
   "settings.agentBehaviour.title": "Поведінка агента",
@@ -1296,7 +1248,6 @@ export const dict = {
   "settings.agentBehaviour.addMcp.args.placeholder": "напр.\n-y\n@modelcontextprotocol/server-filesystem\n/tmp",
   "settings.agentBehaviour.addMcp.url": "URL сервера",
   "settings.agentBehaviour.addMcp.url.placeholder": "напр. http://localhost:3000/sse",
-  "settings.agentBehaviour.mcpBrowseMarketplace": "Переглянути Marketplace",
   "settings.agentBehaviour.mcpEmpty":
     "MCP-серверів не налаштовано. Додайте MCP-сервери до kilo.jsonc або попросіть агента додати їх.",
   "settings.agentBehaviour.workflowsPlaceholder":
@@ -1390,8 +1341,6 @@ export const dict = {
   "settings.providers.select.placeholder": "Вибрати провайдера...",
 
   "dialog.model.notSet": "Не встановлено",
-
-  "profile.personalAccount": "Особистий акаунт",
 
   // Agent Manager strings live in webview-ui/agent-manager/i18n/uk.ts
 
@@ -1503,12 +1452,7 @@ export const dict = {
   "settings.saveBar.cancel": "Скасувати",
   "settings.saveBar.saving": "Збереження…",
   "settings.saveBar.saveFailed": "Не вдалося зберегти налаштування",
-  "notifications.action.next": "Далі",
-  "notifications.action.close": "Закрити",
-  "notifications.action.tryModel": "Спробувати {{model}}",
-  "notifications.action.tryModelGeneric": "Спробувати модель",
   // Missing translations - English fallbacks until translated
-  "profile.switchingAccount": "Перемикання акаунту…",
   "settings.agentBehaviour.createMode": "Створити новий режим",
   "settings.agentBehaviour.createMode.button": "Створити",
   "settings.agentBehaviour.createMode.cancel": "Скасувати",

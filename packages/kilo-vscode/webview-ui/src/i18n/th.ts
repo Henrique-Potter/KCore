@@ -446,15 +446,6 @@ export const dict = {
 
   "error.startup.title": "การเชื่อมต่อเซิร์ฟเวอร์ล้มเหลว",
 
-  "error.paidModel.title": "คุณต้องเข้าสู่ระบบเพื่อใช้โมเดลนี้",
-  "error.paidModel.description":
-    "เข้าสู่ระบบหรือสร้างบัญชีเพื่อเข้าถึงโมเดลกว่า 500 รายการ ใช้เครดิตในราคาทุน หรือใช้คีย์ของคุณเอง",
-  "error.paidModel.action": "เข้าสู่ระบบ",
-  "error.promotionLimit.title": "คุณต้องสมัครสมาชิกเพื่อดำเนินการต่อ",
-  "error.promotionLimit.description":
-    "สมัครฟรีเพื่อดำเนินการต่อและสำรวจโมเดลกว่า 500 รายการ ใช้เวลา 2 นาที ไม่ต้องใช้บัตรเครดิต หรือกลับมาทีหลัง",
-  "error.promotionLimit.action": "สมัครสมาชิก",
-
   "error.chain.unknown": "ข้อผิดพลาดที่ไม่รู้จัก",
   "error.chain.causedBy": "สาเหตุ:",
   "error.chain.apiError": "ข้อผิดพลาด API",
@@ -793,7 +784,6 @@ export const dict = {
   "settings.providers.section.popular": "ผู้ให้บริการยอดนิยม",
   "settings.providers.search.placeholder": "ค้นหาผู้ให้บริการ",
   "settings.providers.select.placeholder": "เลือกผู้ให้บริการ...",
-  "settings.providers.tag.gateway": "Gateway",
   "settings.providers.tag.environment": "สภาพแวดล้อม",
   "settings.providers.tag.config": "กำหนดค่า",
   "settings.providers.tag.chatgpt": "ChatGPT",
@@ -969,21 +959,11 @@ export const dict = {
   "session.showHistory": "แสดงประวัติ",
   "session.search.placeholder": "ค้นหาเซสชัน...",
   "session.empty": "ยังไม่มีเซสชัน คลิก + เพื่อเริ่มการสนทนาใหม่",
-  "session.tab.local": "ในเครื่อง",
-  "session.tab.cloud": "คลาวด์",
-  "session.cloud.repoOnly": "เฉพาะรีโพซิทอรีนี้",
-  "session.cloud.import": "นำเข้าจากคลาวด์",
   "feedback.button": "ข้อเสนอแนะและการสนับสนุน",
   "feedback.dialog.message": "เรายินดีรับฟังข้อเสนอแนะของคุณหรือช่วยแก้ไขปัญหาที่คุณพบ",
   "feedback.dialog.github": "รายงานปัญหาบน GitHub",
   "feedback.dialog.discord": "เข้าร่วมชุมชน Discord ของเรา",
   "feedback.dialog.support": "ฝ่ายสนับสนุนลูกค้า",
-  "session.cloud.import.title": "นำเข้าจากคลาวด์",
-  "session.cloud.import.placeholder": "ID เซสชัน, URL หรือคำสั่ง kilo import",
-  "session.cloud.import.button": "นำเข้า",
-  "session.cloud.import.invalid": "รูปแบบ ID เซสชันไม่ถูกต้อง",
-  "session.cloud.import.legacy": "นี่ดูเหมือนจะเป็นเซสชันเวอร์ชันเก่าที่ไม่รองรับอีกต่อไปแล้ว",
-  "session.cloud.import.failed": "ไม่สามารถนำเข้าเซสชันคลาวด์ได้",
 
   "workspace.new": "พื้นที่ทำงานใหม่",
   "workspace.type.local": "ในเครื่อง",
@@ -1011,36 +991,8 @@ export const dict = {
   "workspace.reset.archived.many": "{{count}} เซสชันจะถูกจัดเก็บ",
   "workspace.reset.note": "สิ่งนี้จะรีเซ็ตพื้นที่ทำงานให้ตรงกับสาขาเริ่มต้น",
 
-  "deviceAuth.toast.urlCopied": "คัดลอก URL ไปยังคลิปบอร์ดแล้ว",
-  "deviceAuth.toast.codeCopied": "คัดลอกรหัสไปยังคลิปบอร์ดแล้ว",
-  "deviceAuth.toast.errorCopied": "คัดลอกข้อผิดพลาดไปยังคลิปบอร์ดแล้ว",
-  "deviceAuth.status.initiating": "กำลังเริ่มเข้าสู่ระบบ...",
-  "deviceAuth.title": "เข้าสู่ระบบ Kilo Code",
-  "deviceAuth.step1": "ขั้นตอนที่ 1: เปิด URL นี้",
-  "deviceAuth.action.copyUrl": "คัดลอก URL",
-  "deviceAuth.action.openBrowser": "เปิดเบราว์เซอร์",
-  "deviceAuth.qrCode.alt": "คิวอาร์โค้ด",
-  "deviceAuth.step2": "ขั้นตอนที่ 2: ป้อนรหัสนี้",
-  "deviceAuth.action.clickToCopy": "คลิกเพื่อคัดลอก",
-  "deviceAuth.status.waiting": "กำลังรอการอนุญาต...",
-  "deviceAuth.status.success": "เข้าสู่ระบบสำเร็จ!",
-  "deviceAuth.status.failed": "เข้าสู่ระบบล้มเหลว",
-  "deviceAuth.error.detailsTitle": "รายละเอียดข้อผิดพลาดการเข้าสู่ระบบ",
-  "deviceAuth.status.cancelled": "ยกเลิกการเข้าสู่ระบบ",
-  "deviceAuth.action.tryAgain": "ลองอีกครั้ง",
-  "deviceAuth.action.copyError": "คัดลอกข้อผิดพลาด",
-  "deviceAuth.action.showDetails": "ดูรายละเอียด",
-
   "common.retry": "ลองอีกครั้ง",
   "common.refresh": "รีเฟรช",
-
-  "profile.title": "โปรไฟล์",
-  "profile.notLoggedIn": "ยังไม่ได้เข้าสู่ระบบ",
-  "profile.action.login": "เข้าสู่ระบบด้วย Kilo Code",
-  "profile.balance.title": "ยอดคงเหลือ",
-  "profile.balance.refresh": "รีเฟรชยอดคงเหลือ",
-  "profile.action.dashboard": "แดชบอร์ด",
-  "profile.action.logout": "ออกจากระบบ",
 
   "settings.section.configuration": "การกำหนดค่า",
   "settings.agentBehaviour.title": "พฤติกรรมของเอเจนต์",
@@ -1311,7 +1263,6 @@ export const dict = {
   "settings.agentBehaviour.mcpDetail.args": "อาร์กิวเมนต์",
   "settings.agentBehaviour.mcpDetail.env": "สภาพแวดล้อม",
   "settings.agentBehaviour.mcpDetail.disabled": "เซิร์ฟเวอร์นี้ถูกปิดใช้งาน",
-  "settings.agentBehaviour.mcpBrowseMarketplace": "เรียกดู Marketplace",
   "settings.agentBehaviour.mcpEmpty":
     "ไม่ได้กำหนดค่าเซิร์ฟเวอร์ MCP เพิ่มเซิร์ฟเวอร์ MCP ใน kilo.jsonc หรือขอให้เอเจนต์เพิ่มให้คุณ",
   "settings.agentBehaviour.workflowsPlaceholder": "เวิร์กโฟลว์จัดการผ่านไฟล์เวิร์กโฟลว์ในพื้นที่ทำงาน",
@@ -1388,8 +1339,6 @@ export const dict = {
   "settings.providers.enabled.description": "หากตั้งค่า เฉพาะผู้ให้บริการเหล่านี้เท่านั้นที่จะพร้อมใช้งาน",
   "settings.providers.notSet": "ไม่ได้ตั้งค่า (ใช้ค่าเริ่มต้นของเซิร์ฟเวอร์)",
   "dialog.model.notSet": "ไม่ได้ตั้งค่า",
-  "profile.personalAccount": "บัญชีส่วนตัว",
-  "profile.switchingAccount": "กำลังสลับบัญชี…",
   // Agent Manager strings live in webview-ui/agent-manager/i18n/th.ts
 
   "question.summary": "{{n}} จาก {{total}} คำถาม",
@@ -1498,8 +1447,4 @@ export const dict = {
   "settings.saveBar.cancel": "ยกเลิก",
   "settings.saveBar.saving": "กำลังบันทึก…",
   "settings.saveBar.saveFailed": "ไม่สามารถบันทึกการตั้งค่าได้",
-  "notifications.action.next": "ถัดไป",
-  "notifications.action.close": "ปิด",
-  "notifications.action.tryModel": "ลองใช้ {{model}}",
-  "notifications.action.tryModelGeneric": "ลองใช้โมเดล",
 }

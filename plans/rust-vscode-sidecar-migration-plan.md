@@ -2,7 +2,7 @@
 
 ## Implementation status
 
-Last updated: 2026-05-01
+Last updated: 2026-05-03
 
 | Area | Status | Notes |
 |---|---|---|
@@ -13,9 +13,41 @@ Last updated: 2026-05-01
 | Milestone 4: Remove Marketplace and KiloClaw from lean target | Complete on the kilo-vscode side, VSIX smoke-passed | Removed VS Code Marketplace and KiloClaw integration points from activation, package contributions, webview bundles, webview routes/messages, services, tests/stories, telemetry names, and KiloClaw-only Stream Chat dependency in `packages/kilo-vscode`. User smoke-tested the packaged VSIX successfully. The opencode-side claw code (`packages/opencode/src/kilocode/claw/*`) and its `stream-chat` dependency in `packages/opencode/package.json` and `package.json` patches remain in place; whether they are also out of the lean target is an open scope question — flagged for a later plan revision, **not** done in M4. |
 | Milestone 5: Read-only route parity for sidebar and Agent Manager | M5 contract-complete on the Rust side | Rust now exposes the full M5 inventory: read-only startup/session routes, Bun-compatible AppData/XDG path resolution, SQL-side session filtering, opaque message cursor pagination with `X-Next-Cursor`/`Link` headers, plus `PATCH /global/config` (persists to `<config_dir>/config.json`), `POST /global/dispose`, `POST /instance/dispose`, `PATCH /session/{id}` (title rename with `session.updated` SSE projection), `GET /provider/{providerID}`, and `PUT`/`DELETE /auth/{providerID}` stubs. `Project` shape now carries `icon` and `commands` so the sidebar doesn't drop them. Remaining gap: live Rust runtime UI smoke test, mutation-gate timing fix in [`KiloConnectionService`](../packages/kilo-vscode/src/services/cli-backend/connection-service.ts) (currently flips on request, not 2xx response), and full MCP parity (M11). |
 | Milestone 6: Session store and SSE event parity | M6 complete on the Rust side | Rust now implements durable session create/list/get/update/delete, viewed/open session state, child lookup, fork cloning with message/part ID remapping, message get/delete, part delete/update, revert/unrevert storage projection, diff readback, share/unshare storage, event table persistence, and write-before-publish SSE projection for `session.created`/`session.updated`/`session.deleted`, `message.updated`/`message.removed`, and `message.part.updated`/`message.part.removed`. `prompt_async`, abort, and fake prompt scaffolding exist, but the real provider-backed prompt runner remains M7. `summarize` is intentionally M6-safe/no-provider: it verifies the session and returns `true` without compaction mutation. Validated with `cargo fmt --all`, `cargo test -p kilo-store`, and `cargo test -p kilo-server`. |
-| Milestone 7: First vertical agent turn | Scripted first-chat smoke present | Rust now has per-session runner state, `BusyError` rejection, cross-session concurrent fake turns, `prompt_async`, abort signaling, deterministic fake turns, parallel fake tool calls, OpenAI OAuth Responses streaming/parser coverage, M7 oracle traces, and a deterministic sidebar-first-chat smoke (`m7_sidebar_first_chat_smoke_streams_persists_and_reads_back`) that launches Rust, opens `/global/event`, creates a session, sends a fake-provider first prompt, observes streamed text delta/session events, verifies persisted messages, and reads history back. Validated with `cargo fmt --all`, `cargo test -p kilo-server`, `cargo test -p kilo-oracle`, and targeted `m7_rust_fixtures`. Remaining M7 risk: true live VS Code UI smoke still needs manual execution because no local UI e2e harness/fake-provider toggle exists. |
+| Milestone 7: First vertical agent turn | Live OpenAI OAuth chat smoke passed | Rust now has per-session runner state, `BusyError` rejection, cross-session concurrent fake turns, `prompt_async`, abort signaling, deterministic fake turns, parallel fake tool calls, OpenAI OAuth Responses streaming/parser coverage, M7 oracle traces, and a deterministic sidebar-first-chat smoke (`m7_sidebar_first_chat_smoke_streams_persists_and_reads_back`) that launches Rust, opens `/global/event`, creates a session, sends a fake-provider first prompt, observes streamed text delta/session events, verifies persisted messages, and reads history back. On 2026-05-03, the latest packaged VSIX was installed and a live VS Code smoke confirmed the Rust sidecar OpenAI Pro / ChatGPT OAuth account-provider path can complete chat (`finally chat works`). Validated with `cargo fmt --all`, `cargo test -p kilo-server`, `cargo test -p kilo-oracle`, targeted `m7_rust_fixtures`, `cargo test -p kilo-server prompt_turn_openai_oauth`, `cargo test -p kilo-provider`, `bun run package`, VSIX packaging, and live smoke. Remaining M7 automation risk: no local UI e2e harness/fake-provider toggle exists. |
+| Storage and process self-healing invariants | Defined; partial implementation | First-run schema bootstrap fixed in `kilo-store` (`init_schema` now runs unconditionally with `create table if not exists`) after a HEAD bug shipped `Invalid parameter name: missing table project` toasts on first chat. Schema versioning, internal-error normalization, Bun↔Rust round-trip oracle, and OS-keychain auth storage remain unscheduled — see new "Storage and process self-healing invariants" section. |
+| Operational invariants | Defined; not implemented | Structured logging via `tracing`, opt-in telemetry seam, single-sidecar-per-user lock, lazy activation event, and request/SSE/session/message resource limits remain unscheduled — see new "Operational invariants" section. |
 
-Current continuation target: manual live `auto`-runtime VS Code UI smoke against Rust, then close M7 or move remaining UI automation work into a dedicated e2e harness task.
+Current continuation target: treat the Rust OpenAI Pro / ChatGPT OAuth account-provider path as live-smoke validated, then move remaining UI automation work into a dedicated e2e harness task. After that, work the new self-healing/operational invariant items into M5/M6/M8/M12/M14 per the cross-references below.
+
+### 2026-05-03 live OpenAI OAuth chat smoke
+
+User confirmation: after installing the latest VSIX and retrying chat, `finally chat works`. This validates the Rust VS Code sidecar's **OpenAI Pro / ChatGPT OAuth account-provider path** for live chat. It does **not** claim generic provider parity.
+
+Fresh artifact that worked: [`packages/kilo-vscode/kilo-code-latest.vsix`](../packages/kilo-vscode/kilo-code-latest.vsix), approximately 83,461,402 bytes, modified 2026-05-03 05:07 PM local time.
+
+Root-cause/fix sequence that made the smoke pass:
+
+- JSON body leniency for SDK requests missing `Content-Type` in [`middleware.rs`](../packages/kilo-vscode-sidecar-rs/crates/kilo-server/src/http/middleware.rs).
+- SQLite store schema initialization on first write in [`lib.rs`](../packages/kilo-vscode-sidecar-rs/crates/kilo-store/src/lib.rs).
+- OpenAI OAuth permissions, tool loop behavior, and provider streaming improvements in [`openai_stream.rs`](../packages/kilo-vscode-sidecar-rs/crates/kilo-server/src/agent/openai_stream.rs).
+- Persisted Responses transcript replay and empty assistant placeholder filtering in [`parts.rs`](../packages/kilo-vscode-sidecar-rs/crates/kilo-server/src/agent/parts.rs).
+- Slash command expansion and inline subtask handling in [`turn.rs`](../packages/kilo-vscode-sidecar-rs/crates/kilo-server/src/agent/turn.rs).
+- Skill/command registry and richer local registry parsing in [`registry.rs`](../packages/kilo-vscode-sidecar-rs/crates/kilo-server/src/registry.rs) and [`routes/registry.rs`](../packages/kilo-vscode-sidecar-rs/crates/kilo-server/src/routes/registry.rs).
+- Provider error diagnostics in [`lib.rs`](../packages/kilo-vscode-sidecar-rs/crates/kilo-provider/src/lib.rs).
+
+Validation highlights:
+
+- `cargo test -p kilo-server prompt_turn_openai_oauth` passed 10 tests from [`Cargo.toml`](../packages/kilo-vscode-sidecar-rs/Cargo.toml).
+- `cargo test -p kilo-provider` passed 54 tests, 1 ignored from [`Cargo.toml`](../packages/kilo-vscode-sidecar-rs/Cargo.toml).
+- `bun run package` passed from [`package.json`](../packages/kilo-vscode/package.json).
+- VSIX packaging passed, and the packaged VSIX above passed the live chat smoke.
+
+Known remaining gaps:
+
+- This is OpenAI OAuth/Codex account-provider parity, not full provider parity.
+- Inline subtasks exist, but full Bun child-agent/subagent orchestration is not implemented.
+- MCP prompt discovery, remote skill URL fetching, permission-filtered skill availability, and long-session compaction/trimming remain future work.
+- Previously known unrelated full-suite issue: [`worktree_list_reads_git_porcelain_paths()`](../packages/kilo-vscode-sidecar-rs/crates/kilo-server/src/tests.rs) may fail independently.
 
 ## North star
 
@@ -90,6 +122,68 @@ When porting providers (M10), match what the *stream* surface produces — token
 
 The oracle harness ([`packages/kilo-vscode-sidecar-rs/crates/kilo-oracle`](../packages/kilo-vscode-sidecar-rs/crates/kilo-oracle)) is the enforcement mechanism for invariants 1, 4, and 5. Invariants 2 and 3 require **dedicated parallel-execution traces**: at minimum, one fixture exercising two-tool-calls-per-step (verifying overlapped execution) and one fixture exercising N concurrent sessions in Agent Manager (verifying zero cross-session leakage). Without those fixtures, drift here will not be caught until production users notice it.
 
+## Storage and process self-healing invariants
+
+These are the parts of the persistence and process surface that must keep working when state is unfamiliar, partially initialized, or recovered from a crash. Anyone porting M5+ to Rust must reproduce these — no toast saying "Invalid parameter name: missing table project" should ever reach a user. They are parallel to the agent-loop invariants above: contract tests can pass while these regress.
+
+### 1. Persistent files self-heal on missing or partial state
+
+Every file the sidecar opens for read-write — `kilo.db`, `auth.json`, `model.json`, `mcp-auth.json`, future caches — must produce a working state regardless of prior content. "Empty 4 KB SQLite file with no tables plus orphaned WAL/SHM siblings" is a real on-disk state: it is what one crashed init leaves behind. The same is true for half-written JSON and stale lock files.
+
+For SQLite: bootstrap with `create table if not exists` for every table on every writer-connection initialization. Do not gate schema creation on file existence — `path.exists()` is true after the first failed `Connection::open`, so a one-time crash leaves every subsequent launch broken. For JSON: parse failures fall back to the empty-default value and overwrite on next successful write, never crash the process.
+
+Reference incident: [`kilo-store/src/lib.rs:964`](../packages/kilo-vscode-sidecar-rs/crates/kilo-store/src/lib.rs:964) prior to the M6.1 fix opened `kilo.db` with `SQLITE_OPEN_CREATE`, applied pragmas, then never created any tables in production (the only `create table` lived in `seed_for_test`, gated behind `cfg(any(test, feature = "test-utils"))`). First chat surfaced `Invalid parameter name: missing table project` to the user as a toast.
+
+### 2. Schema evolves through versioned, idempotent migrations
+
+The SQLite schema must carry a `schema_version` cell (PRAGMA `user_version` is sufficient) and a migration runner that walks from the on-disk version to the binary version on every writer-connection init. Migrations are idempotent (`add column if not exists` patterns where SQLite supports them, version-gated `alter table` elsewhere). New columns default to NULL or to a backfill written at migration time and never break Bun-compat reads for the rollback window.
+
+Adding a column without bumping `schema_version` is a process bug, not a schema bug. CI must fail any change to `init_schema` that does not also add a migration entry.
+
+### 3. Internal errors normalize before reaching the SDK boundary
+
+Library error text — rusqlite's `Display`, `std::io::Error` chains, OAuth refresh failures, panics from spawned tasks — never reaches the SDK envelope unmangled. The sidecar wraps these in the same `NamedError` shape M10 specifies for OpenAI errors: `{name, data: {message}}` with a stable `name` the extension can localize and a `message` safe for the toast surface. `Invalid parameter name: missing table project` is the failure mode for skipping this rule.
+
+### 4. Bun ↔ Rust storage round-trip is verified before Bun fallback removal
+
+Storage compatibility is asymmetric in M0/M5/M6 today (they verify Rust reads Bun-written rows). Before M14 step 7 removes Bun, the oracle must also verify the inverse: Bun reads Rust-written sessions, messages, parts, and events without column-order drift, JSON-default drift, or unknown-field loss. The check runs on every Rust schema change, not once.
+
+### 5. Auth secrets at rest follow OS-native protection
+
+OAuth tokens (ChatGPT Pro refresh tokens, future provider credentials, MCP OAuth) live behind the OS keychain — DPAPI on Windows, Keychain Services on macOS, libsecret/Secret Service on Linux — not in plaintext under `data/kilo/auth.json`. The current plaintext path is M5-era scaffolding; before stable rollout the storage layer routes through a `KeyringStore` shim with a documented plaintext fallback for environments where the keyring is unavailable (CI, headless containers, locked Linux sessions), gated behind an explicit user opt-in or env flag.
+
+### Verification
+
+The oracle harness covers invariants 1, 2, and 4: (a) a fresh-install fixture with no `kilo.db` on disk exercises bootstrap; (b) a half-init fixture (empty `kilo.db` + WAL/SHM siblings) exercises self-heal; (c) a Bun-writes-then-Rust-reads fixture and a Rust-writes-then-Bun-reads fixture exercise round-trip on every schema change. Invariant 3 needs an integration test that asserts every error reaching `internal_error` carries a stable `name` from a documented set. Invariant 5 needs a cross-platform smoke that round-trips an OAuth token through the keyring without writing it to disk.
+
+## Operational invariants
+
+These are runtime behaviors that no contract test catches but that determine whether the sidecar is supportable in production.
+
+### 1. Structured logging with `tracing`
+
+The sidecar emits structured logs through `tracing` and an env-controlled subscriber: spans for HTTP requests, SSE connections, and per-session turns; events at INFO for state transitions, WARN for self-healed conditions, ERROR for surfaced failures. Default destination is `<state_dir>/kilo/log/sidecar.log` with size-based rotation. `RUST_LOG`/`KILO_LOG` overrides the level. `eprintln!` is acceptable only for pre-tracing-init startup messages.
+
+### 2. Telemetry and crash reporting are opt-in but designed in
+
+Even without shipping telemetry day-one, the seam exists: a `Telemetry` trait with a no-op default and one structured emit-point per failure class (sidecar startup error, SSE disconnect-then-reconnect, schema bootstrap, OAuth refresh failure, panic). A future opt-in implementation slots in without rewiring call sites.
+
+### 3. Single sidecar per user across VS Code windows
+
+Two VS Code windows on the same workspace must not spawn two writer processes against the same `kilo.db`. SQLite WAL handles concurrent writes safely at the file level, but the per-Store writer mutex inside [`kilo-store/src/lib.rs:964`](../packages/kilo-vscode-sidecar-rs/crates/kilo-store/src/lib.rs:964) does not coordinate across processes — split-brain session state is the failure mode. Resolution: a per-user lock file (`<state_dir>/kilo/sidecar.lock`) records the live sidecar's PID and listening port; new launches detect the lock, attempt a health probe, and either join the existing instance or take over if the prior PID is dead. Multi-root workspaces and multiple-window-same-workspace both resolve to one sidecar.
+
+### 4. Activation event picks lazy-on-chat, not eager-on-startup
+
+The Rust sidecar spawns on the first kilo-code activation event the user actually triggers — opening the sidebar, opening Agent Manager, invoking a kilo command — not on VS Code startup. Cold start measurement in M13 is from activation event to readiness, not from VS Code launch. Keeps RSS at zero for users who don't use Kilo in a given window. `KILO_VSCODE_SIDECAR_PRESPAWN=1` overrides for benchmarking.
+
+### 5. Resource limits at the boundary
+
+HTTP request body limit: 16 MiB. Max concurrent SSE clients: 32 per workspace. Max sessions per workspace: 1000 (older are archived, not deleted). Max single-message-part size: 1 MiB. Max captured tool-output: 1 MiB (truncated with sentinel). Each is a constant in `kilo-server/src/limits.rs` so changes show up in code review and the oracle can assert them.
+
+### Verification
+
+Logging and telemetry seams are verified by integration tests that assert one structured emit per failure class and that the log file exists after a controlled startup error. The single-sidecar lock is verified by a multi-process test that races two `serve --port 0` invocations and asserts the second one joins or replaces, never both serve. Activation timing is verified manually in the live UI smoke (sidebar open → cold-start measurement starts here, not at VS Code launch). Resource limits are asserted at the route layer: oversize body returns 413, oversize SSE client count returns 503, etc. — all with stable error names.
+
 ## Milestone 0: Contract freeze and Bun oracle harness
 
 ### Goal
@@ -125,6 +219,10 @@ Before writing real Rust behavior, freeze what the VS Code extension expects fro
 - Store fixtures created by Bun and read by Rust.
 - Contract version document in a new sidecar docs file such as [`CONTRACT.md`](../packages/kilo-vscode-sidecar-rs/CONTRACT.md).
 
+### Route inventory governance
+
+[`docs/route-inventory.md`](../packages/kilo-vscode-sidecar-rs/docs/route-inventory.md) is canonical and must be updated in the same commit as any route addition, removal, or method change. The `route_inventory_methods_match_sdk_emission` oracle test in [`kilo-oracle/tests/inventory_parity.rs`](../packages/kilo-vscode-sidecar-rs/crates/kilo-oracle/tests/inventory_parity.rs) enforces parity against [`packages/sdk/js/src/v2/gen/sdk.gen.ts`](../packages/sdk/js/src/v2/gen/sdk.gen.ts); the test failing on a PR means the inventory is stale, not that the SDK is wrong. The owner is whoever lands the route change.
+
 ### Exit gate
 
 Bun oracle tests pass consistently before Rust is judged.
@@ -156,9 +254,16 @@ Keep this Kilo-specific to avoid upstream OpenCode merge churn.
 - Rust code remains VS Code-sidecar-specific until it proves reusable.
 - The migration avoids refactoring shared upstream files first.
 
+### Toolchain and dependency policy
+
+- `rust-toolchain.toml` at the workspace root pins the MSRV to the version CI uses; bumps require an explicit PR with a changelog entry.
+- `cargo-deny` config in `deny.toml` enforces a license allow-list and refuses dependencies with known advisories. Runs on every PR.
+- `Cargo.lock` is committed (already true). `cargo update` runs only via dedicated dependency-bump PRs, never as a side effect of feature work.
+- New transitive dependency over a size threshold (e.g. > 500 KiB compiled or > 50 transitive crates) requires a one-line justification in the PR description.
+
 ### Exit gate
 
-Rust workspace builds, formats, lints, and can produce an empty sidecar binary for all local dev targets.
+Rust workspace builds, formats, lints, and can produce an empty sidecar binary for all local dev targets. `cargo deny check` is green and `rust-toolchain.toml` is checked in.
 
 ## Milestone 2: Rust server skeleton
 
@@ -189,9 +294,18 @@ Create a Rust binary that can be launched by the existing VS Code extension proc
    - Drain/cancel tasks.
    - Exit without orphaning children.
 
+### Process model and operational invariants
+
+These are required at M2 because they shape every subsequent milestone's runtime behavior.
+
+- **Single-sidecar-per-user lock.** See **Operational invariants → 3**. Implementation lives in `kilo-server/src/lock.rs` and gates the bind step. A second `serve --port 0` invocation discovers the existing lock, health-probes the recorded port/PID, and either joins (returns the same readiness line) or replaces (if the prior PID is dead).
+- **Activation timing.** Spawn on the first kilo activation event the user actually triggers, not on VS Code startup. See **Operational invariants → 4**. Cold-start measurement in M13 starts at the activation event.
+- **Resource limits.** Constants in `kilo-server/src/limits.rs` per **Operational invariants → 5**. Applied at axum's `Body::Limited`, the SSE connection counter, and the session-create gate. Oversize/over-limit requests return stable error names (`request_too_large`, `sse_capacity_exceeded`, `session_quota_exceeded`).
+- **Structured logging.** `tracing` subscriber initialized before route registration. See **Operational invariants → 1**. Pre-tracing-init startup messages may use `eprintln!`; everything past route registration is structured.
+
 ### Exit gate
 
-The extension can spawn Rust, parse the port, authenticate, call health, connect SSE, and shut it down without changing [`KiloConnectionService`](../packages/kilo-vscode/src/services/cli-backend/connection-service.ts:61).
+The extension can spawn Rust, parse the port, authenticate, call health, connect SSE, and shut it down without changing [`KiloConnectionService`](../packages/kilo-vscode/src/services/cli-backend/connection-service.ts:61). A second concurrent `serve --port 0` is rejected or joined per the lock policy. Logs land at the configured destination.
 
 ## Milestone 3: Runtime switch and preview fallback
 
@@ -311,9 +425,16 @@ Compare Bun and Rust for:
 - Prompt placeholder events.
 - Agent Manager multi-session event routing.
 
+### Schema bootstrap and migrations
+
+- First writer-connection initialization runs `init_schema` unconditionally; tables use `create table if not exists`. See **Storage and process self-healing invariants → 1**. The historical pattern of gating bootstrap on `path.exists()` is forbidden — that pattern is the bug that produced `Invalid parameter name: missing table project` toasts in the M6.1 incident.
+- Schema version cell uses SQLite's `PRAGMA user_version`. A `migrations` array in `kilo-store/src/migrations.rs` is walked from the on-disk version to the binary version on every writer init. See **Storage and process self-healing invariants → 2**. Each migration is `(version: u32, sql: &str)` and runs in a transaction.
+- Internal-error normalization at the SDK boundary wraps every `rusqlite::Error`, `std::io::Error`, and panic as a `NamedError`. See **Storage and process self-healing invariants → 3**. The set of allowed `name` values is documented in [`CONTRACT.md`](../packages/kilo-vscode-sidecar-rs/CONTRACT.md) and asserted by an integration test.
+- Bun ↔ Rust storage round-trip oracle fixture lives in `kilo-oracle/tests/storage_roundtrip.rs` and runs on every schema change. See **Storage and process self-healing invariants → 4**. Failures block merging changes that affect persisted shape.
+
 ### Exit gate
 
-Rust-created sessions survive restart, Bun-created sessions can be read by Rust, and Agent Manager never receives events for the wrong session.
+Rust-created sessions survive restart, Bun-created sessions can be read by Rust, **Bun can read Rust-created sessions**, and Agent Manager never receives events for the wrong session. A fresh-install fixture (no `kilo.db` on disk) and a half-init fixture (empty `kilo.db` with WAL/SHM siblings) both produce a working store on first chat. Every error path observed in CI carries a stable `name` from the documented set.
 
 ## Milestone 7: First vertical agent turn
 
@@ -373,9 +494,13 @@ Sidebar first chat works against Rust, streams tokens to the existing UI, persis
 7. Tool output truncation and error normalization.
 8. Tool repair behavior.
 
+### Cross-shell tool execution
+
+The `bash` tool surface must work on Windows, where bash is not the default shell. Resolution order on Windows: WSL `bash` if available → Git Bash if installed (detect via `where bash` and `git --exec-path`) → cmd.exe-wrapped `bash.exe` if Git for Windows is on PATH → fail with a stable error name (`shell_unavailable`) if none resolve. PowerShell parity is **not** a goal — Bun's tool semantics assume bash quoting, redirects, and environment expansion; pretending PowerShell is interchangeable is a worse failure mode than refusing to run. The resolution order and fallback policy is documented in [`CONTRACT.md`](../packages/kilo-vscode-sidecar-rs/CONTRACT.md).
+
 ### Exit gate
 
-A realistic task involving file read, edit, diff, permission prompt, denial path, and abort works through Rust with Bun-compatible session history.
+A realistic task involving file read, edit, diff, permission prompt, denial path, and abort works through Rust with Bun-compatible session history. The bash tool runs on Windows hosts that have either WSL or Git for Windows installed, and returns `shell_unavailable` with a user-actionable message on hosts that have neither.
 
 ## Milestone 9: Agent Manager worktree and concurrency parity
 
@@ -425,7 +550,7 @@ Other providers are not blocked — they continue working on Bun via the `auto`/
 
 ### Implement (in order)
 
-1. **Auth storage:** persist `{ type: "oauth", access, refresh, expires, accountId }` in `Auth` for `provider_id = "openai"`. Reuse the existing `PUT /auth/{providerID}` route registered in M5.
+1. **Auth storage:** persist `{ type: "oauth", access, refresh, expires, accountId }` in `Auth` for `provider_id = "openai"`. Reuse the existing `PUT /auth/{providerID}` route registered in M5. Routes the persistence through the `KeyringStore` shim required by **Storage and process self-healing invariants → 5**; plaintext `auth.json` is preview-only and must not survive into stable.
 2. **OAuth flow:** loopback HTTP server on port 1455, PKCE challenge, redirect handling, token exchange against `https://auth.openai.com/oauth/token`. Match the exact scopes and custom params Bun uses (`id_token_add_organizations=true`, `codex_cli_simplified_flow=true`). Headless device-flow variant ([`plugin/codex.ts:516-538`](../packages/opencode/src/plugin/codex.ts:516)) is optional for VS Code (browser flow is the default UX) but worth implementing for SSH/remote-extension cases.
 3. **Refresh:** on expiry-on-call, refresh against `https://auth.openai.com/oauth/token` and persist back. Mirror the structure at [`plugin/codex.ts:425-440`](../packages/opencode/src/plugin/codex.ts:425).
 4. **Model registry:** filter the static provider list down to the Codex-allowed models plus the gpt-5.2/5.3/5.4/5.5 base. Zero out costs (subscription-included). The Codex regex [`/^gpt-(\d+\.\d+)/`](../packages/opencode/src/plugin/codex.ts:388) gating is load-bearing — copy it.
@@ -444,14 +569,13 @@ Other providers are not blocked — they continue working on Bun via the `auto`/
 The following stay on Bun (and are explicitly NOT implemented in Rust):
 
 - API-key OpenAI (Chat Completions API).
-- Kilo Gateway (`@kilocode/kilo-gateway`) — still stubbed in [`kilo-provider/src/lib.rs`](../packages/kilo-vscode-sidecar-rs/crates/kilo-provider/src/lib.rs).
+- Kilo Gateway (`@kilocode/kilo-gateway`), including profile, cloud-session, remote, and FIM surfaces. These are not migration targets for the Rust sidecar.
 - Anthropic, Gemini, OpenRouter.
 - Provider-specific tool-schema transforms beyond what Responses API requires.
 - LiteLLM/Copilot `_noop` injection (M7 must stub the seam, but LiteLLM/Copilot still go to Bun).
-- FIM autocomplete (`POST /kilo/fim`).
 - Workflow / DWS provider paths.
 
-A future plan revision will define M10b (next provider, likely Anthropic API key) once M10 ships and bakes.
+Provider expansion is not part of this migration plan.
 
 ### Testing strategy
 
@@ -510,9 +634,23 @@ A real small MCP fixture server can be configured, connected, invoked, disconnec
 - Decide and document macOS sidecar signing/notarization requirements.
 - Publish checksums for all target triples.
 
+### Cross-platform path handling
+
+- All path comparisons inside the sidecar normalize separators before comparing — Windows comparisons must not depend on `\\` vs `/`. The `worktree_list_reads_git_porcelain_paths` test failure observed during M6.1 was a symptom of missing normalization, not git output drift; the helper must live in `kilo-store/src/paths.rs` (or a peer crate) and every comparator uses it.
+- UNC paths, drive letters, paths with non-ASCII characters, and paths over 260 characters round-trip through workspace and session storage without truncation. CI runs the path test suite on Windows.
+- Console-flashing prevention on Windows extends to all child processes the sidecar spawns (bash tool, MCP stdio servers, git invocations), not just the sidecar binary itself. Use `CREATE_NO_WINDOW` on every `std::process::Command` Windows spawn, not only on top-level startup.
+
 ### Exit gate
 
-Preview VSIX packages install and launch the Rust sidecar on all supported OS/architecture targets.
+Preview VSIX packages install and launch the Rust sidecar on all supported OS/architecture targets. The Windows path test suite is green. No spawned child process flashes a console window.
+
+### Artifact metadata contract
+
+[`packages/kilo-vscode/bin/sidecars.json`](../packages/kilo-vscode/bin/sidecars.json) is the release artifact manifest included in every VSIX alongside the staged sidecar binaries. Schema version `1` contains an `artifacts` array sorted by `kind:file`. Each artifact records `kind` (`bun-cli` or `rust-sidecar`), packaged binary `file`, target platform (`win32-x64`, `darwin-arm64`, etc., or the host target for local staging), SHA-256 checksum, byte `size`, and source `version` git hash when available. The manifest is deterministic for a fixed pair of sidecar binaries and source revisions; it intentionally omits timestamps.
+
+Local extension builds emit the manifest from [`local-bin.ts`](../packages/kilo-vscode/script/local-bin.ts:1) after staging or reusing the host Bun/Rust sidecars. Cross-target VSIX builds emit an equivalent target-specific manifest from [`build.ts`](../packages/kilo-vscode/script/build.ts:1) immediately before `vsce package`, so [`packages/kilo-vscode/.vscodeignore`](../packages/kilo-vscode/.vscodeignore) includes it through `!bin/**`.
+
+Signing remains a release-policy follow-up for M12: Windows has the existing helper [`script/sign-windows.ps1`](../script/sign-windows.ps1:1), but this slice does not wire it into packaging. macOS signing/notarization requirements are still undecided and must be settled before the all-target preview release gate.
 
 ## Milestone 13: Benchmark gates
 
@@ -530,6 +668,18 @@ Compare Bun oracle and Rust candidate with identical workspaces, settings, and p
 | Process leaks | Zero leaked children | Zero leaked children |
 | Package size | No worse than Bun plus 10-25% without approval | Smaller than Bun target preferred |
 
+### M13 benchmark gate contract
+
+The CI-safe gate lives in [`m13_benchmark_gate.rs`](../packages/kilo-vscode-sidecar-rs/crates/kilo-oracle/tests/m13_benchmark_gate.rs) and can be run from [`packages/kilo-vscode-sidecar-rs`](../packages/kilo-vscode-sidecar-rs) with:
+
+```bash
+cargo test -p kilo-oracle --test m13_benchmark_gate m13_rust_sidecar_benchmark_gate -- --nocapture
+```
+
+It is intentionally deterministic scaffolding rather than a noisy performance lab. The gate launches the Rust sidecar through the existing in-process oracle harness, measures cold start to readiness, drives the fake-provider first visible token path without live credentials, measures shutdown, emits structured JSON, and fails only concrete duration/package-size measurements that exceed configured thresholds. Defaults are conservative for local/CI stability: cold start under 5000 ms, first visible token under 5000 ms, shutdown under 1000 ms, and hard shutdown cap under 5000 ms. Override them with `KILO_M13_COLD_START_MS`, `KILO_M13_FIRST_TOKEN_MS`, `KILO_M13_SHUTDOWN_MS`, and `KILO_M13_SHUTDOWN_HARD_MS`.
+
+Package-size gating is opt-in until the release artifact matrix is finalized: set `KILO_M13_PACKAGE_PATH` and `KILO_M13_PACKAGE_SIZE_BYTES` to make the gate compare bytes. RSS, CPU, and leaked-child measurements are reported as `unsupported`/`not_measured` fields in the JSON because portable deterministic sampling is not yet implemented in the oracle harness; those remain M13 gaps for a future platform-specific runner.
+
 ## Milestone 14: Rollout and rollback
 
 ### Rollout phases
@@ -545,11 +695,31 @@ Compare Bun oracle and Rust candidate with identical workspaces, settings, and p
 ### Rollback rules
 
 - Bun fallback is packaged during preview and early stable.
-- Runtime setting can force Bun.
-- Remote kill switch can force Bun.
+- Runtime setting can force Bun with `kilo-code.new.sidecarRuntime = bun`; `KILO_VSCODE_SIDECAR_RUNTIME` overrides the setting for CI/dev emergency use.
+- Local rollout phase is declared by `kilo-code.new.sidecarRollout` (`disabled`, `internal`, `preview`, `stable`) and can be overridden by `KILO_VSCODE_SIDECAR_ROLLOUT`.
+- Emergency rollback kill switch is local/static for this slice: `KILO_VSCODE_SIDECAR_KILL_SWITCH=1` forces Bun by suppressing Rust candidates in both `auto` and forced `rust` plans. No live remote-config dependency is introduced for M14; a future release can wire this same policy to a remote source if one exists.
 - Automatic fallback only before mutable Rust requests.
 - Store remains Bun-compatible until Bun fallback is removed.
-- Every Rust sidecar build declares contract version, sidecar version, target triple, and compatible Bun oracle version.
+- Every sidecar artifact declares `contractVersion`, source `version`, target triple, and `compatibleOracleVersion` in `bin/sidecars.json`. `contractVersion = 1` means the current VS Code HTTP/SSE/process/storage contract. `compatibleOracleVersion = bun-cli-v1` means the artifact is expected to compare against the current packaged Bun CLI oracle contract.
+
+### Stable rollout fallback policy
+
+Through preview and early stable rollout windows, Bun remains packaged and is the only automatic fallback target. `auto` starts Rust first unless rollout is `disabled` or the kill switch is active; if Rust fails before any accepted mutation, startup tries Bun. After Rust accepts a mutating request, automatic fallback is suppressed to avoid storage/state rollback corruption. Forced `rust` normally has no automatic startup fallback, but rollout-disabled or kill-switch policy blocks Rust before spawn and selects Bun with an explicit diagnostic in the sidecar plan.
+
+### Storage round-trip gate before Bun removal
+
+Before M14 step 7 (Bun fallback removal), an automated test runs the full Bun ↔ Rust storage round-trip against representative session shapes: single message, multi-tool turn with parts, aborted turn with reasoning + abort terminal, archived session, forked session, session with summary diffs, session with revert state. Failures of any case block Bun removal. See **Storage and process self-healing invariants → 4**. The asymmetric M0/M5/M6 path "Rust reads Bun-written rows" is necessary but not sufficient — the inverse "Bun reads Rust-written rows" must also pass on every Rust schema change.
+
+### Wire-protocol versioning beyond v1
+
+- `contractVersion = 1` covers the M0-frozen surface. Any breaking change to route paths, request/response shapes, error envelope, or SSE event names increments the version. Additive changes (new optional field, new event name with documented client tolerance) do not.
+- The artifact manifest's `compatibleOracleVersion` advances in lockstep with `contractVersion`.
+- Sidecars announce their `contractVersion` in the readiness stdout line (extended format, backward-compatible) and on `GET /health`. The extension refuses to use a sidecar whose `contractVersion` is newer than the extension's compiled-in maximum.
+- A deprecation cycle of one full release window precedes any contract version bump in stable; preview can bump freely.
+
+### Remote kill-switch follow-up (M14b)
+
+Once a remote-config surface exists in the extension (none today), wire the local kill-switch to consume it without changing M14's policy: the kill switch still forces Bun by suppressing Rust candidates. Until then, `KILO_VSCODE_SIDECAR_KILL_SWITCH=1` is the only mechanism. M14b is a separate plan revision when remote config lands.
 
 ## Issue-ready work breakdown
 
@@ -584,6 +754,21 @@ Compare Bun oracle and Rust candidate with identical workspaces, settings, and p
 29. Run preview default rollout.
 30. Ship stable Rust default with Bun fallback.
 31. Remove Bun fallback after rollback window.
+32. Implement first-run schema bootstrap (`init_schema` unconditional + `create table if not exists`) and the matching fresh-install/half-init oracle fixtures.
+33. Implement schema-version migration runner in `kilo-store/src/migrations.rs` with `PRAGMA user_version` and CI gate against unversioned schema changes.
+34. Implement internal-error normalization wrapping `rusqlite::Error`, `std::io::Error`, and panics at the SDK boundary; document the allowed `name` set in `CONTRACT.md`.
+35. Implement Bun ↔ Rust storage round-trip oracle fixture (`kilo-oracle/tests/storage_roundtrip.rs`).
+36. Implement OS-keychain `KeyringStore` shim (DPAPI / Keychain / libsecret) with documented plaintext fallback gated by env flag.
+37. Implement structured `tracing` subscriber with file rotation, `KILO_LOG`/`RUST_LOG` control, and `<state_dir>/kilo/log/sidecar.log` default destination.
+38. Implement opt-in `Telemetry` trait seam (no-op default; one structured emit-point per failure class).
+39. Implement single-sidecar-per-user lock at `<state_dir>/kilo/sidecar.lock` with health-probe + take-over policy.
+40. Pick lazy-on-chat activation event in `package.json`; add `KILO_VSCODE_SIDECAR_PRESPAWN=1` for benchmarking.
+41. Add request-body, SSE-client-count, session-quota, message-part, and tool-output limits in `kilo-server/src/limits.rs` with stable error names at the route layer.
+42. Add `rust-toolchain.toml`, `deny.toml` license/advisory policy, and the dependency-bump PR convention.
+43. Add cross-shell `bash` resolution on Windows (WSL → Git Bash → cmd-wrapped) with `shell_unavailable` named error.
+44. Add path-normalization helper in `kilo-store/src/paths.rs` and Windows path-handling test suite (UNC, drive letters, non-ASCII, long paths).
+45. Add `route_inventory` PR check that fails if `docs/route-inventory.md` is unchanged when route handlers move.
+46. Add `contractVersion` advancement policy, readiness-line extension, and `GET /health` reporting; teach the extension to refuse a too-new sidecar.
 
 ## Highest-risk areas
 
@@ -593,16 +778,23 @@ Compare Bun oracle and Rust candidate with identical workspaces, settings, and p
 - **OpenAI Pro / Responses API stability (M10):** the `chatgpt.com/backend-api/codex/responses` endpoint is OpenAI-internal and not formally documented as a stable surface. Schema drifts (event-stream part shapes, finish-reason taxonomy, refresh-token semantics) will surface as silent transcript corruption. Mitigations: recorded-stream regression tests, an opt-in live smoke test that runs at least weekly, and an explicit contract version field in the auth blob so we can detect drift on token refresh.
 - **OAuth refresh-on-mid-stream-expiry:** Bun refreshes only when the next request fires; the Rust port must do the same and must not drop the in-flight stream. A naive "refresh-then-retry" implementation that resends the prompt re-runs the agent step with the same input, doubling tool execution. Refresh must wrap only new requests, not active streams.
 - **`isOpenaiOauth` branching drift:** the system-prompt-as-instructions vs system-message-as-first-input split in [`llm.ts:106-159`](../packages/opencode/src/session/llm.ts:106) is invisible to contract tests but changes how the model interprets the conversation. Rust must reproduce the branch exactly, including the soul prepend at [`llm.ts:157`](../packages/opencode/src/session/llm.ts:157).
-- Provider parity (deferred providers): for any provider that stays on Bun (Anthropic, Gemini, OpenRouter, Kilo Gateway, API-key OpenAI), the runtime resolver must route requests for those providers to Bun even when Rust is the default sidecar. A misrouted request → 404 from Rust → mutation gate flip on a now-broken runtime selection. The gate is response-status-aware (M3 fix), so 404 is safe for fallback — but the routing layer must not even attempt a Rust call for deferred providers.
+- Provider parity (intentionally non-migrated providers): for any provider or product surface that stays on Bun/outside Rust (Anthropic, Gemini, OpenRouter, Kilo Gateway, profile/cloud/remote/FIM, API-key OpenAI), the runtime resolver must not route real provider work to Rust. Rust may expose fallback response shapes for extension background calls, but those handlers are not parity implementations.
 - Storage compatibility: any Rust-only migration can block Bun rollback.
 - SSE shape drift: small event differences can break UI state inside [`KiloConnectionService`](../packages/kilo-vscode/src/services/cli-backend/connection-service.ts:61).
 - Agent Manager concurrency: worktree sessions require strict directory and session isolation.
 - MCP OAuth and transports: likely cross-platform edge cases.
 - Packaging/signing: can block release even after functionality works.
 - Marketplace/KiloClaw removal: can leave hidden command, serializer, localization, or bundle references.
+- **Persistent-state self-healing (M5/M6+):** the sidecar opens five files on startup and writes to a sixth on first turn. Any one of them in a half-initialized state (empty file, partial JSON, missing schema) blocks the user. The HEAD schema-init bug fixed in M6.1 is the canonical example. Mitigations live in **Storage and process self-healing invariants**; the cost of skipping any of them is one failed user session per occurrence with no log to diagnose from.
+- **Bun ↔ Rust storage asymmetry (M14):** the rollback window's only safety net is that Bun can read Rust-written data. A column-order, JSON-default, or unknown-field-loss regression is silent until the day Bun is removed and irreversible after that day. The round-trip oracle (Storage invariant 4) is the only line of defense.
+- **Auth secret exposure:** plaintext OAuth tokens at `data/kilo/auth.json` are an exfiltration target on shared machines, CI runners, and backup scrapers. Migration to the OS keychain is preview-blocking, not stable-blocking, but cannot slip past M14 without a documented exception.
+- **Multi-window contention:** without the per-user sidecar lock, two VS Code windows on the same workspace race on `kilo.db`. SQLite WAL handles concurrent writes safely at the file level, but the in-process writer mutex doesn't coordinate across processes — split-brain session state is the failure mode.
+- **Production observability gap:** without structured logging, every user-visible failure becomes a re-run-and-hope debugging session. The schema-init bug surfaced as one toast and zero log entries; an opt-in `tracing` subscriber + per-failure-class telemetry seam is the minimum supportable baseline.
+- **Cross-shell tool execution on Windows (M8):** `bash` is not installed by default on Windows. A naive port that assumes bash, or that silently substitutes PowerShell, will produce subtly wrong tool output (different quoting, different env expansion) that contract tests cannot catch.
+- **Wire-protocol versioning beyond v1:** `contractVersion = 1` is declared in M14 but no policy governs how it advances. Without a documented advancement and deprecation policy, the day a breaking change ships is the day every older extension version breaks silently.
 
 ## Final summary
 
-Build a Kilo-specific Rust sidecar behind the existing [`ServerManager`](../packages/kilo-vscode/src/services/cli-backend/server-manager.ts:18) process seam and [`KiloConnectionService`](../packages/kilo-vscode/src/services/cli-backend/connection-service.ts:61) HTTP/SSE seam. Freeze the current Bun sidecar as the oracle, add a Rust skeleton, add a runtime switch, prune Marketplace and KiloClaw, then migrate vertical slices: read-only UI load, session/store/event parity, first chat turn, tools/permissions, Agent Manager worktrees, **OpenAI Pro / ChatGPT Plus via OAuth + Responses API as the only Rust-side provider for the lean target**, MCP, packaging, benchmarks, and rollout. All other providers (API-key OpenAI, Anthropic, Gemini, OpenRouter, Kilo Gateway) stay on Bun via the runtime resolver until a follow-up plan revision adds them. Keep Bun fallback until Rust has passed contract, storage, sidebar, Agent Manager, OpenAI-Pro provider, tool/MCP, benchmark, and packaging gates.
+Build a Kilo-specific Rust sidecar behind the existing [`ServerManager`](../packages/kilo-vscode/src/services/cli-backend/server-manager.ts:18) process seam and [`KiloConnectionService`](../packages/kilo-vscode/src/services/cli-backend/connection-service.ts:61) HTTP/SSE seam. Freeze the current Bun sidecar as the oracle, add a Rust skeleton, add a runtime switch, prune Marketplace and KiloClaw, then migrate vertical slices: read-only UI load, session/store/event parity, first chat turn, tools/permissions, Agent Manager worktrees, **OpenAI Pro / ChatGPT Plus via OAuth + Responses API as the only Rust-side provider for the lean target**, MCP, packaging, benchmarks, and rollout. All other providers and Kilo Gateway/profile/cloud/remote/FIM surfaces are explicitly outside the Rust migration target. Keep Bun fallback until Rust has passed contract, storage, sidebar, Agent Manager, OpenAI-Pro provider, tool/MCP, benchmark, and packaging gates.
 
-The migration succeeds only if the Rust sidecar reproduces Bun's agentic-loop harness, parallel tool-call execution, per-session cancellation semantics, and the `isOpenaiOauth` system-prompt branching — see **Behavioral fidelity invariants**. The HTTP/SSE contract is the visible surface; the loop behavior underneath it is where Kilo Code's product value lives. Translate behavior, not code structure.
+The migration succeeds only if the Rust sidecar reproduces three categories of invariants. The **Behavioral fidelity invariants** cover Bun's agentic-loop harness, parallel tool-call execution, per-session cancellation semantics, and the `isOpenaiOauth` system-prompt branching — without these, the product loses its UX and throughput. The **Storage and process self-healing invariants** require that no library error text ever reaches a user toast, that persistent files survive partial init, that schema evolves through versioned migrations, and that the Bun↔Rust round-trip stays verified until Bun fallback is removed — without these, every fresh install or partial crash blocks a user. The **Operational invariants** require structured logging, single-sidecar-per-user coordination, lazy activation, and resource limits at the boundary — without these, the sidecar is unsupportable in production. The HTTP/SSE contract is the visible surface; the agent loop, the storage layer, and the operational surface underneath it are where Kilo Code's product value and supportability live. Translate behavior, not code structure — and self-heal everything that can be observed in a half-broken state.

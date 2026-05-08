@@ -14,7 +14,6 @@ type StateListener = (state: ConnectionState) => void
 type SSEEventFilter = (event: Event, directory?: string) => boolean
 type NotificationDismissListener = (notificationId: string) => void
 type LanguageChangeListener = (locale: string) => void
-type ProfileChangeListener = (data: unknown) => void
 type MigrationCompleteListener = () => void
 type FavoritesChangeListener = (favorites: Array<{ providerID: string; modelID: string }>) => void
 type ClearPendingPromptsListener = () => void
@@ -70,13 +69,11 @@ export class KiloConnectionService {
   private state: ConnectionState = "disconnected"
   private connectPromise: Promise<void> | null = null
   private healthPollTimer: ReturnType<typeof setInterval> | null = null
-  private remoteService: import("../RemoteStatusService").RemoteStatusService | null = null
 
   private readonly eventListeners: Set<SSEEventListener> = new Set()
   private readonly stateListeners: Set<StateListener> = new Set()
   private readonly notificationDismissListeners: Set<NotificationDismissListener> = new Set()
   private readonly languageChangeListeners: Set<LanguageChangeListener> = new Set()
-  private readonly profileChangeListeners: Set<ProfileChangeListener> = new Set()
   private readonly migrationCompleteListeners: Set<MigrationCompleteListener> = new Set()
   private readonly favoritesChangeListeners: Set<FavoritesChangeListener> = new Set()
   private readonly clearPendingPromptsListeners: Set<ClearPendingPromptsListener> = new Set()
@@ -93,7 +90,6 @@ export class KiloConnectionService {
   /** Provider key → all open (background) session IDs. */
   private readonly opened: Map<string, string[]> = new Map()
   private debounceTimer: ReturnType<typeof setTimeout> | null = null
-  private unsubRemote: (() => void) | null = null
 
   constructor(context: vscode.ExtensionContext) {
     this.serverManager = new ServerManager(context)
@@ -158,31 +154,10 @@ export class KiloConnectionService {
 
   /**
    * Get server config (baseUrl + password). Returns null if not connected.
-   * Used by TelemetryProxy to POST events to the CLI server.
+   * Used by TelemetryProxy to POST events to the sidecar server.
    */
   getServerConfig(): ServerConfig | null {
     return this.config
-  }
-
-  /**
-   * Set the remote status service. When remote is disabled, flushViewed()
-   * is a no-op. When remote becomes enabled (startup refresh, user toggle,
-   * or SSE event), the accumulated focused/opened state is automatically
-   * flushed so the server is never left unaware of already-open sessions.
-   */
-  setRemoteService(service: import("../RemoteStatusService").RemoteStatusService | null): void {
-    this.unsubRemote?.()
-    this.unsubRemote = null
-    this.remoteService = service
-    if (service) {
-      this.unsubRemote = service.onChange((state) => {
-        if (state.enabled) this.flushViewed()
-      })
-    }
-  }
-
-  private isRemoteEnabled(): boolean {
-    return this.remoteService?.getState().enabled ?? false
   }
 
   /**
@@ -283,25 +258,6 @@ export class KiloConnectionService {
   notifyLanguageChanged(locale: string): void {
     for (const listener of this.languageChangeListeners) {
       listener(locale)
-    }
-  }
-
-  /**
-   * Subscribe to profile change events broadcast from any KiloProvider. Returns unsubscribe function.
-   */
-  onProfileChanged(listener: ProfileChangeListener): () => void {
-    this.profileChangeListeners.add(listener)
-    return () => {
-      this.profileChangeListeners.delete(listener)
-    }
-  }
-
-  /**
-   * Broadcast a profile change event to all subscribed KiloProvider instances.
-   */
-  notifyProfileChanged(data: unknown): void {
-    for (const listener of this.profileChangeListeners) {
-      listener(data)
     }
   }
 
@@ -458,24 +414,12 @@ export class KiloConnectionService {
     this.flushViewed()
   }
 
-  /** Debounced: send the aggregated focused + open session IDs to the server. */
-  flushViewed(): void {
-    if (!this.isRemoteEnabled()) return
-    if (this.debounceTimer) clearTimeout(this.debounceTimer)
-    this.debounceTimer = setTimeout(() => {
-      this.debounceTimer = null
-      const focus = new Set(this.focused.values())
-      const open = new Set<string>()
-      for (const ids of this.opened.values()) {
-        for (const id of ids) {
-          if (!focus.has(id)) open.add(id)
-        }
-      }
-      this.client?.session
-        .viewed({ focused: [...focus], open: [...open] })
-        .catch((err) => console.warn("[Kilo New] ConnectionService: viewed flush failed:", err))
-    }, 150)
-  }
+  /**
+   * Tracks focused/open sessions. The actual server flush was tied to the
+   * Kilo Remote feature; with that feature removed this is now a local
+   * bookkeeping no-op kept so existing call sites remain wired.
+   */
+  flushViewed(): void {}
 
   /**
    * Clean up everything: kill server, close SSE, clear listeners.
@@ -487,7 +431,6 @@ export class KiloConnectionService {
     this.eventListeners.clear()
     this.stateListeners.clear()
     this.notificationDismissListeners.clear()
-    this.profileChangeListeners.clear()
     this.migrationCompleteListeners.clear()
     this.favoritesChangeListeners.clear()
     this.clearPendingPromptsListeners.clear()
@@ -499,8 +442,6 @@ export class KiloConnectionService {
       clearTimeout(this.debounceTimer)
       this.debounceTimer = null
     }
-    this.unsubRemote?.()
-    this.unsubRemote = null
     this.client = null
     this.sseClient = null
     this.config = null
@@ -579,19 +520,18 @@ export class KiloConnectionService {
 
     // Create SDK client with Basic Auth header.
     //
-    // Wrap the SDK's fetch so that the M3 mutation gate flips only AFTER
-    // the sidecar accepts a mutation with a 2xx response. The earlier
-    // request-time flip locked fallback whenever Rust returned 4xx/5xx for
-    // a missing/erroring route, even though Rust never touched state. See
-    // `createMutationTrackingFetch` for the full contract.
+    // Wrap the SDK's fetch so accepted Rust-side mutations are recorded only
+    // after the sidecar responds with a 2xx status.
     const authHeader = `Basic ${Buffer.from(`kilo:${server.password}`).toString("base64")}`
     // Mirror the SDK's default fetch wrapper from
     // `packages/sdk/js/src/v2/client.ts:47-56` (duplex/timeout overrides) so
-    // we don't change Bun semantics by injecting our own fetch.
+    // we preserve SDK transport behavior while injecting mutation tracking.
     const baseFetch: typeof fetch = (input, init) =>
       fetch(input as any, { duplex: "half", timeout: false, ...(init ?? {}) } as any)
     const sm = this.serverManager
-    const trackedFetch = createMutationTrackingFetch(baseFetch, () => sm.markMutationAttempted())
+    const trackedFetch = createMutationTrackingFetch(baseFetch, () => {
+      if (server.runtime === "rust") sm.markMutationAttempted()
+    })
     this.client = createKiloClient({
       baseUrl: config.baseUrl,
       headers: {

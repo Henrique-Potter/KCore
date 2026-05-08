@@ -454,15 +454,6 @@ export const dict = {
 
   "error.startup.title": "Échec de la connexion au serveur",
 
-  "error.paidModel.title": "Vous devez vous connecter pour utiliser ce modèle",
-  "error.paidModel.description":
-    "Connectez-vous ou créez un compte pour accéder à plus de 500 modèles, utiliser des crédits au prix coûtant ou apporter votre propre clé.",
-  "error.paidModel.action": "Se connecter",
-  "error.promotionLimit.title": "Vous devez vous inscrire pour continuer",
-  "error.promotionLimit.description":
-    "Inscrivez-vous gratuitement pour continuer et explorer plus de 500 modèles. 2 minutes, sans carte bancaire. Ou revenez plus tard.",
-  "error.promotionLimit.action": "S'inscrire",
-
   "error.chain.unknown": "Erreur inconnue",
   "error.chain.causedBy": "Causé par :",
   "error.chain.apiError": "Erreur API",
@@ -814,7 +805,6 @@ export const dict = {
   "settings.providers.section.popular": "Fournisseurs populaires",
   "settings.providers.search.placeholder": "Rechercher des fournisseurs",
   "settings.providers.select.placeholder": "Sélectionner un fournisseur...",
-  "settings.providers.tag.gateway": "Gateway",
   "settings.providers.tag.environment": "Environnement",
   "settings.providers.tag.config": "Configuration",
   "settings.providers.tag.chatgpt": "ChatGPT",
@@ -995,22 +985,12 @@ export const dict = {
   "session.showHistory": "Afficher l'historique",
   "session.search.placeholder": "Rechercher des sessions...",
   "session.empty": "Aucune session pour l'instant. Cliquez + pour démarrer une nouvelle conversation.",
-  "session.tab.local": "Local",
-  "session.tab.cloud": "Cloud",
-  "session.cloud.repoOnly": "Uniquement ce dépôt",
-  "session.cloud.import": "Importer depuis le cloud",
   "feedback.button": "Commentaires & support",
   "feedback.dialog.message":
     "Nous aimerions recueillir vos commentaires ou vous aider avec les problèmes que vous rencontrez.",
   "feedback.dialog.github": "Signaler un problème sur GitHub",
   "feedback.dialog.discord": "Rejoindre notre communauté Discord",
   "feedback.dialog.support": "Service client",
-  "session.cloud.import.title": "Importer depuis le cloud",
-  "session.cloud.import.placeholder": "ID de session, URL ou commande kilo import",
-  "session.cloud.import.button": "Importer",
-  "session.cloud.import.invalid": "Format d'ID de session invalide",
-  "session.cloud.import.legacy": "Cette session semble être une ancienne session qui n'est plus prise en charge.",
-  "session.cloud.import.failed": "Échec de l'importation de la session cloud",
 
   "workspace.new": "Nouvel espace de travail",
   "workspace.type.local": "local",
@@ -1038,36 +1018,8 @@ export const dict = {
   "workspace.reset.archived.many": "{{count}} sessions seront archivées.",
   "workspace.reset.note": "Cela réinitialisera l'espace de travail pour correspondre à la branche par défaut.",
 
-  "deviceAuth.toast.urlCopied": "URL copiée dans le presse-papier",
-  "deviceAuth.toast.codeCopied": "Code copié dans le presse-papier",
-  "deviceAuth.toast.errorCopied": "Erreur copiée dans le presse-papiers",
-  "deviceAuth.status.initiating": "Démarrage de la connexion...",
-  "deviceAuth.title": "Se connecter à Kilo Code",
-  "deviceAuth.step1": "Étape 1 : Ouvrez cette URL",
-  "deviceAuth.action.copyUrl": "Copier l'URL",
-  "deviceAuth.action.openBrowser": "Ouvrir le navigateur",
-  "deviceAuth.qrCode.alt": "Code QR",
-  "deviceAuth.step2": "Étape 2 : Entrez ce code",
-  "deviceAuth.action.clickToCopy": "Cliquez pour copier",
-  "deviceAuth.status.waiting": "En attente d'autorisation...",
-  "deviceAuth.status.success": "Connexion réussie !",
-  "deviceAuth.status.failed": "Échec de la connexion",
-  "deviceAuth.error.detailsTitle": "Détails de l'erreur de connexion",
-  "deviceAuth.status.cancelled": "Connexion annulée",
-  "deviceAuth.action.tryAgain": "Réessayer",
-  "deviceAuth.action.copyError": "Copier l'erreur",
-  "deviceAuth.action.showDetails": "Voir les détails",
-
   "common.retry": "Réessayer",
   "common.refresh": "Actualiser",
-
-  "profile.title": "Profil",
-  "profile.notLoggedIn": "Non connecté",
-  "profile.action.login": "Se connecter avec Kilo Code",
-  "profile.balance.title": "Solde",
-  "profile.balance.refresh": "Actualiser le solde",
-  "profile.action.dashboard": "Tableau de bord",
-  "profile.action.logout": "Déconnexion",
 
   "settings.section.configuration": "Configuration",
   "settings.agentBehaviour.title": "Comportement de l'agent",
@@ -1356,7 +1308,6 @@ export const dict = {
   "settings.agentBehaviour.mcpDetail.args": "Arguments",
   "settings.agentBehaviour.mcpDetail.env": "Environnement",
   "settings.agentBehaviour.mcpDetail.disabled": "Ce serveur est désactivé.",
-  "settings.agentBehaviour.mcpBrowseMarketplace": "Parcourir le Marketplace",
   "settings.agentBehaviour.mcpEmpty":
     "Aucun serveur MCP configuré. Ajoutez des serveurs MCP dans kilo.jsonc ou demandez à l'agent de les ajouter.",
   "settings.agentBehaviour.workflowsPlaceholder":
@@ -1443,8 +1394,6 @@ export const dict = {
   "settings.providers.enabled.description": "Si défini, seuls ces fournisseurs seront disponibles",
   "settings.providers.notSet": "Non défini (utiliser la valeur par défaut du serveur)",
   "dialog.model.notSet": "Non défini",
-  "profile.personalAccount": "Compte personnel",
-  "profile.switchingAccount": "Changement de compte…",
   // Agent Manager strings live in webview-ui/agent-manager/i18n/fr.ts
 
   "question.summary": "{{n}} sur {{total}} questions",
@@ -1556,8 +1505,4 @@ export const dict = {
   "settings.saveBar.saving": "Enregistrement…",
   "settings.saveBar.saveFailed": "Impossible d'enregistrer les paramètres",
   "settings.saveBar.cancel": "Annuler",
-  "notifications.action.next": "Suivant",
-  "notifications.action.close": "Fermer",
-  "notifications.action.tryModel": "Essayer {{model}}",
-  "notifications.action.tryModelGeneric": "Essayer le modèle",
 }

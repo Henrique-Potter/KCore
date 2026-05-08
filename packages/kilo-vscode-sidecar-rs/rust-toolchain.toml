@@ -1,0 +1,8 @@
+# Pinned MSRV for the kilo-vscode-sidecar workspace. Bumps require an
+# explicit PR + changelog entry per the migration plan's "Toolchain and
+# dependency policy" section. CI is expected to refuse a workspace whose
+# toolchain disagrees with this file.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

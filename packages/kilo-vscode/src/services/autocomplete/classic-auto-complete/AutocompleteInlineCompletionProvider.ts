@@ -354,21 +354,9 @@ export class AutocompleteInlineCompletionProvider implements vscode.InlineComple
 
     // Circuit breaker / backoff: skip requests when the API is returning errors.
     // This prevents flooding the API with thousands of failed requests when
-    // credits are depleted (402), auth is invalid (401/403), or the server
-    // is rate-limiting (429) / having issues (5xx).
-    if (this.backoff.blocked()) {
-      // For 402 (credits depleted), periodically check the balance endpoint
-      // instead of sending a probe FIM request. If the user has added credits,
-      // reset the backoff so autocomplete resumes.
-      if (this.backoff.getFatalStatus() === 402 && this.backoff.shouldProbe()) {
-        const funded = await this.model.hasBalance()
-        if (funded) {
-          this.backoff.reset()
-          this.fatalNotified = false
-        }
-      }
-      if (this.backoff.blocked()) return []
-    }
+    // auth is invalid (401/403), the server is rate-limiting (429), or
+    // having issues (5xx).
+    if (this.backoff.blocked()) return []
 
     if (!document?.uri?.fsPath) {
       return []

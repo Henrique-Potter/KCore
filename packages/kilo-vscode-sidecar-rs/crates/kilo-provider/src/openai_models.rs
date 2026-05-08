@@ -7,10 +7,11 @@
 //!
 //! Two pieces of logic are load-bearing:
 //!
-//! 1. The `gpt-(\d+\.\d+)` regex gate that admits any future `gpt-5.2+`
-//!    base model without a code change. The Bun code at
+//! 1. The `gpt-(\d+\.\d+)` regex gate that admits future post-`gpt-5.4`
+//!    base models without a code change. The Bun code at
 //!    [`codex.ts:388`](../../../../../opencode/src/plugin/codex.ts:388)
-//!    bounds the upper version at `5.4`; we mirror that bound.
+//!    keeps models whose parsed version is greater than `5.4`; we mirror
+//!    that comparison exactly.
 //! 2. Cost zeroing — surfacing real OpenAI per-token cost on a
 //!    subscription-included model would mis-render the UI's spend tile.
 //!
@@ -19,6 +20,272 @@
 //! path bypasses this filter entirely; the OAuth path always uses it.
 
 use serde_json::{json, Value};
+
+#[derive(Clone, Copy)]
+pub struct ModelSpec {
+    id: &'static str,
+    name: &'static str,
+    family: &'static str,
+    attachment: bool,
+    reasoning: bool,
+    toolcall: bool,
+    temperature: bool,
+    pdf: bool,
+    input: f64,
+    output: f64,
+    cache: f64,
+    context: u64,
+    limit: u64,
+    out: u64,
+    release: &'static str,
+}
+
+/// Static OpenAI registry used by the Rust sidecar. It is intentionally a
+/// compact subset of the upstream OpenAI snapshot: the Codex/ChatGPT Pro
+/// models users can pick after OAuth, plus a few regular OpenAI API models
+/// that prove the API-key path stays unfiltered and priced.
+pub const REGISTRY: &[ModelSpec] = &[
+    ModelSpec {
+        id: "gpt-5.1-codex-max",
+        name: "GPT-5.1 Codex Max",
+        family: "gpt-codex",
+        attachment: true,
+        reasoning: true,
+        toolcall: true,
+        temperature: false,
+        pdf: false,
+        input: 1.25,
+        output: 10.0,
+        cache: 0.125,
+        context: 400000,
+        limit: 272000,
+        out: 128000,
+        release: "2025-11-13",
+    },
+    ModelSpec {
+        id: "gpt-5.1-codex",
+        name: "GPT-5.1 Codex",
+        family: "gpt-codex",
+        attachment: true,
+        reasoning: true,
+        toolcall: true,
+        temperature: false,
+        pdf: false,
+        input: 1.25,
+        output: 10.0,
+        cache: 0.13,
+        context: 400000,
+        limit: 272000,
+        out: 128000,
+        release: "2025-11-13",
+    },
+    ModelSpec {
+        id: "gpt-5.1-codex-mini",
+        name: "GPT-5.1 Codex mini",
+        family: "gpt-codex",
+        attachment: true,
+        reasoning: true,
+        toolcall: true,
+        temperature: false,
+        pdf: false,
+        input: 0.25,
+        output: 2.0,
+        cache: 0.025,
+        context: 400000,
+        limit: 272000,
+        out: 128000,
+        release: "2025-11-13",
+    },
+    ModelSpec {
+        id: "gpt-5.2",
+        name: "GPT-5.2",
+        family: "gpt",
+        attachment: true,
+        reasoning: true,
+        toolcall: true,
+        temperature: false,
+        pdf: false,
+        input: 1.75,
+        output: 14.0,
+        cache: 0.175,
+        context: 400000,
+        limit: 272000,
+        out: 128000,
+        release: "2025-12-11",
+    },
+    ModelSpec {
+        id: "gpt-5.2-codex",
+        name: "GPT-5.2 Codex",
+        family: "gpt-codex",
+        attachment: true,
+        reasoning: true,
+        toolcall: true,
+        temperature: false,
+        pdf: true,
+        input: 1.75,
+        output: 14.0,
+        cache: 0.175,
+        context: 400000,
+        limit: 272000,
+        out: 128000,
+        release: "2025-12-11",
+    },
+    ModelSpec {
+        id: "gpt-5.3-codex",
+        name: "GPT-5.3 Codex",
+        family: "gpt-codex",
+        attachment: true,
+        reasoning: true,
+        toolcall: true,
+        temperature: false,
+        pdf: true,
+        input: 1.75,
+        output: 14.0,
+        cache: 0.175,
+        context: 400000,
+        limit: 272000,
+        out: 128000,
+        release: "2026-02-05",
+    },
+    ModelSpec {
+        id: "gpt-5.4",
+        name: "GPT-5.4",
+        family: "gpt",
+        attachment: true,
+        reasoning: true,
+        toolcall: true,
+        temperature: false,
+        pdf: true,
+        input: 2.5,
+        output: 15.0,
+        cache: 0.25,
+        context: 1050000,
+        limit: 922000,
+        out: 128000,
+        release: "2026-03-05",
+    },
+    ModelSpec {
+        id: "gpt-5.4-mini",
+        name: "GPT-5.4 mini",
+        family: "gpt-mini",
+        attachment: true,
+        reasoning: true,
+        toolcall: true,
+        temperature: false,
+        pdf: false,
+        input: 0.75,
+        output: 4.5,
+        cache: 0.075,
+        context: 400000,
+        limit: 272000,
+        out: 128000,
+        release: "2026-03-17",
+    },
+    ModelSpec {
+        id: "gpt-5.5",
+        name: "GPT-5.5",
+        family: "gpt",
+        attachment: true,
+        reasoning: true,
+        toolcall: true,
+        temperature: false,
+        pdf: true,
+        input: 2.5,
+        output: 15.0,
+        cache: 0.25,
+        context: 1050000,
+        limit: 922000,
+        out: 128000,
+        release: "",
+    },
+    ModelSpec {
+        id: "gpt-5.1",
+        name: "GPT-5.1",
+        family: "gpt",
+        attachment: true,
+        reasoning: true,
+        toolcall: true,
+        temperature: false,
+        pdf: false,
+        input: 1.25,
+        output: 10.0,
+        cache: 0.13,
+        context: 400000,
+        limit: 272000,
+        out: 128000,
+        release: "2025-11-13",
+    },
+    ModelSpec {
+        id: "gpt-4.1",
+        name: "GPT-4.1",
+        family: "gpt",
+        attachment: true,
+        reasoning: false,
+        toolcall: true,
+        temperature: true,
+        pdf: true,
+        input: 2.0,
+        output: 8.0,
+        cache: 0.5,
+        context: 1047576,
+        limit: 1047576,
+        out: 32768,
+        release: "2025-04-14",
+    },
+    ModelSpec {
+        id: "o1-preview",
+        name: "o1-preview",
+        family: "o",
+        attachment: false,
+        reasoning: true,
+        toolcall: false,
+        temperature: true,
+        pdf: false,
+        input: 15.0,
+        output: 60.0,
+        cache: 7.5,
+        context: 128000,
+        limit: 128000,
+        out: 32768,
+        release: "2024-09-12",
+    },
+];
+
+pub fn registry(npm: &str) -> serde_json::Map<String, Value> {
+    REGISTRY
+        .iter()
+        .map(|spec| (spec.id.to_string(), spec.value(npm)))
+        .collect()
+}
+
+impl ModelSpec {
+    fn value(&self, npm: &str) -> Value {
+        json!({
+            "id": self.id,
+            "providerID": "openai",
+            "api": { "id": self.id, "url": "", "npm": npm },
+            "name": self.name,
+            "family": self.family,
+            "capabilities": {
+                "temperature": self.temperature,
+                "reasoning": self.reasoning,
+                "attachment": self.attachment,
+                "toolcall": self.toolcall,
+                "structured_output": true,
+                "input": { "text": true, "audio": false, "image": self.attachment, "video": false, "pdf": self.pdf },
+                "output": { "text": true, "audio": false, "image": false, "video": false, "pdf": false },
+                "interleaved": false
+            },
+            "cost": { "input": self.input, "output": self.output, "cache": { "read": self.cache, "write": 0 } },
+            "limit": { "context": self.context, "input": self.limit, "output": self.out },
+            "status": "active",
+            "options": {},
+            "headers": {},
+            "release_date": self.release,
+            "variants": {}
+        })
+    }
+}
 
 /// Models that are always admitted on the OAuth path, even if they don't
 /// match the version-prefix regex. Kept in sync with
@@ -41,7 +308,7 @@ pub const ALLOWED_MODELS: &[&str] = &[
 ///
 /// - the id contains `"codex"` (always allowed); OR
 /// - the id is in [`ALLOWED_MODELS`]; OR
-/// - the id matches `^gpt-(\d+\.\d+)` AND the captured version is `<= 5.4`.
+/// - the id matches `^gpt-(\d+\.\d+)` AND the captured version is `> 5.4`.
 ///
 /// Anything else is filtered out.
 pub fn is_codex_allowed(id: &str) -> bool {
@@ -51,7 +318,7 @@ pub fn is_codex_allowed(id: &str) -> bool {
     if ALLOWED_MODELS.contains(&id) {
         return true;
     }
-    parse_gpt_major(id).map(|v| v <= 5.4).unwrap_or(false)
+    parse_gpt_major(id).map(|v| v > 5.4).unwrap_or(false)
 }
 
 /// Parse the `gpt-X.Y` version prefix into a float. Matches the regex
@@ -175,24 +442,24 @@ mod tests {
     }
 
     #[test]
-    fn allows_gpt_le_5_4_base() {
-        assert!(is_codex_allowed("gpt-5.4-mini"));
-        assert!(is_codex_allowed("gpt-5.0"));
-        assert!(is_codex_allowed("gpt-3.5"));
+    fn allows_future_gpt_above_5_4_base() {
+        assert!(is_codex_allowed("gpt-5.5"));
+        assert!(is_codex_allowed("gpt-5.6-mini"));
+        assert!(is_codex_allowed("gpt-9.9"));
     }
 
     #[test]
-    fn rejects_gpt_above_5_4() {
+    fn rejects_gpt_at_or_below_5_4_unless_explicit_or_codex() {
         // Per `codex.ts:389`: `if (parseFloat(match[1]) > 5.4) continue` —
-        // i.e. continue past `delete`, meaning the model is *kept*. The
-        // Bun guard is "delete unless explicitly allowed"; ours is "allow
-        // if regex is <= 5.4". The semantic match is on the `<=` boundary.
+        // i.e. continue past `delete`, meaning the model is *kept* only when
+        // it is above the boundary. At-or-below models need either an
+        // explicit allow-list entry or the `codex` substring path.
         // The "codex" substring path always wins regardless of version, so
         // we test with a clean `gpt-<X.Y>-mini` shape that doesn't carry
         // the codex token.
-        assert!(!is_codex_allowed("gpt-9.9-mini"));
-        assert!(!is_codex_allowed("gpt-99.9"));
-        assert!(!is_codex_allowed("gpt-6.0-experimental"));
+        assert!(!is_codex_allowed("gpt-5.1"));
+        assert!(!is_codex_allowed("gpt-4.1"));
+        assert!(!is_codex_allowed("gpt-3.5"));
     }
 
     #[test]
@@ -207,18 +474,18 @@ mod tests {
         let mut models = serde_json::Map::new();
         models.insert("gpt-5.1-codex".to_string(), entry("gpt-5.1-codex", 5));
         models.insert("gpt-5.2".to_string(), entry("gpt-5.2", 7));
-        models.insert("gpt-3.5".to_string(), entry("gpt-3.5", 1));
+        models.insert("gpt-5.5".to_string(), entry("gpt-5.5", 1));
         models.insert("o1-preview".to_string(), entry("o1-preview", 12));
-        models.insert("gpt-9.9-rogue".to_string(), entry("gpt-9.9-rogue", 99));
+        models.insert("gpt-4.1".to_string(), entry("gpt-4.1", 99));
         models.insert("claude-3.5".to_string(), entry("claude-3.5", 3));
 
         filter_codex_models(&mut models);
 
         assert!(models.contains_key("gpt-5.1-codex"));
         assert!(models.contains_key("gpt-5.2"));
-        assert!(models.contains_key("gpt-3.5"));
+        assert!(models.contains_key("gpt-5.5"));
         assert!(!models.contains_key("o1-preview"));
-        assert!(!models.contains_key("gpt-9.9-rogue"));
+        assert!(!models.contains_key("gpt-4.1"));
         assert!(!models.contains_key("claude-3.5"));
 
         for (_, model) in models.iter() {

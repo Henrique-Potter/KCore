@@ -5,7 +5,7 @@
 
 import { createContext, useContext, createSignal, onMount, onCleanup, ParentComponent, Accessor } from "solid-js"
 import { useVSCode } from "./vscode"
-import type { ConnectionState, ServerInfo, ProfileData, DeviceAuthState, ExtensionMessage } from "../types/messages"
+import type { ConnectionState, ServerInfo, ExtensionMessage, ProfileData } from "../types/messages"
 
 interface ServerContextValue {
   connectionState: Accessor<ConnectionState>
@@ -14,18 +14,14 @@ interface ServerContextValue {
   errorMessage: Accessor<string | undefined>
   errorDetails: Accessor<string | undefined>
   isConnected: Accessor<boolean>
-  profileData: Accessor<ProfileData | null>
-  deviceAuth: Accessor<DeviceAuthState>
-  startLogin: () => void
   vscodeLanguage: Accessor<string | undefined>
   languageOverride: Accessor<string | undefined>
   workspaceDirectory: Accessor<string>
   gitInstalled: Accessor<boolean>
+  profileData: Accessor<ProfileData | null | undefined>
 }
 
 export const ServerContext = createContext<ServerContextValue>()
-
-const initialDeviceAuth: DeviceAuthState = { status: "idle" }
 
 export const ServerProvider: ParentComponent = (props) => {
   const vscode = useVSCode()
@@ -35,12 +31,11 @@ export const ServerProvider: ParentComponent = (props) => {
   const [extensionVersion, setExtensionVersion] = createSignal<string | undefined>()
   const [errorMessage, setErrorMessage] = createSignal<string | undefined>()
   const [errorDetails, setErrorDetails] = createSignal<string | undefined>()
-  const [profileData, setProfileData] = createSignal<ProfileData | null>(null)
-  const [deviceAuth, setDeviceAuth] = createSignal<DeviceAuthState>(initialDeviceAuth)
   const [vscodeLanguage, setVscodeLanguage] = createSignal<string | undefined>()
   const [languageOverride, setLanguageOverride] = createSignal<string | undefined>()
   const [workspaceDirectory, setWorkspaceDirectory] = createSignal<string>("")
   const [gitInstalled, setGitInstalled] = createSignal<boolean>(false)
+  const [profileData, setProfileData] = createSignal<ProfileData | null | undefined>()
 
   const gitSub = vscode.onMessage((m: ExtensionMessage) => {
     if (m.type === "gitStatus") setGitInstalled(m.repo)
@@ -94,35 +89,7 @@ export const ServerProvider: ParentComponent = (props) => {
           break
 
         case "profileData":
-          console.log("[Kilo New] Profile data:", message.data ? "received" : "null")
           setProfileData(message.data)
-          break
-
-        case "deviceAuthStarted":
-          console.log("[Kilo New] Device auth started")
-          setDeviceAuth({
-            status: "pending",
-            code: message.code,
-            verificationUrl: message.verificationUrl,
-            expiresIn: message.expiresIn,
-          })
-          break
-
-        case "deviceAuthComplete":
-          console.log("[Kilo New] Device auth complete")
-          setDeviceAuth({ status: "success" })
-          // Reset to idle after a short delay
-          setTimeout(() => setDeviceAuth(initialDeviceAuth), 1500)
-          break
-
-        case "deviceAuthFailed":
-          console.log("[Kilo New] Device auth failed:", message.error)
-          setDeviceAuth({ status: "error", error: message.error })
-          break
-
-        case "deviceAuthCancelled":
-          console.log("[Kilo New] Device auth cancelled")
-          setDeviceAuth(initialDeviceAuth)
           break
       }
     })
@@ -138,15 +105,6 @@ export const ServerProvider: ParentComponent = (props) => {
     vscode.postMessage({ type: "webviewReady" })
   })
 
-  const startLogin = () => {
-    const status = deviceAuth().status
-    if (status === "initiating" || status === "pending") {
-      return
-    }
-    setDeviceAuth({ status: "initiating" })
-    vscode.postMessage({ type: "login" })
-  }
-
   const value: ServerContextValue = {
     connectionState,
     serverInfo,
@@ -154,13 +112,11 @@ export const ServerProvider: ParentComponent = (props) => {
     errorMessage,
     errorDetails,
     isConnected: () => connectionState() === "connected",
-    profileData,
-    deviceAuth,
-    startLogin,
     vscodeLanguage,
     languageOverride,
     workspaceDirectory,
     gitInstalled,
+    profileData,
   }
 
   return <ServerContext.Provider value={value}>{props.children}</ServerContext.Provider>

@@ -40,7 +40,7 @@ mkdirSync(outDir, { recursive: true })
 console.log("\n📦 Rebuilding SDK...")
 await $`bun run --cwd ../sdk/js build`.cwd(root)
 
-console.log("\n🔧 Preparing CLI binary...")
+console.log("\n🔧 Preparing Rust sidecar...")
 await $`bun script/local-bin.ts`.cwd(root)
 
 console.log("\n✅ Type-checking...")

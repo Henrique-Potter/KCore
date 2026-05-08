@@ -447,15 +447,6 @@ export const dict = {
 
   "error.startup.title": "서버 연결 실패",
 
-  "error.paidModel.title": "이 모델을 사용하려면 로그인이 필요합니다",
-  "error.paidModel.description":
-    "로그인하거나 계정을 만들어 500개 이상의 모델에 접근하고, 원가로 크레딧을 사용하거나, 자체 키를 가져오세요.",
-  "error.paidModel.action": "로그인",
-  "error.promotionLimit.title": "계속하려면 가입이 필요합니다",
-  "error.promotionLimit.description":
-    "무료로 가입하여 500개 이상의 모델을 탐색하세요. 2분이면 완료, 신용카드 불필요. 또는 나중에 다시 오세요.",
-  "error.promotionLimit.action": "가입하기",
-
   "error.chain.unknown": "알 수 없는 오류",
   "error.chain.causedBy": "원인:",
   "error.chain.apiError": "API 오류",
@@ -769,7 +760,6 @@ export const dict = {
   "settings.providers.section.popular": "인기 공급자",
   "settings.providers.search.placeholder": "공급자 검색",
   "settings.providers.select.placeholder": "공급자 선택...",
-  "settings.providers.tag.gateway": "Gateway",
   "settings.providers.tag.environment": "환경",
   "settings.providers.tag.config": "구성",
   "settings.providers.tag.chatgpt": "ChatGPT",
@@ -944,21 +934,11 @@ export const dict = {
   "session.showHistory": "기록 보기",
   "session.search.placeholder": "세션 검색...",
   "session.empty": "아직 세션이 없습니다. +를 클릭하여 새 대화를 시작하세요.",
-  "session.tab.local": "로컬",
-  "session.tab.cloud": "클라우드",
-  "session.cloud.repoOnly": "이 저장소만",
-  "session.cloud.import": "클라우드에서 가져오기",
   "feedback.button": "피드백 & 지원",
   "feedback.dialog.message": "피드백을 들려주시거나 겪고 계신 문제에 대해 도움을 드리고 싶습니다.",
   "feedback.dialog.github": "GitHub에 이슈 보고하기",
   "feedback.dialog.discord": "Discord 커뮤니티 참여하기",
   "feedback.dialog.support": "고객 지원",
-  "session.cloud.import.title": "클라우드에서 가져오기",
-  "session.cloud.import.placeholder": "세션 ID, URL 또는 kilo import 명령어",
-  "session.cloud.import.button": "가져오기",
-  "session.cloud.import.invalid": "잘못된 세션 ID 형식입니다",
-  "session.cloud.import.legacy": "이전 버전의 세션으로 보이며 더 이상 지원되지 않습니다.",
-  "session.cloud.import.failed": "클라우드 세션 가져오기 실패",
 
   "workspace.new": "새 작업 공간",
   "workspace.type.local": "로컬",
@@ -986,36 +966,8 @@ export const dict = {
   "workspace.reset.archived.many": "{{count}}개의 세션이 보관됩니다.",
   "workspace.reset.note": "이 작업은 작업 공간을 기본 브랜치와 일치하도록 재설정합니다.",
 
-  "deviceAuth.toast.urlCopied": "URL이 클립보드에 복사되었습니다",
-  "deviceAuth.toast.codeCopied": "코드가 클립보드에 복사되었습니다",
-  "deviceAuth.toast.errorCopied": "오류가 클립보드에 복사되었습니다",
-  "deviceAuth.status.initiating": "로그인 시작 중...",
-  "deviceAuth.title": "Kilo Code에 로그인",
-  "deviceAuth.step1": "1단계: 이 URL을 여세요",
-  "deviceAuth.action.copyUrl": "URL 복사",
-  "deviceAuth.action.openBrowser": "브라우저 열기",
-  "deviceAuth.qrCode.alt": "QR 코드",
-  "deviceAuth.step2": "2단계: 이 코드를 입력하세요",
-  "deviceAuth.action.clickToCopy": "클릭하여 복사",
-  "deviceAuth.status.waiting": "인증 대기 중...",
-  "deviceAuth.status.success": "로그인 성공!",
-  "deviceAuth.status.failed": "로그인 실패",
-  "deviceAuth.error.detailsTitle": "로그인 오류 상세 정보",
-  "deviceAuth.status.cancelled": "로그인 취소됨",
-  "deviceAuth.action.tryAgain": "다시 시도",
-  "deviceAuth.action.copyError": "오류 복사",
-  "deviceAuth.action.showDetails": "자세히 보기",
-
   "common.retry": "재시도",
   "common.refresh": "새로고침",
-
-  "profile.title": "프로필",
-  "profile.notLoggedIn": "로그인하지 않음",
-  "profile.action.login": "Kilo Code로 로그인",
-  "profile.balance.title": "잔액",
-  "profile.balance.refresh": "잔액 새로고침",
-  "profile.action.dashboard": "대시보드",
-  "profile.action.logout": "로그아웃",
 
   "settings.section.configuration": "구성",
   "settings.agentBehaviour.title": "에이전트 동작",
@@ -1312,7 +1264,6 @@ export const dict = {
   "settings.agentBehaviour.mcpDetail.args": "인수",
   "settings.agentBehaviour.mcpDetail.env": "환경",
   "settings.agentBehaviour.mcpDetail.disabled": "이 서버는 비활성화되어 있습니다.",
-  "settings.agentBehaviour.mcpBrowseMarketplace": "마켓플레이스 둘러보기",
   "settings.agentBehaviour.mcpEmpty":
     "MCP 서버가 구성되지 않았습니다. kilo.jsonc에서 MCP 서버를 추가하거나 에이전트에게 추가를 요청하세요.",
   "settings.agentBehaviour.workflowsPlaceholder": "워크플로우는 워크스페이스의 워크플로우 파일을 통해 관리됩니다.",
@@ -1389,8 +1340,6 @@ export const dict = {
   "settings.providers.enabled.description": "설정된 경우 이 공급자만 사용 가능 (배타적 허용 목록)",
   "settings.providers.notSet": "설정되지 않음 (서버 기본값 사용)",
   "dialog.model.notSet": "설정되지 않음",
-  "profile.personalAccount": "개인 계정",
-  "profile.switchingAccount": "계정 전환 중…",
   // Agent Manager strings live in webview-ui/agent-manager/i18n/ko.ts
 
   "question.summary": "{{total}}개 질문 중 {{n}}번째",
@@ -1499,8 +1448,4 @@ export const dict = {
   "settings.saveBar.cancel": "취소",
   "settings.saveBar.saving": "저장 중…",
   "settings.saveBar.saveFailed": "설정을 저장할 수 없습니다",
-  "notifications.action.next": "다음",
-  "notifications.action.close": "닫기",
-  "notifications.action.tryModel": "{{model}} 시도",
-  "notifications.action.tryModelGeneric": "모델 시도",
 }

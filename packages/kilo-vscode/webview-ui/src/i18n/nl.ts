@@ -451,15 +451,6 @@ export const dict = {
 
   "error.startup.title": "Serververbinding mislukt",
 
-  "error.paidModel.title": "Je moet inloggen om dit model te gebruiken",
-  "error.paidModel.description":
-    "Log in of maak een account aan om toegang te krijgen tot meer dan 500 modellen, credits tegen kostprijs te gebruiken, of je eigen sleutel mee te nemen.",
-  "error.paidModel.action": "Inloggen",
-  "error.promotionLimit.title": "Je moet je registreren om door te gaan",
-  "error.promotionLimit.description":
-    "Registreer je gratis om door te gaan en 500 andere modellen te ontdekken. Duurt 2 minuten, geen creditcard vereist. Of kom later terug.",
-  "error.promotionLimit.action": "Registreren",
-
   "error.chain.unknown": "Onbekende fout",
   "error.chain.causedBy": "Veroorzaakt door:",
   "error.chain.apiError": "API-fout",
@@ -779,7 +770,6 @@ export const dict = {
   "settings.providers.section.connected": "Gekoppelde providers",
   "settings.providers.connected.empty": "Geen gekoppelde providers",
   "settings.providers.section.popular": "Populaire providers",
-  "settings.providers.tag.gateway": "Gateway",
   "settings.providers.tag.environment": "Omgeving",
   "settings.providers.tag.config": "Config",
   "settings.providers.tag.chatgpt": "ChatGPT",
@@ -954,21 +944,11 @@ export const dict = {
   "session.showHistory": "Geschiedenis weergeven",
   "session.search.placeholder": "Zoek sessies...",
   "session.empty": "Nog geen sessies. Klik op + om een nieuw gesprek te starten.",
-  "session.tab.local": "Lokaal",
-  "session.tab.cloud": "Cloud",
-  "session.cloud.repoOnly": "Alleen deze repository",
-  "session.cloud.import": "Importeer uit de cloud",
   "feedback.button": "Feedback & Ondersteuning",
   "feedback.dialog.message": "We horen graag uw feedback of helpen met eventuele problemen die u ervaart.",
   "feedback.dialog.github": "Meld een probleem op GitHub",
   "feedback.dialog.discord": "Word lid van onze Discord community",
   "feedback.dialog.support": "Klantenservice",
-  "session.cloud.import.title": "Importeer uit de cloud",
-  "session.cloud.import.placeholder": "Sessie-ID, URL, of kilo import commando",
-  "session.cloud.import.button": "Importeren",
-  "session.cloud.import.invalid": "Ongeldig formaat van sessie-ID",
-  "session.cloud.import.legacy": "Dit lijkt een oude sessie te zijn die niet langer wordt ondersteund.",
-  "session.cloud.import.failed": "Importeren van cloudsessie mislukt",
 
   "workspace.new": "Nieuwe workspace",
   "workspace.type.local": "lokaal",
@@ -996,36 +976,8 @@ export const dict = {
   "workspace.reset.archived.many": "{{count}} sessies worden gearchiveerd.",
   "workspace.reset.note": "Dit reset de workspace naar de standaard branch.",
 
-  "deviceAuth.toast.urlCopied": "URL gekopieerd naar klembord",
-  "deviceAuth.toast.codeCopied": "Code gekopieerd naar klembord",
-  "deviceAuth.toast.errorCopied": "Fout gekopieerd naar klembord",
-  "deviceAuth.status.initiating": "Inloggen starten...",
-  "deviceAuth.title": "Meld je aan bij Kilo Code",
-  "deviceAuth.step1": "Stap 1: Open deze URL",
-  "deviceAuth.action.copyUrl": "Kopieer URL",
-  "deviceAuth.action.openBrowser": "Open Browser",
-  "deviceAuth.qrCode.alt": "QR Code",
-  "deviceAuth.step2": "Stap 2: Voer deze code in",
-  "deviceAuth.action.clickToCopy": "Klik om te kopiëren",
-  "deviceAuth.status.waiting": "Wachten op autorisatie...",
-  "deviceAuth.status.success": "Inloggen succesvol!",
-  "deviceAuth.status.failed": "Inloggen mislukt",
-  "deviceAuth.status.cancelled": "Inloggen geannuleerd",
-  "deviceAuth.action.copyError": "Kopieer fout",
-  "deviceAuth.action.showDetails": "Bekijk details",
-  "deviceAuth.action.tryAgain": "Probeer opnieuw",
-  "deviceAuth.error.detailsTitle": "Inlogfout details",
-
   "common.retry": "Opnieuw proberen",
   "common.refresh": "Vernieuwen",
-
-  "profile.title": "Profiel",
-  "profile.notLoggedIn": "Niet ingelogd",
-  "profile.action.login": "Inloggen met Kilo Code",
-  "profile.balance.title": "Saldo",
-  "profile.balance.refresh": "Saldo vernieuwen",
-  "profile.action.dashboard": "Dashboard",
-  "profile.action.logout": "Uitloggen",
 
   "settings.section.configuration": "Configuratie",
   "settings.agentBehaviour.title": "Agent Gedrag",
@@ -1304,7 +1256,6 @@ export const dict = {
   "settings.agentBehaviour.addMcp.args.placeholder": "e.g.\n-y\n@modelcontextprotocol/server-filesystem\n/tmp",
   "settings.agentBehaviour.addMcp.url": "Server-URL",
   "settings.agentBehaviour.addMcp.url.placeholder": "e.g. http://localhost:3000/sse",
-  "settings.agentBehaviour.mcpBrowseMarketplace": "Bladeren door Marketplace",
   "settings.agentBehaviour.mcpEmpty":
     "Geen MCP-servers geconfigureerd. Voeg MCP-servers toe in kilo.jsonc of vraag de agent om ze toe te voegen.",
   "settings.agentBehaviour.workflowsPlaceholder": "Workflows worden beheerd via workflowbestanden in je workspace.",
@@ -1400,9 +1351,6 @@ export const dict = {
   "settings.providers.select.placeholder": "Selecteer provider...",
 
   "dialog.model.notSet": "Niet ingesteld",
-
-  "profile.personalAccount": "Persoonlijk Account",
-  "profile.switchingAccount": "Account wisselen…",
 
   // Agent Manager strings live in webview-ui/agent-manager/i18n/en.ts
 
@@ -1514,10 +1462,6 @@ export const dict = {
   "settings.saveBar.cancel": "Annuleren",
   "settings.saveBar.saving": "Bezig met opslaan…",
   "settings.saveBar.saveFailed": "Instellingen konden niet worden opgeslagen",
-  "notifications.action.next": "Volgende",
-  "notifications.action.close": "Sluiten",
-  "notifications.action.tryModel": "Probeer {{model}}",
-  "notifications.action.tryModelGeneric": "Probeer model",
   // Missing translations - English fallbacks until translated
   "settings.agentBehaviour.createMode": "Nieuwe modus aanmaken",
   "settings.agentBehaviour.createMode.button": "Aanmaken",

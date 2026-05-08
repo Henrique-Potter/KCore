@@ -31,7 +31,6 @@ This document tracks remaining work needed for feature parity with the old exten
 | [Codebase Indexing & Semantic Search](non-agent-features/codebase-indexing-semantic-search.md) | Vector indexing, semantic search, embeddings infrastructure | CLI has grep/glob endpoints; semantic indexing is extension or cloud | P2 |
 | [Contribution Tracking](non-agent-features/contribution-tracking.md) | AI attribution tracking, line fingerprinting, reporting | Extension-side | P3 |
 | [Custom Commands](non-agent-features/custom-command-system.md) | Slash command system, project-level command discovery, YAML frontmatter support | CLI has custom commands; extension provides UI entry points | P2 |
-| [Marketplace](non-agent-features/marketplace.md) | Catalog, install, update capabilities (toolbar button exists but renders a stub) | Extension-side | P2 |
 | [MCP & MCP Hub](non-agent-features/mcp-and-mcp-hub.md) | MCP configuration UI (add/edit/delete servers), tool allowlisting | CLI owns MCP lifecycle; extension provides config UI | P1 |
 | [Repository Initialization](non-agent-features/repository-initialization.md) | /init command support for setting up agentic engineering | CLI /init endpoint; extension provides UI trigger | P3 |
 | [Rules & Workflows](non-agent-features/rules-and-workflows.md) | Workflow management UI (rules subtab exists, workflows subtab is a stub) | CLI owns rules runtime; extension provides management UI | P3 |

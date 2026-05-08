@@ -24,6 +24,9 @@ axum = { version = "0.8", features = ["http1", "tokio"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 futures-core = "0.3"
 futures-util = "0.3"
 kilo-protocol = { path = "crates/kilo-protocol" }
@@ -33,7 +36,8 @@ kilo-store = { path = "crates/kilo-store" }
 rand = { version = "0.8", features = ["std_rng"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+portable-pty = "0.9"

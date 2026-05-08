@@ -190,7 +190,7 @@ describe("resolveEventSessionId", () => {
 })
 
 // ---------------------------------------------------------------------------
-// M3 mutation gate tests
+// Mutation tracking tests
 // ---------------------------------------------------------------------------
 
 describe("isMutatingMethod", () => {
@@ -239,7 +239,7 @@ describe("createMutationTrackingFetch", () => {
     return new Response("body", { status })
   }
 
-  it("flips gate on a 2xx mutation response", async () => {
+  it("records a 2xx mutation response", async () => {
     let count = 0
     const baseFetch = (async () => fakeResponse(200)) as typeof fetch
     const wrapped = createMutationTrackingFetch(baseFetch, () => count++)
@@ -249,10 +249,7 @@ describe("createMutationTrackingFetch", () => {
     expect(count).toBe(1)
   })
 
-  it("does NOT flip gate on a 404 response — Rust never accepted the mutation", async () => {
-    // This is the M3 HIGH-2 regression: a missing route (e.g. PATCH
-    // /global/config before M5) used to permanently lock fallback even
-    // though Rust never touched state. The fix says "flip on 2xx only."
+  it("does NOT record a 404 response because Rust never accepted the mutation", async () => {
     let count = 0
     const baseFetch = (async () => fakeResponse(404)) as typeof fetch
     const wrapped = createMutationTrackingFetch(baseFetch, () => count++)
@@ -262,7 +259,7 @@ describe("createMutationTrackingFetch", () => {
     expect(count).toBe(0)
   })
 
-  it("does NOT flip gate on a 500 response — Rust crashed before persisting", async () => {
+  it("does NOT record a 500 response because Rust crashed before persisting", async () => {
     let count = 0
     const baseFetch = (async () => fakeResponse(500)) as typeof fetch
     const wrapped = createMutationTrackingFetch(baseFetch, () => count++)
@@ -272,7 +269,7 @@ describe("createMutationTrackingFetch", () => {
     expect(count).toBe(0)
   })
 
-  it("does NOT flip gate on a network error (baseFetch throws)", async () => {
+  it("does NOT record a network error (baseFetch throws)", async () => {
     // A thrown fetch means we never even got a response, so Rust cannot
     // have observed the mutation. The error must propagate untouched.
     let count = 0
@@ -286,7 +283,7 @@ describe("createMutationTrackingFetch", () => {
     expect(count).toBe(0)
   })
 
-  it("does NOT flip gate on a 2xx GET — only mutating methods can flip", async () => {
+  it("does NOT record a 2xx GET because only mutating methods count", async () => {
     let count = 0
     const baseFetch = (async () => fakeResponse(200)) as typeof fetch
     const wrapped = createMutationTrackingFetch(baseFetch, () => count++)
@@ -296,7 +293,7 @@ describe("createMutationTrackingFetch", () => {
     expect(count).toBe(0)
   })
 
-  it("flips gate when SDK sends a Request object with method PATCH", async () => {
+  it("records a Request object with method PATCH", async () => {
     // The SDK normally constructs a `Request` rather than passing init —
     // the helper has to read method off the Request, not init.
     let count = 0
@@ -308,7 +305,7 @@ describe("createMutationTrackingFetch", () => {
     expect(count).toBe(1)
   })
 
-  it("flips gate every successful mutation — caller (ServerManager) handles idempotence", async () => {
+  it("records every successful mutation; caller handles idempotence", async () => {
     let count = 0
     const baseFetch = (async () => fakeResponse(201)) as typeof fetch
     const wrapped = createMutationTrackingFetch(baseFetch, () => count++)
@@ -336,5 +333,54 @@ describe("createMutationTrackingFetch", () => {
     const body = await res.json()
 
     expect(body).toEqual({ ok: 1 })
+  })
+
+  it("records a streaming 2xx mutation BEFORE the body finishes", async () => {
+    // `POST /session/{id}/prompt_async` returns a streaming 200 OK whose body
+    // completes long after headers arrive. Record once the sidecar accepts the
+    // prompt, not when the stream eventually drains.
+    let count = 0
+
+    // ReadableStream that never closes — simulates a long-running SSE body.
+    let _streamController: ReadableStreamDefaultController<Uint8Array> | null = null
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        _streamController = controller
+        controller.enqueue(new TextEncoder().encode("event: open\n\n"))
+      },
+    })
+    const baseFetch = (async () =>
+      new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch
+    const wrapped = createMutationTrackingFetch(baseFetch, () => count++)
+
+    // Use a Request, mirroring how the SDK calls the wrapped fetch.
+    const res = await wrapped(new Request("http://x/session/abc/prompt_async", { method: "POST" }))
+
+    // Mutation must already be recorded; we have the response head, body still open.
+    expect(count).toBe(1)
+    expect(res.ok).toBe(true)
+    expect(res.body).toBeDefined()
+
+    // Cleanup: cancel the stream so the test process doesn't leak it.
+    await res.body?.cancel()
+  })
+
+  it("does NOT record a streaming 4xx response because sidecar rejected the prompt", async () => {
+    let count = 0
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode("error\n"))
+        c.close()
+      },
+    })
+    const baseFetch = (async () =>
+      new Response(body, { status: 404, headers: { "content-type": "text/event-stream" } })) as typeof fetch
+    const wrapped = createMutationTrackingFetch(baseFetch, () => count++)
+
+    const res = await wrapped(new Request("http://x/session/abc/prompt_async", { method: "POST" }))
+
+    expect(count).toBe(0)
+    expect(res.ok).toBe(false)
+    await res.body?.cancel()
   })
 })

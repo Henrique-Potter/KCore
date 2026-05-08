@@ -27,7 +27,6 @@ import { Diff } from "@kilocode/kilo-ui/diff"
 import { Code } from "@kilocode/kilo-ui/code"
 import { File } from "@kilocode/kilo-ui/file"
 import { SessionContext } from "../context/session"
-import { NotificationsContext } from "../context/notifications"
 import { LanguageContext } from "../context/language"
 import { IndexingProvider } from "../context/indexing"
 import { dict as uiEn } from "@kilocode/kilo-ui/i18n/en"
@@ -36,13 +35,7 @@ import { dict as amEn } from "../../agent-manager/i18n/en"
 import { dict as kiloEn } from "@kilocode/kilo-i18n/en"
 import { hasIndexingPlugin } from "@kilocode/kilo-indexing/detect"
 import { resolveTemplate } from "../context/language-utils"
-import type {
-  Config,
-  KilocodeNotification,
-  PermissionRequest,
-  QuestionRequest,
-  SuggestionRequest,
-} from "../types/messages"
+import type { Config, PermissionRequest, QuestionRequest, SuggestionRequest } from "../types/messages"
 
 type PluginSpec = string | [string, Record<string, unknown>]
 
@@ -110,19 +103,7 @@ export const defaultMockData = {
   provider: { all: [], connected: false, default: {} },
 }
 
-// ---------------------------------------------------------------------------
-// Mock NotificationsContext value
-// ---------------------------------------------------------------------------
-
 function noop() {}
-
-function mockNotificationsValue(items: KilocodeNotification[] = []) {
-  return {
-    notifications: () => items,
-    filteredNotifications: () => items,
-    dismiss: noop,
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Mock SessionContext value — only the subset used by components
@@ -241,8 +222,6 @@ export function mockSessionValue(overrides?: {
     deleteSession: noop,
     renameSession: noop,
     syncSession: noop,
-    cloudPreviewId: () => null,
-    selectCloudSession: noop,
   }
 }
 
@@ -255,7 +234,6 @@ interface StoryProvidersProps {
   permissions?: PermissionRequest[]
   questions?: QuestionRequest[]
   suggestions?: SuggestionRequest[]
-  notifications?: KilocodeNotification[]
   status?: string
   sessionID?: string
   /** When provided, injects a mock ConfigContext with this config instead of the real ConfigProvider. */
@@ -310,7 +288,6 @@ export const StoryProviders: ParentComponent<StoryProvidersProps> = (props) => {
     suggestions: props.suggestions,
     status: props.status,
   })
-  const notifications = mockNotificationsValue(props.notifications)
   const [locale] = createSignal<"en">("en")
 
   return (
@@ -328,27 +305,25 @@ export const StoryProviders: ParentComponent<StoryProvidersProps> = (props) => {
                 }}
               >
                 <I18nProvider value={{ locale: () => "en", t }}>
-                  <NotificationsContext.Provider value={notifications}>
-                    <SessionContext.Provider value={session as any}>
-                      <IndexingProvider>
-                        <DataProvider data={data()} directory="/project/">
-                          <DiffComponentProvider component={Diff}>
-                            <CodeComponentProvider component={Code}>
-                              <FileComponentProvider component={File}>
-                                <MarkedProvider>
-                                  {props.noPadding ? (
-                                    props.children
-                                  ) : (
-                                    <div style={{ padding: "12px" }}>{props.children}</div>
-                                  )}
-                                </MarkedProvider>
-                              </FileComponentProvider>
-                            </CodeComponentProvider>
-                          </DiffComponentProvider>
-                        </DataProvider>
-                      </IndexingProvider>
-                    </SessionContext.Provider>
-                  </NotificationsContext.Provider>
+                  <SessionContext.Provider value={session as any}>
+                    <IndexingProvider>
+                      <DataProvider data={data()} directory="/project/">
+                        <DiffComponentProvider component={Diff}>
+                          <CodeComponentProvider component={Code}>
+                            <FileComponentProvider component={File}>
+                              <MarkedProvider>
+                                {props.noPadding ? (
+                                  props.children
+                                ) : (
+                                  <div style={{ padding: "12px" }}>{props.children}</div>
+                                )}
+                              </MarkedProvider>
+                            </FileComponentProvider>
+                          </CodeComponentProvider>
+                        </DiffComponentProvider>
+                      </DataProvider>
+                    </IndexingProvider>
+                  </SessionContext.Provider>
                 </I18nProvider>
               </LanguageContext.Provider>
             </DialogProvider>
