@@ -36,6 +36,187 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 const log = Log.create({ service: "llm" })
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 type Result = Awaited<ReturnType<typeof streamText>>
+// kilocode_change start - deterministic Bun sidecar benchmark provider
+const FAKE_PREFIX = "__KILO_BENCH_FAKE__"
+
+type FakeCall = {
+  tool: string
+  input?: Record<string, unknown>
+  delayMs?: number
+}
+
+type FakeControl = {
+  text?: string
+  delayMs?: number
+  fakeText?: string
+  fakeDelayMs?: number
+  toolCalls?: FakeCall[]
+  fakeToolCalls?: FakeCall[]
+}
+
+function wait(ms: number | undefined, abort: AbortSignal) {
+  if (!ms || ms <= 0) return Promise.resolve()
+  return new Promise<void>((resolve, reject) => {
+    const id = setTimeout(resolve, ms)
+    const stop = () => {
+      clearTimeout(id)
+      reject(new DOMException("Aborted", "AbortError"))
+    }
+    abort.addEventListener("abort", stop, { once: true })
+  })
+}
+
+function fakeText(input: StreamRequest) {
+  for (const msg of [...input.messages].reverse()) {
+    if (msg.role !== "user") continue
+    const content = msg.content
+    if (typeof content === "string") return content
+    if (!Array.isArray(content)) continue
+    const text = content
+      .map((part: any) => (part?.type === "text" && typeof part.text === "string" ? part.text : ""))
+      .join("\n")
+    if (text.trim()) return text
+  }
+  return ""
+}
+
+function fakeControl(input: StreamRequest): FakeControl {
+  const text = fakeText(input)
+  const idx = text.indexOf(FAKE_PREFIX)
+  if (idx === -1) return {}
+  const raw = text.slice(idx + FAKE_PREFIX.length).trim()
+  if (!raw) return {}
+  try {
+    return JSON.parse(raw) as FakeControl
+  } catch {
+    const json = fakeJson(raw)
+    if (!json) return { text: raw }
+    try {
+      return JSON.parse(json) as FakeControl
+    } catch {
+      return { text: raw }
+    }
+  }
+}
+
+function fakeJson(raw: string) {
+  const start = raw.indexOf("{")
+  if (start === -1) return
+  let depth = 0
+  let quote = false
+  let escape = false
+  for (let i = start; i < raw.length; i++) {
+    const ch = raw[i]
+    if (escape) {
+      escape = false
+      continue
+    }
+    if (ch === "\\") {
+      escape = true
+      continue
+    }
+    if (ch === '"') {
+      quote = !quote
+      continue
+    }
+    if (quote) continue
+    if (ch === "{") depth++
+    if (ch === "}") depth--
+    if (depth === 0) return raw.slice(start, i + 1)
+  }
+}
+
+function fakeOutput(toolName: string, value: any) {
+  if (typeof value === "string") return { title: toolName, metadata: {}, output: value }
+  if (value && typeof value === "object") {
+    return {
+      title: typeof value.title === "string" ? value.title : toolName,
+      metadata: value.metadata && typeof value.metadata === "object" ? value.metadata : {},
+      output:
+        typeof value.output === "string"
+          ? value.output
+          : value.output === undefined
+            ? JSON.stringify(value)
+            : String(value.output),
+      attachments: Array.isArray(value.attachments) ? value.attachments : undefined,
+    }
+  }
+  return { title: toolName, metadata: {}, output: String(value ?? "") }
+}
+
+async function fakeTool(input: StreamRequest, call: FakeCall, id: string) {
+  await wait(call.delayMs, input.abort)
+  const item = input.tools[call.tool]
+  if (!item?.execute) throw new Error(`Unknown fake benchmark tool: ${call.tool}`)
+  const value = await item.execute(call.input ?? {}, {
+    toolCallId: id,
+    messages: input.messages,
+    abortSignal: input.abort,
+  })
+  return fakeOutput(call.tool, value)
+}
+
+async function* fakeBenchmarkStream(input: StreamRequest): AsyncGenerator<Event> {
+  const control = fakeControl(input)
+  const text = control.text ?? control.fakeText ?? "fake"
+  const calls = control.toolCalls ?? control.fakeToolCalls ?? []
+  yield { type: "start" } as Event
+  yield { type: "start-step" } as Event
+  await wait(control.delayMs ?? control.fakeDelayMs, input.abort)
+  if (text) {
+    yield { type: "text-start", id: "fake-text" } as Event
+    yield { type: "text-delta", id: "fake-text", text } as Event
+    yield { type: "text-end", id: "fake-text" } as Event
+  }
+  const pending: Promise<{ idx: number; event: Event }>[] = []
+  for (const [idx, call] of calls.entries()) {
+    const id = `fake-call-${idx}`
+    yield { type: "tool-input-start", id, toolName: call.tool } as Event
+    yield { type: "tool-call", toolCallId: id, toolName: call.tool, input: call.input ?? {} } as Event
+    pending.push(
+      fakeTool(input, call, id).then(
+        (output) => ({ idx, event: { type: "tool-result", toolCallId: id, output } as Event }),
+        (error) => ({ idx, event: { type: "tool-error", toolCallId: id, error } as Event }),
+      ),
+    )
+  }
+  while (pending.length) {
+    const next = await Promise.race(pending.map((task, slot) => task.then((done) => ({ ...done, slot }))))
+    pending.splice(next.slot, 1)
+    yield next.event
+  }
+  yield {
+    type: "finish-step",
+    finishReason: "stop",
+    usage: {
+      inputTokens: 1,
+      outputTokens: text ? 1 : 0,
+      totalTokens: text ? 2 : 1,
+    },
+  } as Event
+  yield {
+    type: "finish",
+    finishReason: "stop",
+    rawFinishReason: "stop",
+    usage: {
+      inputTokens: 1,
+      outputTokens: text ? 1 : 0,
+      totalTokens: text ? 2 : 1,
+    },
+    totalUsage: {
+      inputTokens: 1,
+      outputTokens: text ? 1 : 0,
+      totalTokens: text ? 2 : 1,
+    },
+  } as unknown as Event
+}
+
+function fakeBenchmarkResult(input: StreamRequest): Result {
+  return {
+    fullStream: fakeBenchmarkStream(input),
+  } as unknown as Result
+}
+// kilocode_change end
 
 export type StreamInput = {
   user: MessageV2.User
@@ -91,6 +272,12 @@ const live: Layer.Layer<
         modelID: input.model.id,
         providerID: input.model.providerID,
       })
+
+      // kilocode_change start - deterministic Bun sidecar benchmark provider
+      if (Flag.KILO_BENCH_FAKE_PROVIDER && input.model.providerID === "fake") {
+        return fakeBenchmarkResult(input)
+      }
+      // kilocode_change end
 
       const [language, cfg, item, info] = yield* Effect.all(
         [

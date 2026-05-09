@@ -4,6 +4,7 @@
 //! response. The substantive listener / token-exchange / PKCE / JWT logic
 //! lives in `crate::oauth::{listener,tokens,crypto,url}`.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,15 +14,15 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use kilo_protocol::Config;
-use serde_json::{json, Value};
+use kilo_protocol::{Config, GlobalEvent};
+use serde_json::{json, Map, Value};
 
 use crate::oauth::crypto::{oauth_secret, pkce_challenge};
 use crate::oauth::listener::ensure_oauth_listener;
 use crate::oauth::tokens::exchange_code;
 use crate::oauth::url::oauth_url;
 use crate::oauth::{OAUTH_PENDING_TTL, OPENAI_REDIRECT};
-use crate::{internal_error, internal_error_named, AppState, PendingAuth};
+use crate::{http::sse, internal_error, internal_error_named, AppState, PendingAuth};
 
 #[cfg(not(test))]
 const OAUTH_CALLBACK_WAIT: Duration = OAUTH_PENDING_TTL;
@@ -63,9 +64,50 @@ pub(crate) async fn update_config(
     State(state): State<Arc<AppState>>,
     Json(input): Json<Config>,
 ) -> Response {
-    match state.store.set_config(input) {
-        Ok(value) => Json(value).into_response(),
-        Err(err) => internal_error(err.to_string()),
+    let mut current = state.store.config();
+    merge_config(&mut current, input);
+    let out = match state.store.set_config(current) {
+        Ok(value) => value,
+        Err(err) => return internal_error(err.to_string()),
+    };
+    sse::publish(&state, GlobalEvent::bus("global.config.updated", json!({})));
+    Json(out).into_response()
+}
+
+fn merge_config(target: &mut Config, patch: Config) {
+    for (key, value) in patch.data {
+        if value.is_null() {
+            target.data.remove(&key);
+            continue;
+        }
+        match target.data.get_mut(&key) {
+            Some(existing) => merge_value(existing, value),
+            None => {
+                target.data.insert(key, value);
+            }
+        }
+    }
+}
+
+fn merge_value(target: &mut Value, patch: Value) {
+    match (target, patch) {
+        (Value::Object(target), Value::Object(patch)) => merge_object(target, patch),
+        (target, patch) => *target = patch,
+    }
+}
+
+fn merge_object(target: &mut Map<String, Value>, patch: Map<String, Value>) {
+    for (key, value) in patch {
+        if value.is_null() {
+            target.remove(&key);
+            continue;
+        }
+        match target.get_mut(&key) {
+            Some(existing) => merge_value(existing, value),
+            None => {
+                target.insert(key, value);
+            }
+        }
     }
 }
 
@@ -395,15 +437,26 @@ async fn complete_oauth_callback(
     verifier: &str,
     complete: Option<tokio::sync::watch::Sender<Option<Result<(), String>>>>,
 ) -> Response {
-    let res =
-        match exchange_code(&state.oauth_token_endpoint, code, OPENAI_REDIRECT, verifier).await {
-            Ok(value) => state
-                .store
-                .set_provider_auth("openai", value)
-                .map(|_| ())
-                .map_err(|err| err.to_string()),
-            Err(err) => Err(err),
-        };
+    // The OAuth callback handler has no Stop button to bind to — the user
+    // is in their browser. The 30s reqwest timeout in `token_client` is
+    // the safety net here.
+    let cancel = AtomicBool::new(false);
+    let res = match exchange_code(
+        &state.oauth_token_endpoint,
+        code,
+        OPENAI_REDIRECT,
+        verifier,
+        &cancel,
+    )
+    .await
+    {
+        Ok(value) => state
+            .store
+            .set_provider_auth("openai", value)
+            .map(|_| ())
+            .map_err(|err| err.to_string()),
+        Err(err) => Err(err),
+    };
     if let Some(tx) = complete {
         let _ = tx.send(Some(res.clone()));
     }

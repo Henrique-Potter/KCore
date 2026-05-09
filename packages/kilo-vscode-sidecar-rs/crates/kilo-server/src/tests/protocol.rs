@@ -170,6 +170,33 @@ async fn populated_body_post_passes_through_unchanged() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn network_wait_routes_match_empty_rust_sidecar_state() {
+    let root = unique_root();
+    let st = state_at(&root);
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/network?directory=d%3A%5CProjects%5Ckilocode")
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app(st.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(response_to_string(res).await, "[]");
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/network/missing/reject")
+        .header(header::CONTENT_LENGTH, "0")
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app(st).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// Same body-bearing route, but the SDK-style empty-body call. With the
 /// lenient layer the request reaches the handler; without it, axum's `Json<T>`
 /// extractor would still pass since `global_dispose` doesn't extract a body —
@@ -510,4 +537,179 @@ fn instance_event_frame_has_bus_shape() {
     assert_eq!(parsed["type"], "server.connected");
     assert_eq!(parsed["properties"], json!({}));
     assert!(parsed.get("directory").is_none());
+}
+
+/// `GET /kilo/cloud/session/{id}` must include an `info.title` field.
+/// Bun's gateway proxies the cloud server's response, which always
+/// includes `info: {title}` (`kilo-gateway/src/server/routes.ts:420`);
+/// the extension reads `data.info.title` and crashes on undefined. The
+/// Rust offline stub mirrors that envelope so the cloud-sessions
+/// sidebar renders an offline placeholder instead of a TypeError.
+#[tokio::test]
+async fn kilo_cloud_session_returns_info_envelope() {
+    let root = unique_root();
+    let st = state_at(&root);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/kilo/cloud/session/ses_offline")
+        .body(Body::empty())
+        .unwrap();
+    let res = app(st).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let data: Value = serde_json::from_str(&response_to_string(res).await).unwrap();
+    assert_eq!(data["info"]["id"], "ses_offline");
+    assert!(data["info"]["title"].is_string());
+    assert_eq!(data["info"]["time"]["created"], 0);
+    assert_eq!(data["info"]["time"]["updated"], 0);
+    assert_eq!(data["messages"], json!([]));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// `POST /commit-message` falls back to the literal stub when there is
+/// no provider auth registered (no LLM credentials reachable). The
+/// fallback path reflects the selected file count so the extension
+/// still gets a usable string in offline / unauth scenarios.
+#[tokio::test]
+async fn commit_message_falls_back_to_stub_without_auth() {
+    let root = unique_root();
+    let st = state_at(&root);
+    seed(&st.store);
+    // No `set_provider_auth` call: auth lookup returns None, the LLM
+    // call short-circuits, fallback message fires.
+    let body = json!({ "path": root.to_string_lossy(), "selectedFiles": ["x.ts"] }).to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/commit-message")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app(st).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let data: Value = serde_json::from_str(&response_to_string(res).await).unwrap();
+    assert_eq!(data["message"], "Update 1 selected file(s)");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// `POST /enhance-prompt` falls back to echoing the input when there is
+/// no provider auth. Without this fallback the webview "Improve my
+/// prompt" button would return nothing useful when offline.
+#[tokio::test]
+async fn enhance_prompt_falls_back_to_echo_without_auth() {
+    let root = unique_root();
+    let st = state_at(&root);
+
+    let body = json!({ "text": "explain the registry module" }).to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/enhance-prompt")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app(st).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let data: Value = serde_json::from_str(&response_to_string(res).await).unwrap();
+    assert_eq!(data["text"], "explain the registry module");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// `POST /kilocode/skill/remove` deletes the skill's parent directory
+/// and returns `Json(true)` (Bun parity:
+/// `packages/opencode/src/skill/index.ts:313-320`). A missing path
+/// returns 404 with an `{error}` envelope.
+#[tokio::test]
+async fn remove_skill_deletes_parent_directory_and_returns_true() {
+    use std::fs;
+    let root = unique_root();
+    let st = state_at(&root);
+    seed(&st.store);
+
+    let paths = st.store.paths();
+    let skill_dir = std::path::PathBuf::from(&paths.config)
+        .join("skill")
+        .join("demo");
+    fs::create_dir_all(&skill_dir).unwrap();
+    let skill_file = skill_dir.join("SKILL.md");
+    fs::write(
+        &skill_file,
+        "---\nname: demo\ndescription: demo skill\n---\nbody",
+    )
+    .unwrap();
+    assert!(skill_file.exists());
+
+    let body = json!({ "location": skill_file.to_string_lossy(), "directory": paths.directory })
+        .to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/kilocode/skill/remove")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app(st.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let data: Value = serde_json::from_str(&response_to_string(res).await).unwrap();
+    assert_eq!(data, json!(true));
+    assert!(!skill_dir.exists(), "skill directory should be removed");
+
+    // Second call (file already gone) returns 404 with error envelope.
+    let body = json!({ "location": skill_file.to_string_lossy() }).to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/kilocode/skill/remove")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app(st).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let data: Value = serde_json::from_str(&response_to_string(res).await).unwrap();
+    assert!(data.get("error").and_then(Value::as_str).is_some());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// `POST /kilocode/agent/remove` deletes a custom-agent markdown file
+/// from any of the registry-scanned config directories and returns
+/// `Json(true)`. A name that matches no file returns 404.
+#[tokio::test]
+async fn remove_agent_deletes_markdown_file_and_returns_true() {
+    use std::fs;
+    let root = unique_root();
+    let st = state_at(&root);
+    seed(&st.store);
+
+    let paths = st.store.paths();
+    let agent_file = std::path::PathBuf::from(&paths.config)
+        .join("agent")
+        .join("custom.md");
+    fs::create_dir_all(agent_file.parent().unwrap()).unwrap();
+    fs::write(&agent_file, "---\nname: custom\n---\nprompt").unwrap();
+    assert!(agent_file.exists());
+
+    let body = json!({ "name": "custom", "directory": paths.directory }).to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/kilocode/agent/remove")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app(st.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let data: Value = serde_json::from_str(&response_to_string(res).await).unwrap();
+    assert_eq!(data, json!(true));
+    assert!(!agent_file.exists(), "agent file should be removed");
+
+    let body = json!({ "name": "custom" }).to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/kilocode/agent/remove")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app(st).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    let _ = std::fs::remove_dir_all(root);
 }

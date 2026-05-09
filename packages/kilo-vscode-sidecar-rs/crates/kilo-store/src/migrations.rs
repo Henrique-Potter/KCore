@@ -28,7 +28,7 @@ use rusqlite::Connection;
 
 /// Latest schema version the binary writes. Incremented in lockstep with
 /// any change to `init_schema` or any append to [`MIGRATIONS`].
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 1;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 2;
 
 /// Entry in the migrations table. `version` is the version this entry
 /// brings the database TO (i.e. running entry `2` requires the database
@@ -114,6 +114,22 @@ const MIGRATIONS: &[Migration] = &[
             type text not null,
             data text not null
         );",
+    },
+    // Version 2: Bun-compatible per-session todo state
+    // (`packages/opencode/src/session/session.sql.ts::TodoTable`).
+    Migration {
+        version: 2,
+        sql: "create table if not exists todo (
+            session_id text not null references session(id) on delete cascade,
+            content text not null,
+            status text not null,
+            priority text not null,
+            position integer not null,
+            time_created integer not null,
+            time_updated integer not null,
+            primary key (session_id, position)
+        );
+        create index if not exists todo_session_idx on todo(session_id);",
     },
 ];
 

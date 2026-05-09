@@ -3,9 +3,12 @@
 
 use kilo_protocol::{PromptInput, SessionCreateInput};
 use serde_json::json;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use crate::agent::tools::bash::fake_bash_with_cancel;
+use crate::agent::tools::fs::{fake_edit, fake_glob, fake_grep, fake_read, fake_write};
 use crate::agent::turn::prompt_turn;
 
 use super::common::{drain, seed, state_at, unique_root};
@@ -54,6 +57,77 @@ async fn prompt_turn_fake_grep_persists_match_metadata() {
     assert!(output.contains("Line 1: needle one"));
     assert!(output.contains("src/b.txt:"));
     assert_eq!(out.parts[2]["type"], "step-finish");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn prompt_turn_fake_glob_persists_match_metadata() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let repo = root.join("repo");
+    std::fs::create_dir_all(repo.join("src").join("nested")).unwrap();
+    std::fs::write(repo.join("src").join("a.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(repo.join("src").join("nested").join("b.rs"), "fn b() {}\n").unwrap();
+    std::fs::write(repo.join("src").join("nested").join("c.ts"), "export {}\n").unwrap();
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("create session");
+
+    let out = prompt_turn(
+        &state,
+        &session.id,
+        PromptInput {
+            parts: vec![json!({ "type": "text", "text": "glob rust files" })],
+            provider: Some(json!({
+                "fakeToolCalls": [{
+                    "tool": "glob",
+                    "input": { "pattern": "src/**/*.rs" }
+                }]
+            })),
+            ..Default::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .expect("prompt turn");
+
+    let tool = &out.parts[1];
+    assert_eq!(tool["tool"], "glob");
+    assert_eq!(tool["state"]["status"], "completed");
+    assert_eq!(tool["state"]["metadata"]["count"], 2);
+    assert_eq!(tool["state"]["metadata"]["truncated"], false);
+    let output = tool["state"]["output"].as_str().unwrap();
+    assert!(output.contains("src/a.rs"), "{output}");
+    assert!(output.contains("src/nested/b.rs"), "{output}");
+    assert!(!output.contains("src/nested/c.ts"), "{output}");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn fake_glob_supports_basename_patterns_and_braces() {
+    let root = unique_root();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("README.md"), "# hi\n").unwrap();
+    std::fs::write(repo.join("src").join("main.ts"), "main\n").unwrap();
+    std::fs::write(repo.join("src").join("main.js"), "main\n").unwrap();
+    std::fs::write(repo.join("src").join("main.rs"), "main\n").unwrap();
+
+    let (_, output, meta) =
+        fake_glob(&repo, &json!({ "pattern": "*.{ts,js}", "path": "src" })).expect("glob");
+
+    assert_eq!(meta["count"], 2);
+    assert!(output.contains("src/main.ts"), "{output}");
+    assert!(output.contains("src/main.js"), "{output}");
+    assert!(!output.contains("src/main.rs"), "{output}");
+
+    let (_, output, meta) = fake_glob(&repo, &json!({ "pattern": "README.md" })).expect("glob");
+    assert_eq!(meta["count"], 1);
+    assert!(output.contains("README.md"), "{output}");
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -721,6 +795,125 @@ async fn prompt_turn_fake_bash_nonzero_persists_completed_metadata() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[test]
+fn fake_bash_stops_promptly_when_cancelled() {
+    let root = unique_root();
+    std::fs::create_dir_all(root.join("repo")).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        flag.store(true, Ordering::SeqCst);
+    });
+
+    let start = Instant::now();
+    let out = fake_bash_with_cancel(
+        &root.join("repo"),
+        &json!({
+            "command": "sleep 5",
+            "timeout": 5000,
+            "description": "sleep"
+        }),
+        Some(cancel.as_ref()),
+    )
+    .expect("bash should cancel cleanly");
+
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "cancelled bash waited too long: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(out.2["cancelled"], true);
+    assert_eq!(out.2["timeout"], false);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn fake_bash_accepts_absolute_workdir_inside_repo() {
+    let root = unique_root();
+    let repo = root.join("repo");
+    let src = repo.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    let out = fake_bash_with_cancel(
+        &repo,
+        &json!({
+            "command": "echo ok",
+            "workdir": src.to_string_lossy(),
+            "description": "absolute workdir"
+        }),
+        None,
+    )
+    .expect("absolute workdir inside repo should be accepted");
+
+    assert_eq!(out.2["exit"], 0);
+    assert!(out.1.contains("ok"));
+
+    #[cfg(windows)]
+    {
+        let slash = src
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        let out = fake_bash_with_cancel(
+            &repo,
+            &json!({
+                "command": "echo ok",
+                "workdir": slash,
+                "description": "absolute slash workdir"
+            }),
+            None,
+        )
+        .expect("lowercase slash absolute workdir inside repo should be accepted");
+        assert_eq!(out.2["exit"], 0);
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn fake_file_tools_accept_absolute_paths_inside_repo() {
+    let root = unique_root();
+    let repo = root.join("repo");
+    let src = repo.join("src");
+    let note = src.join("note.txt");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(&note, "hello needle\n").unwrap();
+
+    let read = fake_read(&repo, &json!({ "filePath": note.to_string_lossy() }))
+        .expect("read should accept an absolute path inside repo");
+    assert!(read.1.contains("hello needle"));
+
+    let grep = fake_grep(
+        &repo,
+        &json!({ "pattern": "needle", "path": src.to_string_lossy() }),
+    )
+    .expect("grep should accept an absolute path inside repo");
+    assert_eq!(grep.2["matches"], 1);
+
+    let write = repo.join("created.txt");
+    fake_write(
+        &repo,
+        &json!({ "filePath": write.to_string_lossy(), "content": "new\n" }),
+    )
+    .expect("write should accept an absolute path inside repo");
+    assert_eq!(std::fs::read_to_string(&write).unwrap(), "new\n");
+
+    fake_edit(
+        &repo,
+        &json!({
+            "filePath": write.to_string_lossy(),
+            "oldString": "new",
+            "newString": "changed"
+        }),
+    )
+    .expect("edit should accept an absolute path inside repo");
+    assert_eq!(std::fs::read_to_string(&write).unwrap(), "changed\n");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn prompt_turn_fake_bash_invalid_input_persists_tool_errors() {
     let root = unique_root();
@@ -772,6 +965,232 @@ async fn prompt_turn_fake_bash_invalid_input_persists_tool_errors() {
     let page = state.store.messages(&session.id, None, None).unwrap();
     assert_eq!(page.items[1].parts[1]["state"]["status"], "error");
     assert_eq!(page.items[1].parts[2]["state"]["status"], "error");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn prompt_turn_fake_task_creates_child_session_and_completed_part() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    std::fs::create_dir_all(root.join("repo")).unwrap();
+    let session = state
+        .store
+        .create_session(SessionCreateInput {
+            permission: Some(json!({ "task": "allow" })),
+            ..Default::default()
+        })
+        .expect("create session");
+
+    let out = prompt_turn(
+        &state,
+        &session.id,
+        PromptInput {
+            parts: vec![json!({ "type": "text", "text": "run task" })],
+            provider: Some(json!({
+                "fakeToolCalls": [{
+                    "tool": "task",
+                    "input": {
+                        "description": "bench child",
+                        "prompt": "child done",
+                        "subagent_type": "general"
+                    }
+                }]
+            })),
+            ..Default::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .expect("prompt turn");
+
+    let tool = &out.parts[1];
+    assert_eq!(tool["type"], "tool");
+    assert_eq!(tool["tool"], "task");
+    assert_eq!(tool["state"]["status"], "completed");
+    assert_eq!(tool["state"]["title"], "bench child");
+    let output = tool["state"]["output"].as_str().unwrap();
+    assert!(output.contains("<task_result>"), "{output}");
+    assert!(output.contains("child done"), "{output}");
+    let child = tool["state"]["metadata"]["sessionId"].as_str().unwrap();
+    let children = state.store.children(&session.id).unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].id, child);
+
+    let page = state.store.messages(child, None, None).unwrap();
+    let body = serde_json::to_string(&page.items).unwrap();
+    assert!(body.contains("Echo: child done"), "{body}");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn prompt_turn_fake_parallel_task_calls_create_children_in_input_order() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    std::fs::create_dir_all(root.join("repo")).unwrap();
+    let session = state
+        .store
+        .create_session(SessionCreateInput {
+            permission: Some(json!({ "task": "allow" })),
+            ..Default::default()
+        })
+        .expect("create session");
+
+    let out = prompt_turn(
+        &state,
+        &session.id,
+        PromptInput {
+            parts: vec![json!({ "type": "text", "text": "run tasks" })],
+            provider: Some(json!({
+                "fakeToolCalls": [
+                    {
+                        "tool": "task",
+                        "delayMs": 25,
+                        "input": {
+                            "description": "bench child one",
+                            "prompt": "child one done",
+                            "subagent_type": "general"
+                        }
+                    },
+                    {
+                        "tool": "task",
+                        "input": {
+                            "description": "bench child two",
+                            "prompt": "child two done",
+                            "subagent_type": "general"
+                        }
+                    }
+                ]
+            })),
+            ..Default::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .expect("prompt turn");
+
+    assert_eq!(out.parts[1]["tool"], "task");
+    assert_eq!(out.parts[1]["state"]["title"], "bench child one");
+    assert_eq!(out.parts[2]["tool"], "task");
+    assert_eq!(out.parts[2]["state"]["title"], "bench child two");
+    assert!(out.parts[1]["state"]["output"]
+        .as_str()
+        .unwrap()
+        .contains("child one done"));
+    assert!(out.parts[2]["state"]["output"]
+        .as_str()
+        .unwrap()
+        .contains("child two done"));
+    let children = state.store.children(&session.id).unwrap();
+    assert_eq!(children.len(), 2);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn fake_edit_preserves_crlf_when_old_and_new_use_lf() {
+    let root = unique_root();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let path = repo.join("crlf.txt");
+    std::fs::write(&path, b"alpha\r\nbeta\r\ngamma\r\n").unwrap();
+
+    fake_edit(
+        &repo,
+        &json!({
+            "filePath": path.to_string_lossy(),
+            "oldString": "beta",
+            "newString": "BETA"
+        }),
+    )
+    .expect("edit");
+
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(bytes, b"alpha\r\nBETA\r\ngamma\r\n");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn fake_write_then_edit_preserves_utf16_le_bom() {
+    let root = unique_root();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let path = repo.join("u16.txt");
+
+    let mut bytes = vec![0xff, 0xfe];
+    for unit in "hello".encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let read = fake_read(&repo, &json!({ "filePath": path.to_string_lossy() }))
+        .expect("encoding-aware read");
+    assert!(read.1.contains("hello"));
+
+    fake_write(
+        &repo,
+        &json!({
+            "filePath": path.to_string_lossy(),
+            "content": "world"
+        }),
+    )
+    .expect("encoding-preserving write");
+
+    let after = std::fs::read(&path).unwrap();
+    assert!(after.starts_with(&[0xff, 0xfe]), "BOM dropped on write");
+    let mut expected = vec![0xff, 0xfe];
+    for unit in "world".encode_utf16() {
+        expected.extend_from_slice(&unit.to_le_bytes());
+    }
+    assert_eq!(after, expected);
+
+    fake_edit(
+        &repo,
+        &json!({
+            "filePath": path.to_string_lossy(),
+            "oldString": "world",
+            "newString": "earth"
+        }),
+    )
+    .expect("encoding-preserving edit");
+    let edited = std::fs::read(&path).unwrap();
+    let mut expected_edit = vec![0xff, 0xfe];
+    for unit in "earth".encode_utf16() {
+        expected_edit.extend_from_slice(&unit.to_le_bytes());
+    }
+    assert_eq!(edited, expected_edit);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn fake_edit_indentation_skew_succeeds_via_replacer_chain() {
+    let root = unique_root();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let path = repo.join("ind.rs");
+    std::fs::write(
+        &path,
+        "fn main() {\n        if x {\n            do_thing();\n        }\n}\n",
+    )
+    .unwrap();
+
+    fake_edit(
+        &repo,
+        &json!({
+            "filePath": path.to_string_lossy(),
+            "oldString": "if x {\n    do_thing();\n}",
+            "newString": "if x { done(); }"
+        }),
+    )
+    .expect("edit through replacer chain");
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(after.contains("if x { done(); }"));
 
     let _ = std::fs::remove_dir_all(root);
 }

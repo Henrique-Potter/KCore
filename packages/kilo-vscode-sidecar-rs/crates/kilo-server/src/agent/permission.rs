@@ -9,6 +9,7 @@
 //! routes layer (`routes::permissions::reply_permission`) import the
 //! resulting helpers via their typed paths.
 
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use kilo_protocol::GlobalEvent;
@@ -109,10 +110,11 @@ pub(crate) async fn ask_mcp_permission(
     let soft = permission_ruleset(state, sid);
     let hard = hard_ruleset(state, sid);
     let rule = evaluate_permission_layered("mcp", namespaced, &soft, &hard);
-    if rule.action == "deny" {
+    let legacy = evaluate_permission_layered(namespaced, "*", &soft, &hard);
+    if rule.action == "deny" || legacy.action == "deny" {
         return Err(format!("MCP permission denied for {namespaced}"));
     }
-    if rule.action == "allow" {
+    if rule.action == "allow" || legacy.action == "allow" {
         return Ok(());
     }
     ask_permission_once(
@@ -226,6 +228,17 @@ async fn ask_permission_once(
 ) -> Result<(), String> {
     let id = format!("permission_{mid}_{pid}_{idx}");
     let (tx, rx) = tokio::sync::oneshot::channel();
+    let protected = is_protected_request(state, permission, &patterns, input);
+    let mut metadata = input.clone();
+    if protected {
+        // UI hint: the webview reads this to hide the "Allow always" toggle.
+        // Bun parity: `permission/index.ts:251-258` injects the same key.
+        if let Some(map) = metadata.as_object_mut() {
+            map.insert("disableAlways".to_string(), Value::Bool(true));
+        } else {
+            metadata = json!({ "disableAlways": true });
+        }
+    }
     let info = json!({
         "id": id,
         "sessionID": sid,
@@ -233,7 +246,7 @@ async fn ask_permission_once(
         "permission": permission,
         "patterns": patterns,
         "always": patterns,
-        "metadata": input,
+        "metadata": metadata,
         "tool": { "messageID": mid, "callID": call, "name": tool },
     });
     state.permissions.lock().unwrap().insert(
@@ -247,6 +260,12 @@ async fn ask_permission_once(
     match rx.await {
         Ok(PermissionDecision::Allow) => Ok(()),
         Ok(PermissionDecision::Always) => {
+            // Bun parity (`permission/index.ts:308`): a request flagged by
+            // `ConfigProtection.isRequest` cannot persist an "always" rule.
+            // Treat as `once` — the action is granted but no rule is saved.
+            if protected {
+                return Ok(());
+            }
             let mut new_rules = Vec::with_capacity(patterns.len());
             for pattern in patterns {
                 new_rules.push(PermissionRule {
@@ -274,6 +293,70 @@ async fn ask_permission_once(
     }
 }
 
+/// Bun parity: `kilocode/permission/config-paths.ts::ConfigProtection.isRequest`.
+/// Decide whether a permission request targets protected config files /
+/// dirs. Currently only gates `edit` (write/edit/apply_patch all collapse
+/// onto this permission key). Returns `true` if any pattern OR any
+/// metadata-derived path resolves to a protected location, in which case
+/// the caller forces `always` → `once` and disables the "Allow always"
+/// toggle in the UI.
+pub(crate) fn is_protected_request(
+    state: &AppState,
+    permission: &str,
+    patterns: &[String],
+    metadata: &Value,
+) -> bool {
+    if permission != "edit" {
+        return false;
+    }
+    let paths = state.store.paths();
+    for pattern in patterns {
+        if config_paths::is_protected(pattern, &paths) {
+            return true;
+        }
+    }
+    if let Some(fp) = metadata.get("filePath").and_then(Value::as_str) {
+        if config_paths::is_protected(fp, &paths) {
+            return true;
+        }
+    }
+    if let Some(files) = metadata.get("files").and_then(Value::as_array) {
+        for file in files {
+            for key in ["filePath", "movePath"] {
+                if let Some(value) = file.get(key).and_then(Value::as_str) {
+                    if config_paths::is_protected(value, &paths) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `is_protected_request` overload that consumes a pending entry's `info`
+/// shape (as published in `permission.asked`). Used by the routes layer
+/// (`saveAlwaysRules`, `allowEverything`, drain) to decide whether to
+/// downgrade or skip an entry without re-deriving the permission/patterns.
+pub(crate) fn is_protected_info(state: &AppState, info: &Value) -> bool {
+    let permission = info
+        .get("permission")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let patterns: Vec<String> = info
+        .get("patterns")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let empty = Value::Object(Default::default());
+    let metadata = info.get("metadata").unwrap_or(&empty);
+    is_protected_request(state, permission, &patterns, metadata)
+}
+
 pub(crate) fn permission_decision(input: &Value) -> Option<PermissionDecision> {
     match input.get("reply").and_then(Value::as_str)? {
         "once" | "allow" => Some(PermissionDecision::Allow),
@@ -284,6 +367,14 @@ pub(crate) fn permission_decision(input: &Value) -> Option<PermissionDecision> {
 }
 
 fn permission_ruleset(state: &AppState, sid: &str) -> Vec<PermissionRule> {
+    permission_rules_for_session(state, sid)
+}
+
+/// Public alias of `permission_ruleset`. The drain pass in
+/// `routes::permissions::permission_rules`/`allow_everything` consults the
+/// merged soft ruleset (`state.approvals` + per-session rules) when
+/// re-evaluating sibling pending entries.
+pub(crate) fn permission_rules_for_session(state: &AppState, sid: &str) -> Vec<PermissionRule> {
     let mut rules = state.approvals.lock().unwrap().clone();
     if let Some(session) = state.store.session(sid) {
         rules.extend(parse_permission_rules(session.permission.as_ref()));
@@ -292,7 +383,35 @@ fn permission_ruleset(state: &AppState, sid: &str) -> Vec<PermissionRule> {
 }
 
 fn parse_permission_rules(value: Option<&Value>) -> Vec<PermissionRule> {
-    let Some(Value::Object(map)) = value else {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    // Array form: `[{ permission, pattern, action }]` (Bun's normalized
+    // shape, also produced by `allow_everything`). Object form:
+    // `{ "edit": "allow", "bash": { "git push": "deny" } }` (legacy
+    // global config shape). Both must round-trip cleanly.
+    if let Some(items) = value.as_array() {
+        let mut rules = Vec::new();
+        for item in items {
+            let Some(permission) = item.get("permission").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(action) = item.get("action").and_then(Value::as_str) else {
+                continue;
+            };
+            rules.push(PermissionRule {
+                permission: permission.to_string(),
+                pattern: item
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .unwrap_or("*")
+                    .to_string(),
+                action: action.to_string(),
+            });
+        }
+        return rules;
+    }
+    let Some(map) = value.as_object() else {
         return Vec::new();
     };
     let mut rules = Vec::new();
@@ -398,6 +517,130 @@ fn wildcard_match(value: &str, pattern: &str) -> bool {
     pi == p.len()
 }
 
+/// Bun parity: `kilocode/permission/config-paths.ts`. Match a path
+/// (absolute or relative) against the protected config locations. Used
+/// by `is_protected_request` to gate the "Allow always" downgrade.
+pub(crate) mod config_paths {
+    use super::{FsPath, PathBuf};
+    use kilo_protocol::KiloPath;
+    use std::env;
+
+    /// Workspace-relative directory prefixes that always count as config.
+    const CONFIG_DIRS: &[&str] = &[".kilo/", ".kilocode/", ".opencode/"];
+    /// Subdirectories of the config dirs that are NOT config files (Bun's
+    /// `EXCLUDED_SUBDIRS`). Plan markdown sidecars live here.
+    const EXCLUDED_SUBDIRS: &[&str] = &["plans/"];
+    /// Root-level filenames that always count as config.
+    const CONFIG_ROOT_FILES: &[&str] = &[
+        "kilo.json",
+        "kilo.jsonc",
+        "kilocode.json",
+        "opencode.json",
+        "opencode.jsonc",
+        "AGENTS.md",
+        ".kilocoderules",
+        ".kilocodeignore",
+        ".kilocodemodes",
+    ];
+
+    fn normalize(value: &str) -> String {
+        value.replace('\\', "/")
+    }
+
+    fn excluded(remainder: &str) -> bool {
+        EXCLUDED_SUBDIRS
+            .iter()
+            .any(|sub| remainder.starts_with(sub))
+    }
+
+    /// Project-relative protection check. Mirrors Bun's
+    /// `ConfigProtection.isRelative`.
+    pub(crate) fn is_relative(pattern: &str) -> bool {
+        let normalized = normalize(pattern);
+        for dir in CONFIG_DIRS {
+            let bare = &dir[..dir.len() - 1];
+            if normalized == bare || normalized.ends_with(&format!("/{bare}")) {
+                return true;
+            }
+            if normalized.starts_with(dir) {
+                if excluded(&normalized[dir.len()..]) {
+                    continue;
+                }
+                return true;
+            }
+            if let Some(idx) = normalized.find(&format!("/{dir}")) {
+                let after = &normalized[idx + 1 + dir.len()..];
+                if excluded(after) {
+                    continue;
+                }
+                return true;
+            }
+        }
+        let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
+        if normalized == basename {
+            return CONFIG_ROOT_FILES.iter().any(|name| *name == normalized);
+        }
+        false
+    }
+
+    fn within(child: &FsPath, parent: &FsPath) -> bool {
+        let child = normalize(&child.to_string_lossy());
+        let parent = normalize(&parent.to_string_lossy());
+        if parent.is_empty() {
+            return false;
+        }
+        child == parent || child.starts_with(&format!("{parent}/"))
+    }
+
+    fn config_dirs(paths: &KiloPath) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if !paths.config.is_empty() {
+            out.push(PathBuf::from(&paths.config));
+        }
+        if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
+            let xdg = xdg.trim();
+            if !xdg.is_empty() {
+                out.push(PathBuf::from(xdg).join("kilo"));
+            }
+        }
+        // Legacy global dirs Bun calls out (`KilocodePaths.globalDirs`).
+        let home = if paths.home.is_empty() {
+            env::var("HOME")
+                .or_else(|_| env::var("USERPROFILE"))
+                .unwrap_or_default()
+        } else {
+            paths.home.clone()
+        };
+        if !home.is_empty() {
+            out.push(PathBuf::from(&home).join(".kilo"));
+            out.push(PathBuf::from(&home).join(".kilocode"));
+        }
+        out
+    }
+
+    /// Absolute-path protection check. Mirrors Bun's
+    /// `ConfigProtection.isAbsolute`.
+    pub(crate) fn is_absolute(filepath: &str, paths: &KiloPath) -> bool {
+        let target = PathBuf::from(filepath);
+        for dir in config_dirs(paths) {
+            if within(&target, &dir) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Combined entry point. Picks `is_absolute` for absolute paths,
+    /// `is_relative` otherwise. Returns `true` if the path is protected.
+    pub(crate) fn is_protected(value: &str, paths: &KiloPath) -> bool {
+        let p = FsPath::new(value);
+        if p.is_absolute() {
+            return is_absolute(value, paths);
+        }
+        is_relative(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +714,20 @@ mod tests {
     fn evaluate_permission_default_is_ask() {
         let rules: Vec<PermissionRule> = vec![];
         assert_eq!(evaluate_permission("bash", "ls", &rules).action, "ask");
+    }
+
+    #[test]
+    fn config_paths_relative_recognises_kilo_dirs_and_root_files() {
+        use super::config_paths::is_relative;
+        assert!(is_relative(".kilo/agents/x.json"));
+        assert!(is_relative(".kilocode/config.json"));
+        assert!(is_relative(".opencode/foo"));
+        assert!(is_relative("packages/sub/.kilo/foo"));
+        assert!(is_relative("AGENTS.md"));
+        assert!(is_relative("kilo.json"));
+        assert!(is_relative(".kilocoderules"));
+        assert!(!is_relative(".kilo/plans/draft.md"));
+        assert!(!is_relative("src/main.rs"));
+        assert!(!is_relative("docs/README.md"));
     }
 }

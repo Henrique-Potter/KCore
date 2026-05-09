@@ -51,6 +51,7 @@ export const Flag = {
   KILO_SERVER_PASSWORD: process.env["KILO_SERVER_PASSWORD"],
   KILO_SERVER_USERNAME: process.env["KILO_SERVER_USERNAME"],
   KILO_ENABLE_QUESTION_TOOL: truthy("KILO_ENABLE_QUESTION_TOOL"),
+  KILO_BENCH_FAKE_PROVIDER: truthy("KILO_BENCH_FAKE_PROVIDER"), // kilocode_change - deterministic Bun sidecar benchmark provider
 
   // Experimental
   KILO_EXPERIMENTAL,

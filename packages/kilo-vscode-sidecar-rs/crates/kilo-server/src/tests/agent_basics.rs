@@ -10,12 +10,13 @@ use axum::{
 use kilo_protocol::{PromptInput, SessionCreateInput};
 use serde_json::json;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::agent::fake::{fake_tool_parts, wait_fake};
 use crate::agent::turn::{ensure_prompt_supported, prompt_guarded, prompt_turn};
+use crate::routes::health::agents;
 use crate::routes::prompt::{abort_session, prompt, prompt_async};
 use crate::{FakeCall, TurnError};
 
@@ -23,6 +24,78 @@ use super::common::{
     assert_delta, assert_sync, drain, drain_no_store_mirror, response_to_value, seed, state,
     state_at, unique_root, ENV_RESOLVE_LOCK,
 };
+
+#[tokio::test]
+async fn agents_route_lists_native_kilo_agent_types() {
+    let root = unique_root();
+    let state = state_at(&root);
+
+    let body = response_to_value(agents(State(state.clone())).await.into_response()).await;
+    let items = body.as_array().expect("agent list");
+    let names = items
+        .iter()
+        .filter_map(|item| item.get("name").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+
+    assert!(names.contains(&"code"));
+    assert!(names.contains(&"plan"));
+    assert!(names.contains(&"general"));
+    assert!(names.contains(&"explore"));
+    assert!(names.contains(&"ask"));
+    let explore = items
+        .iter()
+        .find(|item| item.get("name").and_then(serde_json::Value::as_str) == Some("explore"))
+        .expect("explore agent");
+    assert!(explore
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .contains("codebases"));
+    assert_eq!(state.agent_info("build").unwrap()["mode"], "primary");
+    assert_eq!(state.agent_info("explore").unwrap()["mode"], "subagent");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn agents_route_merges_custom_agent_config() {
+    let root = unique_root();
+    let dir = root.join("config").join("kilo");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("kilo.json"),
+        serde_json::to_string(&json!({
+            "default_agent": "research",
+            "agent": {
+                "research": {
+                    "description": "Custom research mode.",
+                    "mode": "subagent",
+                    "permission": { "read": "allow", "bash": "deny" },
+                    "options": { "source": "test" }
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let state = state_at(&root);
+
+    let body = response_to_value(agents(State(state.clone())).await.into_response()).await;
+    let items = body.as_array().expect("agent list");
+    let first = items.first().expect("default first");
+    let custom = items
+        .iter()
+        .find(|item| item.get("name").and_then(serde_json::Value::as_str) == Some("research"))
+        .expect("custom agent");
+
+    assert_eq!(first["name"], "research");
+    assert_eq!(custom["mode"], "subagent");
+    assert_eq!(custom["options"]["source"], "test");
+    assert_eq!(state.agent_info("research").unwrap()["mode"], "subagent");
+    assert_eq!(state.agent_permission_rules("research").len(), 2);
+
+    let _ = std::fs::remove_dir_all(root);
+}
 
 #[tokio::test]
 async fn prompt_turn_persists_user_and_assistant_messages() {
@@ -490,6 +563,227 @@ async fn abort_route_without_active_runner_is_not_stale() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Fix H2 (revised): `fake_read` no longer hard-caps file size. The
+/// streaming implementation reads line-by-line via `BufReader`, so
+/// large files are still readable when the agent uses `offset`/`limit`
+/// to page through them — memory is bounded by the captured window,
+/// not by the file size. Generates a ~50 MB file with sequentially
+/// numbered lines and asserts that windowed reads at the head and
+/// deep into the file both succeed and return the expected line text.
+#[tokio::test]
+async fn fake_read_streams_window_from_large_file() {
+    use crate::agent::tools::fs::fake_read_cancel;
+    use std::io::{BufWriter, Write};
+
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let dir = PathBuf::from(state.store.paths().directory);
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("big.log");
+    // ~45 MB on disk: 5,500,000 lines of `<n>\n` averaging ~8 bytes
+    // each. The deep-window assertion needs at least `offset + limit
+    // = 5_000_010` lines.
+    {
+        let f = std::fs::File::create(&target).unwrap();
+        let mut w = BufWriter::with_capacity(1 << 20, f);
+        for i in 1..=5_500_000usize {
+            writeln!(w, "{i}").unwrap();
+        }
+        w.flush().unwrap();
+    }
+
+    // Head window. Streaming means we only allocate ~10 line strings
+    // plus the line buffer — orders of magnitude less than the legacy
+    // whole-file `String::from_utf8_lossy(&bytes).lines().collect()`.
+    let started = Instant::now();
+    let head = fake_read_cancel(&dir, &json!({ "filePath": "big.log", "limit": 10 }), None)
+        .expect("head window must succeed");
+    let head_elapsed = started.elapsed();
+    let head_output = head.1.as_str();
+    assert!(
+        head_output.contains("\n1: 1\n"),
+        "head window must include line 1, got:\n{head_output}"
+    );
+    assert!(
+        head_output.contains("\n10: 10\n"),
+        "head window must include line 10, got tail:\n{}",
+        &head_output[head_output.len().saturating_sub(200)..]
+    );
+    assert_eq!(head.2["truncated"], true);
+
+    // Deep window. The legacy implementation would have allocated the
+    // entire ~45 MB file into a `String` before slicing. With
+    // streaming, memory stays bounded by the captured window plus
+    // one reused line buffer; runtime is `offset + limit` line reads.
+    let started_deep = Instant::now();
+    let deep = fake_read_cancel(
+        &dir,
+        &json!({ "filePath": "big.log", "offset": 5_000_000, "limit": 10 }),
+        None,
+    )
+    .expect("deep window must succeed");
+    let deep_elapsed = started_deep.elapsed();
+    let deep_output = deep.1.as_str();
+    assert!(
+        deep_output.contains("\n5000000: 5000000\n"),
+        "deep window must include line 5,000,000"
+    );
+    assert!(
+        deep_output.contains("\n5000009: 5000009\n"),
+        "deep window must include line 5,000,009"
+    );
+    assert_eq!(deep.2["truncated"], true);
+
+    // Both reads should be bounded-time. The head is essentially
+    // free; the deep read is `offset` line decodes. 30 seconds is
+    // generous for cold-cache disk on Windows but tight enough to
+    // flag a regression that re-introduces whole-file loading.
+    assert!(
+        head_elapsed < Duration::from_secs(2),
+        "head streaming window took {head_elapsed:?}"
+    );
+    assert!(
+        deep_elapsed < Duration::from_secs(30),
+        "deep streaming window took {deep_elapsed:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Fix H2: walk + collect_text_matches now observe a passed cancel
+/// atomic between files / between matched lines. A grep over many
+/// files with a tripped cancel must terminate promptly with the
+/// cancellation error.
+#[tokio::test]
+async fn fake_grep_observes_cancel_between_walked_files() {
+    use crate::agent::tools::fs::fake_grep_cancel;
+
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let dir = PathBuf::from(state.store.paths().directory);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Generate enough files that the walk has work to do. The cancel
+    // check fires before each file's read; with cancel pre-set, the
+    // walk drains immediately and grep returns aborted.
+    for i in 0..200 {
+        std::fs::write(
+            dir.join(format!("file_{i}.txt")),
+            format!("needle on line {i}\n"),
+        )
+        .unwrap();
+    }
+    let cancel = AtomicBool::new(true); // pre-tripped
+    let started = Instant::now();
+    let res = fake_grep_cancel(&dir, &json!({ "pattern": "needle" }), Some(&cancel));
+    let err = res.expect_err("pre-tripped cancel must short-circuit grep");
+    assert_eq!(err, "Tool call aborted");
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "grep with pre-tripped cancel took {:?}",
+        started.elapsed()
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn prompt_async_installs_abort_handle_and_abort_session_preempts_spawned_task() {
+    // Fix C1: `abort_session` flips `runner.cancel`, but a spawned task
+    // suspended on a non-cooperative `.await` won't see it. The fix
+    // installs `task.abort_handle()` on the runner so abort can preempt
+    // the future. This test exercises the install + abort path.
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("create session");
+
+    // 60s fake delay — long enough that a missing abort would let the
+    // test sit on `wait_fake`. The cancel race in `wait_fake` would
+    // also bail, but the assertion below targets the abort handle
+    // itself, not the cooperative path.
+    let res = prompt_async(
+        State(state.clone()),
+        Path(session.id.clone()),
+        Json(PromptInput {
+            parts: vec![json!({ "type": "text", "text": "stuck" })],
+            provider: Some(json!({ "fake": true, "fakeDelayMs": 60000 })),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    // Wait until the runner exists and has its abort handle installed.
+    let mut installed = false;
+    for _ in 0..50 {
+        if let Some(runner) = state.runners.lock().unwrap().get(&session.id) {
+            if runner.abort.lock().unwrap().is_some() {
+                installed = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(installed, "abort handle must be installed on the runner");
+
+    let res = abort_session(State(state.clone()), Path(session.id.clone())).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Runner must drop quickly. Tolerance: ~1s.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(1) {
+        if state.runners.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        state.runners.lock().unwrap().is_empty(),
+        "abort_session must clear the runner within 1s"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn abort_session_from_task_child_cancels_parent_runner_too() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let parent = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("parent session");
+    let child = state
+        .store
+        .create_session(SessionCreateInput {
+            parent_id: Some(parent.id.clone()),
+            ..Default::default()
+        })
+        .expect("child session");
+    let run = crate::agent::turn::start_runner(state.clone(), &parent.id).unwrap();
+    let sub = crate::agent::turn::start_runner_with_parent(
+        state.clone(),
+        &child.id,
+        Some(parent.id.clone()),
+    )
+    .unwrap();
+
+    let res = abort_session(State(state.clone()), Path(child.id.clone())).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(run.cancel.load(Ordering::SeqCst));
+    assert!(sub.cancel.load(Ordering::SeqCst));
+
+    drop(sub);
+    drop(run);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn prompt_async_returns_no_content_and_persists_transcript() {
     let root = unique_root();
@@ -656,7 +950,6 @@ async fn fake_tool_calls_run_in_parallel_and_return_input_order() {
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join("a.txt"), "a\n").unwrap();
     std::fs::write(repo.join("b.txt"), "b\n").unwrap();
-    let root = PathBuf::from(state.store.paths().directory);
     let cancel = Arc::new(AtomicBool::new(false));
     let start = Instant::now();
     wait_fake(DELAY, &cancel).await;
@@ -664,7 +957,8 @@ async fn fake_tool_calls_run_in_parallel_and_return_input_order() {
     let serial = start.elapsed();
     let start = Instant::now();
     let parts = fake_tool_parts(
-        root.clone(),
+        state.clone(),
+        "sid_parallel".to_string(),
         "msg_parallel".to_string(),
         "prt_parallel".to_string(),
         vec![
@@ -683,6 +977,7 @@ async fn fake_tool_calls_run_in_parallel_and_return_input_order() {
         ],
         1,
         Arc::new(AtomicBool::new(false)),
+        None,
     )
     .await;
     let elapsed = start.elapsed();

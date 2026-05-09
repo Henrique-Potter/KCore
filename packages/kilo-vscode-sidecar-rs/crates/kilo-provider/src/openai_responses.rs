@@ -85,6 +85,9 @@ pub fn classify_event(
 ) -> Option<ResponsesStreamPart> {
     match event {
         StreamEvent::TextDelta(delta) => Some(ResponsesStreamPart::TextDelta(delta)),
+        StreamEvent::ReasoningStart { .. }
+        | StreamEvent::ReasoningDelta { .. }
+        | StreamEvent::ReasoningEnd { .. } => None,
         StreamEvent::ToolDelta {
             id,
             name: Some(name),

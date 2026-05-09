@@ -20,8 +20,8 @@ use crate::agent::parts::{
 };
 use crate::agent::turn::start_runner;
 use crate::routes::permissions::{
-    permission_list, permission_rules, question_list, reject_question, reply_permission,
-    reply_question,
+    accept_suggestion, allow_everything, permission_list, permission_rules, question_list,
+    reject_question, reply_permission, reply_question, suggestion_list,
 };
 use crate::routes::prompt::abort_session;
 
@@ -351,6 +351,85 @@ async fn abort_session_rejects_pending_prompts_for_child_sessions() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Fix H1: `task` subagent dispatch previously didn't re-check cancel
+/// after the user approved permission. With the fix, a Stop press
+/// during the "Allow subagent?" prompt produces an aborted tool part
+/// instead of spawning a child session. We trigger the permission ask
+/// for `task`, set cancel, then reply allow, and assert: tool part is
+/// `error` with `Tool call aborted` and no child session was created.
+#[tokio::test]
+async fn task_subagent_cancel_after_permission_approve_skips_child_spawn() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+    let repo = PathBuf::from(state.store.paths().directory);
+    let call = ChatToolCall {
+        id: "call_task_cancel".to_string(),
+        name: "task".to_string(),
+        input: json!({
+            "description": "summarize",
+            "prompt": "summarize the code",
+            "subagent_type": "general"
+        }),
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_handle = cancel.clone();
+    let got = state.clone();
+    let dir = repo.clone();
+    let sid = session.id.clone();
+    let req = call.clone();
+    let task = tokio::spawn(async move {
+        real_tool_part(
+            &got,
+            &dir,
+            &sid,
+            "msg_task_cancel",
+            "prt_task_cancel",
+            0,
+            &req,
+            1,
+            cancel_handle,
+            None,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let pending = permission_list(&state);
+    assert_eq!(pending.len(), 1, "permission ask must be pending");
+    let id = pending[0]["id"].as_str().unwrap().to_string();
+
+    // Trip cancel BEFORE replying. The reply unblocks the await, but the
+    // post-permission re-check must see the flag and short-circuit.
+    cancel.store(true, Ordering::SeqCst);
+    let res = reply_permission(
+        State(state.clone()),
+        Path(id),
+        Json(json!({ "reply": "once" })),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let part = task.await.unwrap();
+    assert_eq!(part["type"], "tool");
+    assert_eq!(part["tool"], "task");
+    assert_eq!(part["state"]["status"], "error");
+    assert_eq!(part["state"]["error"], "Tool call aborted");
+
+    // No child session must have been created — task tool short-circuited
+    // before `execute_task_tool` ran.
+    let children = state.store.children(&session.id).unwrap_or_default();
+    assert!(
+        children.is_empty(),
+        "no child session must be created when cancel races permission approve"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn mutating_tool_accept_reject_parts_keep_structured_shapes() {
     let root = unique_root();
@@ -406,6 +485,7 @@ async fn mutating_tool_accept_reject_parts_keep_structured_shapes() {
         "write",
         &blocked,
         1,
+        &AtomicBool::new(false),
     );
     assert_eq!(err["state"]["status"], "error");
     assert_eq!(err["state"]["metadata"]["error"]["name"], "PathError");
@@ -591,7 +671,13 @@ fn real_tools_only_advertises_mutating_tools_when_gate_active() {
         names,
         vec![
             "read",
+            "glob",
             "grep",
+            "webfetch",
+            "todowrite",
+            "skill",
+            "suggest",
+            "lsp",
             "task",
             "question",
             "write",
@@ -600,6 +686,298 @@ fn real_tools_only_advertises_mutating_tools_when_gate_active() {
             "bash"
         ]
     );
+}
+
+#[tokio::test]
+async fn todowrite_tool_persists_todos_and_publishes_update() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput {
+            permission: Some(json!({ "todowrite": "allow" })),
+            ..Default::default()
+        })
+        .unwrap();
+    let call = ChatToolCall {
+        id: "call_todo".to_string(),
+        name: "todowrite".to_string(),
+        input: json!({
+            "todos": [
+                { "content": "map", "status": "completed", "priority": "high" },
+                { "content": "ship", "status": "in_progress", "priority": "medium" }
+            ]
+        }),
+    };
+    let mut bus = state.bus.subscribe();
+
+    let part = real_tool_part(
+        &state,
+        std::path::Path::new(&state.store.paths().directory),
+        &session.id,
+        "msg_todo",
+        "prt_todo",
+        0,
+        &call,
+        1,
+        Arc::new(AtomicBool::new(false)),
+        None,
+    )
+    .await;
+
+    assert_eq!(part["tool"], "todowrite");
+    assert_eq!(part["state"]["status"], "completed");
+    assert_eq!(part["state"]["metadata"]["todos"][1]["content"], "ship");
+    assert_eq!(
+        state.store.todos(&session.id).unwrap()[1]["status"],
+        "in_progress"
+    );
+    let event = bus.try_recv().unwrap().as_global();
+    assert_eq!(event.payload.kind, "todo.updated");
+    assert_eq!(event.payload.properties["sessionID"], session.id);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn lsp_tool_returns_document_symbols_without_lsp_server() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let repo = PathBuf::from(state.store.paths().directory);
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("src").join("main.rs"),
+        "pub fn helper() {}\nstruct HelperState;\n",
+    )
+    .unwrap();
+    let session = state
+        .store
+        .create_session(SessionCreateInput {
+            permission: Some(json!({ "lsp": "allow" })),
+            ..Default::default()
+        })
+        .unwrap();
+    let call = ChatToolCall {
+        id: "call_lsp".to_string(),
+        name: "lsp".to_string(),
+        input: json!({
+            "operation": "documentSymbol",
+            "filePath": "src/main.rs",
+            "line": 1,
+            "character": 1,
+        }),
+    };
+
+    let part = real_tool_part(
+        &state,
+        &repo,
+        &session.id,
+        "msg_lsp",
+        "prt_lsp",
+        0,
+        &call,
+        1,
+        Arc::new(AtomicBool::new(false)),
+        None,
+    )
+    .await;
+
+    assert_eq!(part["tool"], "lsp");
+    assert_eq!(part["state"]["status"], "completed");
+    assert_eq!(part["state"]["metadata"]["result"][0]["name"], "helper");
+    assert_eq!(
+        part["state"]["metadata"]["result"][0]["path"],
+        "src/main.rs"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn lsp_tool_reports_unavailable_server_for_position_queries() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let repo = PathBuf::from(state.store.paths().directory);
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("main.rs"), "fn main() {}\n").unwrap();
+    let session = state
+        .store
+        .create_session(SessionCreateInput {
+            permission: Some(json!({ "lsp": "allow" })),
+            ..Default::default()
+        })
+        .unwrap();
+    let call = ChatToolCall {
+        id: "call_lsp_hover".to_string(),
+        name: "lsp".to_string(),
+        input: json!({
+            "operation": "hover",
+            "filePath": "main.rs",
+            "line": 1,
+            "character": 4,
+        }),
+    };
+
+    let part = real_tool_part(
+        &state,
+        &repo,
+        &session.id,
+        "msg_lsp_hover",
+        "prt_lsp_hover",
+        0,
+        &call,
+        1,
+        Arc::new(AtomicBool::new(false)),
+        None,
+    )
+    .await;
+
+    assert_eq!(part["tool"], "lsp");
+    assert_eq!(part["state"]["status"], "error");
+    assert!(part["state"]["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("No LSP server available"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn suggest_tool_waits_for_accept_and_returns_prompt() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+    let repo = PathBuf::from(state.store.paths().directory);
+    let call = ChatToolCall {
+        id: "call_suggest".to_string(),
+        name: "suggest".to_string(),
+        input: json!({
+            "suggest": "Review these changes?",
+            "actions": [{
+                "label": "Review",
+                "description": "Run local review",
+                "prompt": "/local-review-uncommitted"
+            }]
+        }),
+    };
+    let mut bus = state.bus.subscribe();
+    let got = state.clone();
+    let sid = session.id.clone();
+    let req = call.clone();
+    let task = tokio::spawn(async move {
+        real_tool_part(
+            &got,
+            &repo,
+            &sid,
+            "msg_suggest",
+            "prt_suggest",
+            0,
+            &req,
+            1,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+    });
+
+    for _ in 0..50 {
+        if !suggestion_list(&state).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let pending = suggestion_list(&state);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0]["id"], "suggestion_msg_suggest_prt_suggest_0");
+    assert_eq!(pending[0]["blocking"], false);
+    assert_eq!(pending[0]["tool"]["callID"], "call_suggest");
+    let shown = bus.try_recv().unwrap().as_global();
+    assert_eq!(shown.payload.kind, "suggestion.shown");
+    assert_eq!(shown.payload.properties["text"], "Review these changes?");
+    let idle = bus.try_recv().unwrap().as_global();
+    assert_eq!(idle.payload.kind, "session.status");
+
+    let res = accept_suggestion(
+        State(state.clone()),
+        Path("suggestion_msg_suggest_prt_suggest_0".to_string()),
+        Json(json!({ "index": 0 })),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let accepted = bus.try_recv().unwrap().as_global();
+    assert_eq!(accepted.payload.kind, "session.idle");
+    let accepted = bus.try_recv().unwrap().as_global();
+    assert_eq!(accepted.payload.kind, "suggestion.accepted");
+    let part = task.await.unwrap();
+    assert_eq!(part["tool"], "suggest");
+    assert_eq!(part["state"]["status"], "completed");
+    assert_eq!(part["state"]["metadata"]["accepted"]["label"], "Review");
+    assert!(part["state"]["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("/local-review-uncommitted"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn skill_tool_loads_discovered_skill_content() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let repo = PathBuf::from(state.store.paths().directory);
+    let dir = repo.join(".kilo").join("skills").join("focus");
+    std::fs::create_dir_all(dir.join("scripts")).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: focus\ndescription: Focus workflow\n---\nUse focused steps.",
+    )
+    .unwrap();
+    std::fs::write(dir.join("scripts").join("run.ps1"), "Write-Output ok").unwrap();
+    let session = state
+        .store
+        .create_session(SessionCreateInput {
+            permission: Some(json!({ "skill": { "focus": "allow" } })),
+            ..Default::default()
+        })
+        .unwrap();
+    let call = ChatToolCall {
+        id: "call_skill".to_string(),
+        name: "skill".to_string(),
+        input: json!({ "name": "focus" }),
+    };
+
+    let part = real_tool_part(
+        &state,
+        &repo,
+        &session.id,
+        "msg_skill",
+        "prt_skill",
+        0,
+        &call,
+        1,
+        Arc::new(AtomicBool::new(false)),
+        None,
+    )
+    .await;
+
+    assert_eq!(part["tool"], "skill");
+    assert_eq!(part["state"]["status"], "completed");
+    let output = part["state"]["output"].as_str().unwrap_or_default();
+    assert!(output.contains("<skill_content name=\"focus\">"));
+    assert!(output.contains("Use focused steps."));
+    assert!(output.contains("<skill_files>"));
+    assert!(output.contains("run.ps1"));
+    assert_eq!(part["state"]["metadata"]["name"], "focus");
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 /// Regression: the VS Code extension's `client.session.promptAsync` flow
@@ -644,7 +1022,13 @@ async fn real_tools_infers_toolcall_from_provider_id_when_capabilities_absent() 
         names,
         vec![
             "read",
+            "glob",
             "grep",
+            "webfetch",
+            "todowrite",
+            "skill",
+            "suggest",
+            "lsp",
             "task",
             "question",
             "write",
@@ -677,6 +1061,7 @@ async fn real_tools_infers_toolcall_from_provider_id_when_capabilities_absent() 
         names.contains(&"task".to_string()),
         "tools map with task enabled must advertise task: {names:?}"
     );
+    assert_eq!(names, vec!["task"]);
 
     // Unknown provider doesn't trigger the inference.
     let unknown = PromptInput {
@@ -685,4 +1070,287 @@ async fn real_tools_infers_toolcall_from_provider_id_when_capabilities_absent() 
         ..Default::default()
     };
     assert!(real_tools(&state, &unknown).is_empty());
+}
+
+/// Helper: park a pending permission entry directly into state without
+/// going through the full `real_tool_part` flow. Returns the receiver so
+/// tests can assert on the resolution, and the request id used.
+fn park_pending(
+    state: &Arc<crate::AppState>,
+    id: &str,
+    sid: &str,
+    permission: &str,
+    patterns: Vec<&str>,
+    metadata: serde_json::Value,
+) -> tokio::sync::oneshot::Receiver<crate::PermissionDecision> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let info = json!({
+        "id": id,
+        "sessionID": sid,
+        "status": "pending",
+        "permission": permission,
+        "patterns": patterns,
+        "always": patterns,
+        "metadata": metadata,
+        "tool": { "messageID": "mid", "callID": "call", "name": permission },
+    });
+    state
+        .permissions
+        .lock()
+        .unwrap()
+        .insert(id.to_string(), crate::PendingPermission { info, reply: tx });
+    rx
+}
+
+/// Fix 1: `saveAlwaysRules` must drain pending sibling entries the new
+/// rule covers. Park two pending `edit` requests for the same session;
+/// reply to the first via `/always-rules` with `approvedAlways: ["*"]`.
+/// The sibling's pattern (`other.txt`) is covered by the wildcard, so it
+/// must resolve `once` and disappear from the pending map.
+#[tokio::test]
+async fn save_always_rules_drains_covered_sibling() {
+    let state = state();
+    let sid = "ses_drain";
+    let mut bus = state.bus.subscribe();
+    park_pending(
+        &state,
+        "perm_origin",
+        sid,
+        "edit",
+        vec!["origin.txt"],
+        json!({ "filePath": "origin.txt" }),
+    );
+    let sibling_rx = park_pending(
+        &state,
+        "perm_sibling",
+        sid,
+        "edit",
+        vec!["other.txt"],
+        json!({ "filePath": "other.txt" }),
+    );
+    // Drop pre-existing bus events.
+    while bus.try_recv().is_ok() {}
+
+    let res = permission_rules(
+        State(state.clone()),
+        Path("perm_origin".to_string()),
+        Json(json!({ "approvedAlways": ["*"] })),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // The sibling must have been drained as `once` (allow). Origin is
+    // intentionally left in the pending map for the UI's follow-up reply.
+    let pending = permission_list(&state);
+    let ids: Vec<&str> = pending
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["perm_origin"]);
+    assert_eq!(
+        sibling_rx.await.unwrap(),
+        crate::PermissionDecision::Allow,
+        "sibling must resolve as `once` once the wildcard rule covers it",
+    );
+
+    // A `permission.replied` for the sibling must have been published.
+    let mut saw = false;
+    while let Ok(event) = bus.try_recv() {
+        let event = event.as_global();
+        if event.payload.kind == "permission.replied"
+            && event.payload.properties["requestID"] == "perm_sibling"
+        {
+            assert_eq!(event.payload.properties["reply"], "once");
+            saw = true;
+            break;
+        }
+    }
+    assert!(saw, "drainCovered must publish permission.replied");
+}
+
+/// Fix 2: a `reject` reply must cascade to every sibling pending entry
+/// in the same session. Park three entries — two on session A, one on
+/// session B — then reject one of session A's. Both A entries must
+/// resolve to `Reject`; B must remain untouched.
+#[tokio::test]
+async fn reject_reply_cascades_across_session_siblings() {
+    let state = state();
+    let mut bus = state.bus.subscribe();
+    let rx_a1 = park_pending(
+        &state,
+        "perm_a1",
+        "ses_a",
+        "edit",
+        vec!["a1.txt"],
+        json!({ "filePath": "a1.txt" }),
+    );
+    let rx_a2 = park_pending(
+        &state,
+        "perm_a2",
+        "ses_a",
+        "edit",
+        vec!["a2.txt"],
+        json!({ "filePath": "a2.txt" }),
+    );
+    let _rx_b = park_pending(
+        &state,
+        "perm_b",
+        "ses_b",
+        "edit",
+        vec!["b.txt"],
+        json!({ "filePath": "b.txt" }),
+    );
+    while bus.try_recv().is_ok() {}
+
+    let res = reply_permission(
+        State(state.clone()),
+        Path("perm_a1".to_string()),
+        Json(json!({ "reply": "reject" })),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    assert_eq!(rx_a1.await.unwrap(), crate::PermissionDecision::Reject);
+    assert_eq!(rx_a2.await.unwrap(), crate::PermissionDecision::Reject);
+    let pending = permission_list(&state);
+    assert_eq!(pending.len(), 1, "session B's entry must remain pending");
+    assert_eq!(pending[0]["id"], "perm_b");
+
+    // Two `permission.replied` events with reply=reject expected.
+    let mut rejected = Vec::new();
+    while let Ok(event) = bus.try_recv() {
+        let event = event.as_global();
+        if event.payload.kind == "permission.replied"
+            && event.payload.properties["reply"] == "reject"
+        {
+            rejected.push(
+                event.payload.properties["requestID"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+    }
+    assert!(rejected.contains(&"perm_a1".to_string()));
+    assert!(rejected.contains(&"perm_a2".to_string()));
+    assert!(!rejected.contains(&"perm_b".to_string()));
+}
+
+/// Fix 3: `POST /permission/allow-everything` (no sessionID) appends the
+/// global wildcard rule and drains every pending entry. We park two
+/// entries on different sessions; both must resolve `once` after the
+/// route runs.
+#[tokio::test]
+async fn allow_everything_global_clears_all_pending() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let rx1 = park_pending(
+        &state,
+        "perm_a",
+        "ses_x",
+        "edit",
+        vec!["x.txt"],
+        json!({ "filePath": "x.txt" }),
+    );
+    let rx2 = park_pending(
+        &state,
+        "perm_b",
+        "ses_y",
+        "bash",
+        vec!["ls"],
+        json!({ "command": "ls" }),
+    );
+
+    let res = allow_everything(State(state.clone()), Json(json!({ "enable": true }))).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    assert!(permission_list(&state).is_empty());
+    assert_eq!(rx1.await.unwrap(), crate::PermissionDecision::Allow);
+    assert_eq!(rx2.await.unwrap(), crate::PermissionDecision::Allow);
+
+    // The wildcard rule must now be visible in approvals.
+    let approvals = state.approvals.lock().unwrap().clone();
+    assert!(approvals
+        .iter()
+        .any(|r| r.permission == "*" && r.pattern == "*" && r.action == "allow"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Fix 4: editing a path inside `.kilo/` must downgrade the user's
+/// "always" choice to a one-shot allow — no rule may be persisted, and
+/// the metadata must carry the `disableAlways: true` UI hint.
+#[tokio::test]
+async fn config_path_downgrades_always_to_once() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+    let repo = PathBuf::from(state.store.paths().directory);
+    std::fs::create_dir_all(repo.join(".kilo/agents")).unwrap();
+    let call = ChatToolCall {
+        id: "call_kilo_edit".to_string(),
+        name: "write".to_string(),
+        input: json!({ "filePath": ".kilo/agents/x.json", "content": "{}\n" }),
+    };
+    let got = state.clone();
+    let dir = repo.clone();
+    let sid = session.id.clone();
+    let req = call.clone();
+    let task = tokio::spawn(async move {
+        real_tool_part(
+            &got,
+            &dir,
+            &sid,
+            "msg_kilo_edit",
+            "prt_kilo_edit",
+            0,
+            &req,
+            1,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .await
+    });
+
+    // Wait for the permission ask.
+    for _ in 0..50 {
+        if !permission_list(&state).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let pending = permission_list(&state);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0]["metadata"]["disableAlways"], true,
+        "protected requests must mark `disableAlways` so the UI hides Allow always",
+    );
+    let id = pending[0]["id"].as_str().unwrap().to_string();
+
+    // User clicks "Allow always" — must be downgraded to once: tool
+    // succeeds, but no permission rule is persisted.
+    let res = reply_permission(
+        State(state.clone()),
+        Path(id),
+        Json(json!({ "reply": "always" })),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let part = task.await.unwrap();
+    assert_eq!(part["state"]["status"], "completed");
+
+    let approvals = state.approvals.lock().unwrap().clone();
+    assert!(
+        approvals.is_empty(),
+        "always→once on protected paths must NOT persist a rule, got {approvals:?}",
+    );
+    let persisted = state.store.permission_rules();
+    assert!(persisted.is_empty(), "disk persistence must also be empty");
+
+    let _ = std::fs::remove_dir_all(root);
 }

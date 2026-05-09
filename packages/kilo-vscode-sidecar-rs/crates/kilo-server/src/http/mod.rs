@@ -27,27 +27,30 @@ use crate::routes::{
         clear_auth, config, config_providers, oauth_authorize, oauth_callback, provider_auth,
         provider_detail, providers, set_auth, update_config,
     },
+    enhance::enhance_prompt,
     files::{file_content, file_status, find_file, find_symbol, find_text, list_file},
     health::{
         agents, global_dispose, health, instance_dispose, paths, project, remote_status, status,
         warnings,
     },
+    indexing::indexing_status,
     mcp::{
         mcp_add, mcp_auth, mcp_call_tool, mcp_connect, mcp_disconnect, mcp_oauth_authorize,
         mcp_oauth_callback, mcp_status,
     },
     messages::{delete_message, delete_part, message, messages, update_part},
+    network::{network_waits, reject_network_wait, reply_network_wait},
     permissions::{
-        accept_suggestion, dismiss_suggestion, permission_rules, permissions, questions,
-        reject_question, reply_permission, reply_question, suggestions,
+        accept_suggestion, allow_everything, dismiss_suggestion, permission_rules, permissions,
+        questions, reject_question, reply_permission, reply_question, suggestions,
     },
-    prompt::{abort_session, prompt, prompt_async},
+    prompt::{abort_session, command, prompt, prompt_async},
     pty::{pty_create, pty_delete, pty_update},
     registry::{commands, skills},
     sessions::{
         append_message, children, create_session, delete_session, diff_session, fork_session,
-        revert_session, session, sessions, share_session, summarize_session, unrevert_session,
-        unshare_session, update_session, viewed,
+        revert_session, session, sessions, share_session, summarize_session, todos,
+        unrevert_session, unshare_session, update_session, viewed,
     },
     worktree::{
         create_worktree, delete_worktree, reset_worktree, worktree_diff, worktree_diff_file,
@@ -72,6 +75,7 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
         .route("/path", get(paths))
         .route("/config", get(config))
         .route("/global/config", get(config).patch(update_config))
+        .route("/enhance-prompt", post(enhance_prompt))
         .route("/config/providers", get(config_providers))
         .route("/config/warnings", get(warnings))
         .route("/provider", get(providers))
@@ -98,6 +102,7 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
             get(session).patch(update_session).delete(delete_session),
         )
         .route("/session/{id}/children", get(children))
+        .route("/session/{id}/todo", get(todos))
         .route("/session/{id}/fork", post(fork_session))
         .route("/session/{id}/diff", get(diff_session))
         .route(
@@ -108,6 +113,7 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
         .route("/session/{id}/revert", post(revert_session))
         .route("/session/{id}/unrevert", post(unrevert_session))
         .route("/session/{id}/message", get(messages).post(prompt))
+        .route("/session/{id}/command", post(command))
         .route(
             "/session/{id}/message/{message_id}",
             get(message).delete(delete_message),
@@ -127,11 +133,15 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
         .route("/mcp/{name}/disconnect", post(mcp_disconnect))
         .route("/mcp/{name}/tool", post(mcp_call_tool))
         .route("/permission", get(permissions))
+        .route("/permission/allow-everything", post(allow_everything))
         .route("/permission/{id}/reply", post(reply_permission))
         .route("/permission/{id}/always-rules", post(permission_rules))
         .route("/question", get(questions))
         .route("/question/{id}/reply", post(reply_question))
         .route("/question/{id}/reject", post(reject_question))
+        .route("/network", get(network_waits))
+        .route("/network/{id}/reply", post(reply_network_wait))
+        .route("/network/{id}/reject", post(reject_network_wait))
         .route("/find", get(find_text))
         .route("/find/file", get(find_file))
         .route("/find/symbol", get(find_symbol))
@@ -155,6 +165,7 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
         .route("/suggestion/{id}/accept", post(accept_suggestion))
         .route("/suggestion/{id}/dismiss", post(dismiss_suggestion))
         .route("/remote/status", get(remote_status))
+        .route("/indexing/status", get(indexing_status))
         .route("/remote/enable", post(remote_enable))
         .route("/remote/disable", post(remote_disable))
         .route("/commit-message", post(commit_message))

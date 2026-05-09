@@ -1,6 +1,6 @@
-# Build Rust sidecar
-cd packages/kilo-vscode-sidecar-rs
-cargo build -p kilo-vscode-sidecar --release
-cd D:\Projects\kilocode\packages\kilo-vscode
-bun install
+cd .\packages\kilo-vscode-sidecar-rs
+cargo build --release -p kilo-vscode-sidecar
+cd ..\kilo-vscode
+bun run prepare:sidecar -- --force
 bun run package
+bunx vsce package --no-dependencies --skip-license -o kilo-code-latest.vsix

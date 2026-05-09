@@ -24,9 +24,10 @@ must remain on Bun until it is added intentionally.
 | Path | 1 | - | model-state worktree resolution |
 | Project | 0 | - | (unused by VS Code today) |
 | Provider | 2 | - | provider list and auth methods |
-| Session | 13 | 1 (prompt) | chat, agent manager |
-| Permission | 2 | - | tool permission UX |
+| Session | 15 | 1 (prompt) | chat, agent manager |
+| Permission | 3 | - | tool permission UX |
 | Question | 3 | - | inline question UX |
+| Network | 3 | - | settings-save prompt drain |
 | Suggestion | 3 | - | suggestion UX |
 | Find | 1 | - | file search |
 | Mcp | 4 | - | MCP toggling, browser tool |
@@ -35,12 +36,13 @@ must remain on Bun until it is added intentionally.
 | Instance | 1 | - | org switch, dispose |
 | Remote | 3 | - | RemoteStatusService |
 | CommitMessage | 1 | - | commit-message gen |
+| EnhancePrompt | 1 | - | prompt enhancement |
 | Kilo | 6 | 1 (FIM) | profile, FIM, cloud sessions |
 | Kilocode | 6 | - | skill/agent/sessionImport |
 
 That is the full surface. **No** route under `/tui/*`, `/experimental/*` (other
 than the ones listed below), `/event` (CLI command stream), `/file/*`,
-`/lsp/*`, `/formatter/*`, `/network/*`, `/sync/*`, `/vcs/*`, `/log`,
+`/lsp/*`, `/formatter/*`, `/sync/*`, `/vcs/*`, `/log`,
 `/agent`, `/skill`, `/telemetry/*` is touched by the extension. They remain
 Bun-only.
 
@@ -112,6 +114,7 @@ query (or `x-kilo-directory` header).
 | PATCH | `/session/{sessionID}` | `{ title? }` | `Session` | `KiloProvider.ts:1541` |
 | DELETE | `/session/{sessionID}` | - | `void` | `KiloProvider.ts:1509` |
 | GET | `/session/{sessionID}/message` | - | `Message[]` | `kilo-provider/message-page.ts:34` |
+| GET | `/session/{sessionID}/todo` | - | `Todo[]` | Session todo state / Agent Manager task view |
 | POST | `/session/{sessionID}/fork` | `{ messageID? }` | `Session` | `agent-manager/fork-session.ts:47`; `agent-manager/continue-in-worktree.ts:84` |
 | POST | `/session/{sessionID}/abort` | - | `void` | `kilo-provider/abort.ts:4`; `agent-manager/continue-in-worktree.ts:31` |
 | POST | `/session/{sessionID}/summarize` | `{ providerID, modelID }` | `void` | `KiloProvider.ts:2640` |
@@ -125,6 +128,7 @@ query (or `x-kilo-directory` header).
 | M | Path | Body | Resp | Call sites |
 |---|---|---|---|---|
 | GET | `/permission` | - | `PermissionRequest[]` | `commands/toggle-auto-approve.ts:64`; `services/cli-backend/connection-service.ts:394`; `kilo-provider/handlers/permission-handler.ts:130` |
+| POST | `/permission/allow-everything` | - | `void` | `PermissionDock.tsx` global allow action |
 | POST | `/permission/{requestID}/reply` | `{ reply }` | `void` | `commands/toggle-auto-approve.ts:67,85`; `connection-service.ts:398` |
 
 ### Question
@@ -134,6 +138,19 @@ query (or `x-kilo-directory` header).
 | GET | `/question` | - | `QuestionRequest[]` | `kilo-provider/handlers/question.ts:32`; `connection-service.ts:402` |
 | POST | `/question/{requestID}/reply` | `{ value }` | `void` | `kilo-provider/handlers/question.ts:70` |
 | POST | `/question/{requestID}/reject` | - | `void` | `kilo-provider/handlers/question.ts:96`; `connection-service.ts:406` |
+
+### Network
+
+| M | Path | Body | Resp | Call sites |
+|---|---|---|---|---|
+| GET | `/network` | - | `SessionNetworkWait[]` | `services/cli-backend/connection-service.ts:50` |
+| POST | `/network/{requestID}/reply` | - | `boolean` | `kilo-provider/network.ts:36` |
+| POST | `/network/{requestID}/reject` | - | `boolean` | `services/cli-backend/connection-service.ts:54` |
+
+Rust currently does not pause turns on offline-network waits, so `GET /network`
+returns an empty list and reply/reject for unknown waits return `404`. This is
+still part of the VS Code contract because config save drains pending network
+waits before applying settings.
 
 ### Suggestion
 
@@ -221,12 +238,13 @@ Rust sidecar:
 | Route family | Rust preview behavior |
 |---|---|
 | `/remote/enable`, `/remote/disable`, `/remote/status` | Return `{ enabled: false, connected: false }`; no cloud websocket is started. |
-| `/commit-message` | Returns a deterministic local fallback message. |
+| `/commit-message` | Uses the configured small OpenAI model when available and falls back to a deterministic local message. |
 | `/kilo/profile`, `/kilo/organization` | Return an anonymous profile shape and acknowledge org selection without contacting Kilo Gateway. |
 | `/kilo/fim` | Returns a one-frame empty SSE completion so autocomplete callers do not fail on 404. |
 | `/kilo/cloud-sessions`, `/kilo/cloud/session/*` | Return empty/null local fallback shapes; cloud import is acknowledged as not imported. |
+| `/indexing/status` | Raw-fetch compatibility handler for the VS Code status panel; returns a disabled `IndexingStatus` shape while Rust indexing is out of scope. |
 | `/kilocode/session-import/*` | Persist legacy project/session/message/part payloads into the local SQLite store with row-preserving IDs and idempotent non-forced session skips. |
-| `/kilocode/skill/remove`, `/kilocode/agent/remove` | Return `true` without deleting local files. |
+| `/kilocode/skill/remove`, `/kilocode/agent/remove` | Delete matching local registry files and return `true`; missing entries return 404. |
 
 These compatibility handlers are intentionally narrow: they prevent unrelated
 Rust chat/runtime flows from breaking on extension background calls, but they do
@@ -267,6 +285,12 @@ FIM, or skill/agent filesystem-removal behavior.
 | M | Path | Body | Resp | Call sites |
 |---|---|---|---|---|
 | POST | `/commit-message` | `{ diff, ... }` | `{ message }` | `services/commit-message/index.ts:88` |
+
+### EnhancePrompt
+
+| M | Path | Body | Resp | Call sites |
+|---|---|---|---|---|
+| POST | `/enhance-prompt` | `{ text }` | `{ text }` | `KiloProvider.ts:891` |
 
 ### Kilo (Kilo Cloud / FIM)
 
@@ -327,7 +351,7 @@ The extension never invokes:
 - Most of `/experimental/*` (only `/experimental/worktree/diff*` is used).
 - `/event` (CLI command bus â€” different stream from `/global/event`).
 - `/file`, `/file/content`, `/file/status`.
-- `/lsp`, `/formatter`, `/network/*`.
+- `/lsp`, `/formatter`.
 - `/sync/*`, `/vcs`, `/vcs/diff`.
 - `/log`, `/agent`, `/skill` (top-level â€” used by the CLI, not the extension).
 - `/telemetry/capture`.

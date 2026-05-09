@@ -11,6 +11,29 @@ function load<A>(dir: string, fn: (svc: Agent.Interface) => Effect.Effect<A>) {
 }
 
 describe("session.system", () => {
+  test("environment marks project config files as optional", async () => {
+    await using tmp = await tmpdir({ git: true })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const run = Effect.gen(function* () {
+          const svc = yield* SystemPrompt.Service
+          return svc.environment({
+            providerID: "openai",
+            api: { id: "gpt-test" },
+          } as any)[0]
+        }).pipe(Effect.provide(SystemPrompt.defaultLayer))
+
+        const env = await Effect.runPromise(run)
+
+        expect(env).toContain("Optional project config:")
+        expect(env).toContain("Do not assume optional config files exist")
+        expect(env).toContain("list/glob before reading them")
+      },
+    })
+  })
+
   test("skills output is sorted by name and stable across calls", async () => {
     await using tmp = await tmpdir({
       git: true,

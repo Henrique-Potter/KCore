@@ -216,6 +216,23 @@ pub struct PromptInput {
     pub editor_context: Option<Value>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct CommandInput {
+    #[serde(rename = "messageID", default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub arguments: String,
+    pub command: String,
+    #[serde(default)]
+    pub variant: Option<String>,
+    #[serde(default)]
+    pub parts: Vec<Value>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct MessageAppendResult {
     pub info: Value,

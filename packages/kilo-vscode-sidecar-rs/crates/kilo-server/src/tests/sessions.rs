@@ -18,12 +18,13 @@ use crate::routes::messages::{delete_message, delete_part, message, update_part}
 use crate::routes::permissions::{accept_suggestion, dismiss_suggestion, suggestion_list};
 use crate::routes::sessions::{
     children, diff_session, fork_session, revert_session, set_viewed, share_session,
-    summarize_session, unrevert_session, unshare_session, update_session, viewed_snapshot,
+    summarize_session, todos, unrevert_session, unshare_session, update_session, viewed_snapshot,
 };
 use crate::{PendingSuggestion, SuggestionDecision};
 
 use super::common::{
-    assert_sync, drain_no_store_mirror, recv_sync, seed, state, state_at, unique_root,
+    assert_sync, drain_no_store_mirror, recv_sync, response_to_value, seed, state, state_at,
+    unique_root,
 };
 
 #[tokio::test]
@@ -60,6 +61,39 @@ async fn update_session_route_persists_permission_and_archived_time() {
         json!({ "edit": "allow" })
     );
     assert_eq!(event.payload.properties["info"]["time"]["archived"], 123);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn todo_route_returns_session_todos() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("create session");
+    state
+        .store
+        .update_todos(
+            &session.id,
+            &[json!({
+                "content": "ship",
+                "status": "pending",
+                "priority": "high"
+            })],
+        )
+        .unwrap();
+
+    let body = response_to_value(todos(State(state.clone()), Path(session.id.clone())).await).await;
+    assert_eq!(body[0]["content"], "ship");
+    assert_eq!(
+        todos(State(state), Path("missing".to_string()))
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
 
     let _ = std::fs::remove_dir_all(root);
 }

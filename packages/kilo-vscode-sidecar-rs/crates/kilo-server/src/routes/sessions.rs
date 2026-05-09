@@ -105,6 +105,13 @@ pub(crate) async fn children(
     }
 }
 
+pub(crate) async fn todos(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    match state.store.todos(&id) {
+        Some(items) => Json(items).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 pub(crate) async fn fork_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,

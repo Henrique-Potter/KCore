@@ -5,8 +5,211 @@ mod rust_harness;
 
 use kilo_oracle::benchmark::{BenchmarkReport, BenchmarkThresholds, GateMetric};
 use kilo_oracle::sse::{SseRecorder, StopCondition};
+use kilo_oracle::{OracleClient, SidecarHandle, SpawnConfig};
 use rust_harness::{create_session, fake_prompt, prompt_async, RustSidecar};
 use serde_json::json;
+use tempfile::TempDir;
+
+const BUN_FAKE_PREFIX: &str = "__KILO_BENCH_FAKE__";
+
+struct BunFakeSidecar {
+    _root: TempDir,
+    handle: SidecarHandle,
+    client: OracleClient,
+}
+
+impl BunFakeSidecar {
+    async fn spawn() -> Self {
+        let root = tempfile::tempdir().expect("create Bun fake tempdir");
+        std::fs::write(root.path().join("note.txt"), "needle\nsecond\n")
+            .expect("seed Bun fake note");
+        std::fs::create_dir_all(root.path().join("src")).expect("seed Bun fake src dir");
+        std::fs::write(root.path().join("src").join("main.rs"), "fn main() {}\n")
+            .expect("seed Bun fake source");
+        let cfg = SpawnConfig::default()
+            .with_cwd(root.path())
+            .with_extra_env("KILO_BENCH_FAKE_PROVIDER", "1")
+            .with_extra_env("KILO_DISABLE_MODELS_FETCH", "1")
+            .with_extra_env("KILO_DISABLE_DEFAULT_PLUGINS", "1")
+            .with_extra_env("HOME", root.path().join("home").to_string_lossy())
+            .with_extra_env("USERPROFILE", root.path().join("home").to_string_lossy())
+            .with_extra_env(
+                "XDG_CACHE_HOME",
+                root.path().join(".cache").to_string_lossy(),
+            )
+            .with_extra_env(
+                "XDG_DATA_HOME",
+                root.path().join(".local/share").to_string_lossy(),
+            )
+            .with_extra_env(
+                "XDG_CONFIG_HOME",
+                root.path().join(".config").to_string_lossy(),
+            )
+            .with_extra_env(
+                "XDG_STATE_HOME",
+                root.path().join(".local/state").to_string_lossy(),
+            );
+        let handle = SidecarHandle::spawn(cfg)
+            .await
+            .expect("spawn Bun fake sidecar");
+        let client = OracleClient::unscoped("127.0.0.1", handle.ready.port, Some(&handle.password))
+            .expect("build Bun fake client");
+        Self {
+            _root: root,
+            handle,
+            client,
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        self.handle
+            .shutdown()
+            .await
+            .expect("shutdown Bun fake sidecar");
+    }
+}
+
+fn bun_fake_text(control: serde_json::Value) -> String {
+    format!(
+        "{BUN_FAKE_PREFIX}{}",
+        serde_json::to_string(&control).unwrap()
+    )
+}
+
+async fn bun_create_session(sidecar: &BunFakeSidecar, title: &str) -> String {
+    let body = json!({
+        "title": title,
+        "permission": [{
+            "permission": "task",
+            "pattern": "*",
+            "action": "allow"
+        }]
+    });
+    let res: serde_json::Value = sidecar
+        .client
+        .post_json("/session", Some(&body))
+        .await
+        .expect("create Bun fake session");
+    res.get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .expect("Bun fake session id")
+}
+
+fn bun_fake_prompt(control: serde_json::Value) -> serde_json::Value {
+    json!({
+        "parts": [{ "type": "text", "text": bun_fake_text(control) }],
+        "model": { "providerID": "fake", "modelID": "fake-echo" }
+    })
+}
+
+async fn bun_messages(sidecar: &BunFakeSidecar, id: &str) -> serde_json::Value {
+    sidecar
+        .client
+        .get_json(&format!("/session/{id}/message"))
+        .await
+        .expect("read Bun fake messages")
+}
+
+async fn bun_children(sidecar: &BunFakeSidecar, id: &str) -> serde_json::Value {
+    sidecar
+        .client
+        .get_json(&format!("/session/{id}/children"))
+        .await
+        .expect("read Bun fake children")
+}
+
+fn bun_assistant_text(value: &serde_json::Value) -> String {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|msg| {
+            msg.get("info")
+                .and_then(|info| info.get("role"))
+                .and_then(|role| role.as_str())
+                == Some("assistant")
+        })
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn bun_wait_assistant(sidecar: &BunFakeSidecar, id: &str, needle: &str) {
+    let until = Instant::now() + Duration::from_secs(30);
+    let mut last = String::new();
+    while Instant::now() < until {
+        let messages = bun_messages(sidecar, id).await;
+        let text = bun_assistant_text(&messages);
+        if text.contains(needle) {
+            return;
+        }
+        last = text;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("Bun fake assistant output did not contain {needle:?}; last={last}");
+}
+
+async fn bun_wait_task_child(sidecar: &BunFakeSidecar, id: &str) -> usize {
+    let until = Instant::now() + Duration::from_secs(30);
+    let mut last = String::new();
+    while Instant::now() < until {
+        let messages = bun_messages(sidecar, id).await;
+        let children = bun_children(sidecar, id).await;
+        let count = children.as_array().map(Vec::len).unwrap_or_default();
+        let text = bun_assistant_text(&messages);
+        if count > 0 && (text.contains("child done") || text.contains("<task_result>")) {
+            return count;
+        }
+        last = json!({ "assistant": text, "children": count }).to_string();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("Bun fake task subagent timed out; last={last}");
+}
+
+async fn rust_create_task_session(sidecar: &RustSidecar, title: &str) -> String {
+    let body = json!({
+        "title": title,
+        "directory": sidecar.repo().to_string_lossy(),
+        "permission": { "task": "allow" }
+    });
+    let res: serde_json::Value = sidecar
+        .client
+        .post_json("/session", Some(&body))
+        .await
+        .expect("create Rust fake task session");
+    res.get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .expect("Rust fake task session id")
+}
+
+async fn rust_children(sidecar: &RustSidecar, id: &str) -> serde_json::Value {
+    sidecar
+        .client
+        .get_json(&format!("/session/{id}/children"))
+        .await
+        .expect("read Rust fake children")
+}
+
+async fn rust_wait_task_child(sidecar: &RustSidecar, id: &str) -> usize {
+    let until = Instant::now() + Duration::from_secs(30);
+    let mut last = String::new();
+    while Instant::now() < until {
+        let messages = rust_harness::messages(&sidecar.client, id)
+            .await
+            .expect("read Rust fake messages");
+        let children = rust_children(sidecar, id).await;
+        let count = children.as_array().map(Vec::len).unwrap_or_default();
+        let text = bun_assistant_text(&serde_json::Value::Array(messages));
+        if count > 0 && (text.contains("child done") || text.contains("<task_result>")) {
+            return count;
+        }
+        last = json!({ "assistant": text, "children": count }).to_string();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("Rust fake task subagent timed out; last={last}");
+}
 
 /// Read the test process's resident-set size in bytes. The M13 harness runs
 /// the sidecar in-process, so this measurement is the sidecar's RSS plus
@@ -320,6 +523,174 @@ fn is_sse_type(frame: &kilo_oracle::sse::SseFrame, kind: &str) -> bool {
         })
         .as_deref()
         == Some(kind)
+}
+
+fn is_session_terminal(parsed: &Option<serde_json::Value>, id: &str) -> bool {
+    let Some(parsed) = parsed.as_ref() else {
+        return false;
+    };
+    let payload = parsed.get("payload");
+    let kind = payload.and_then(|p| p.get("type")).and_then(|v| v.as_str());
+    if kind != Some("session.idle") && kind != Some("session.error") {
+        return false;
+    }
+    payload
+        .and_then(|p| p.get("properties"))
+        .and_then(|p| p.get("sessionID"))
+        .and_then(|v| v.as_str())
+        == Some(id)
+}
+
+/// Bun fake-provider benchmark smoke. This exercises the real Bun
+/// session/processor/SSE stack without live provider credentials.
+///
+/// Run from `packages/kilo-vscode-sidecar-rs`:
+/// `cargo test -p kilo-oracle --test m13_benchmark_gate m13_bun_fake_provider_first_token -- --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m13_bun_fake_provider_first_token() {
+    let mut sidecar = BunFakeSidecar::spawn().await;
+    let id = bun_create_session(&sidecar, "M13 Bun fake first token").await;
+    let client = sidecar.client.clone();
+    let watch = id.clone();
+    let task = tokio::spawn(async move {
+        let response = client.open_global_event_stream().await?;
+        SseRecorder::new()
+            .record(
+                response,
+                StopCondition::Predicate(Box::new(move |frame, parsed| {
+                    is_sse_type(frame, "message.part.delta") || is_session_terminal(parsed, &watch)
+                })),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let started = Instant::now();
+    let body = bun_fake_prompt(json!({ "fakeDelayMs": 25, "fakeText": "hello" }));
+    let _: serde_json::Value = sidecar
+        .client
+        .post_json(&format!("/session/{id}/prompt_async"), Some(&body))
+        .await
+        .expect("Bun fake prompt async");
+    let frames = task.await.unwrap().expect("record Bun fake first token");
+    let elapsed = started.elapsed();
+    assert!(
+        frames
+            .iter()
+            .any(|frame| is_sse_type(frame, "message.part.delta")),
+        "Bun fake provider did not emit visible text"
+    );
+    println!(
+        "[m13_bun_fake_provider_first_token] elapsed_ms={}",
+        elapsed.as_millis()
+    );
+    sidecar.shutdown().await;
+}
+
+/// Agent Manager-like Bun fake-provider benchmark: two independent sessions
+/// run under one sidecar and both must reach idle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m13_bun_fake_provider_concurrent_sessions() {
+    let mut sidecar = BunFakeSidecar::spawn().await;
+    let a = bun_create_session(&sidecar, "M13 Bun fake session A").await;
+    let b = bun_create_session(&sidecar, "M13 Bun fake session B").await;
+    let started = Instant::now();
+    let body_a = bun_fake_prompt(json!({ "fakeDelayMs": 220, "fakeText": "one" }));
+    let body_b = bun_fake_prompt(json!({ "fakeDelayMs": 80, "fakeText": "two" }));
+    let path_a = format!("/session/{a}/prompt_async");
+    let path_b = format!("/session/{b}/prompt_async");
+    let (res_a, res_b) = tokio::join!(
+        sidecar
+            .client
+            .post_json::<serde_json::Value>(&path_a, Some(&body_a)),
+        sidecar
+            .client
+            .post_json::<serde_json::Value>(&path_b, Some(&body_b)),
+    );
+    res_a.expect("Bun fake prompt A async");
+    res_b.expect("Bun fake prompt B async");
+    let (seen_a, seen_b) = tokio::join!(
+        bun_wait_assistant(&sidecar, &a, "one"),
+        bun_wait_assistant(&sidecar, &b, "two"),
+    );
+    let _ = (seen_a, seen_b);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "Bun fake concurrent sessions look serialized: {elapsed:?}"
+    );
+    println!(
+        "[m13_bun_fake_provider_concurrent_sessions] elapsed_ms={}",
+        elapsed.as_millis()
+    );
+    sidecar.shutdown().await;
+}
+
+/// Bun fake-provider benchmark for the real `task` tool path. The parent
+/// fake stream calls `task`; the child subagent prompt uses the same fake
+/// provider, so this measures session/subagent orchestration without a live
+/// model.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m13_bun_fake_provider_task_subagent() {
+    let mut sidecar = BunFakeSidecar::spawn().await;
+    let id = bun_create_session(&sidecar, "M13 Bun fake task subagent").await;
+    let child = bun_fake_text(json!({ "fakeDelayMs": 25, "fakeText": "child done" }));
+    let body = bun_fake_prompt(json!({
+        "fakeText": "parent",
+        "fakeToolCalls": [{
+            "tool": "task",
+            "input": {
+                "description": "bench child",
+                "prompt": child,
+                "subagent_type": "general"
+            }
+        }]
+    }));
+    let started = Instant::now();
+    let _: serde_json::Value = sidecar
+        .client
+        .post_json(&format!("/session/{id}/prompt_async"), Some(&body))
+        .await
+        .expect("Bun fake task prompt async");
+    let count = bun_wait_task_child(&sidecar, &id).await;
+    println!(
+        "[m13_bun_fake_provider_task_subagent] elapsed_ms={} children={}",
+        started.elapsed().as_millis(),
+        count
+    );
+    sidecar.shutdown().await;
+}
+
+/// Rust fake-provider benchmark for the same task-tool scenario as Bun.
+/// The child prompt is driven by the Rust fake provider, but the `task`
+/// call itself goes through the real Rust task/session runner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m13_rust_fake_provider_task_subagent() {
+    let sidecar = RustSidecar::spawn().await.expect("spawn rust sidecar");
+    let id = rust_create_task_session(&sidecar, "M13 Rust fake task subagent").await;
+    let body = fake_prompt(
+        "parent",
+        json!({
+            "fakeToolCalls": [{
+                "tool": "task",
+                "input": {
+                    "description": "bench child",
+                    "prompt": "child done",
+                    "subagent_type": "general"
+                }
+            }]
+        }),
+    );
+    let started = Instant::now();
+    prompt_async(&sidecar.client, &id, &body)
+        .await
+        .expect("Rust fake task prompt async");
+    let count = rust_wait_task_child(&sidecar, &id).await;
+    println!(
+        "[m13_rust_fake_provider_task_subagent] elapsed_ms={} children={}",
+        started.elapsed().as_millis(),
+        count
+    );
+    sidecar.shutdown().await.expect("shutdown rust sidecar");
 }
 
 /// M13 deterministic benchmark gate. This is intentionally a conservative CI-safe

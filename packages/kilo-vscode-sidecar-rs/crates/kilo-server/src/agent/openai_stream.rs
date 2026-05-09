@@ -16,12 +16,12 @@
 //! `crate::agent::openai_stream::*`.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc},
 };
 
-use kilo_protocol::{MessageAppendInput, MessageAppendResult, PromptInput};
+use kilo_protocol::{KiloPath, MessageAppendInput, MessageAppendResult, PromptInput};
 use kilo_provider::{
     ChatMessage, ChatResponseItem, ChatTool, ChatUsage, ProviderError, StreamEvent,
 };
@@ -36,6 +36,7 @@ use crate::agent::parts::{
 };
 use crate::agent::shape::{
     repair_tool_name, step_finish_part_iter, step_start_part, tokens_value, usage_accumulate,
+    usage_cost_value,
 };
 use crate::{oauth, registry};
 use crate::{
@@ -75,12 +76,14 @@ pub(crate) async fn prompt_openai_stream(
     // M7 Fix 1+2: this is the outer turn loop. One assistant message per
     // turn carries text + tool_call + tool_result parts across iterations
     // (Bun parity — see `processor.ts:301-302, 334-335`). We start with a
-    // single empty text part; each iteration appends new parts via
-    // `append_message_record`, which upserts on (`info.id`, `part.id`).
+    // initial empty text part for the first stream deltas; each iteration
+    // appends its own chronological parts via `append_message_record`,
+    // which upserts on (`info.id`, `part.id`).
+    let paths = state.store.paths();
     let start = state.store.append_message_record(
         id,
         MessageAppendInput {
-            info: assistant_openai_info(&user, &input),
+            info: assistant_openai_info(&paths, &user, &input),
             parts: vec![json!({ "type": "text", "text": "" })],
         },
     )?;
@@ -93,19 +96,31 @@ pub(crate) async fn prompt_openai_stream(
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let paths = state.store.paths();
     let root = PathBuf::from(paths.directory.clone());
-    let auths = match oauth::tokens::fresh_auths(&state).await {
+    let auths = match oauth::tokens::fresh_auths(&state, &cancel).await {
         Ok(auths) => auths,
         Err(err) => {
+            if is_canceled(&cancel) || err.contains("aborted") {
+                return finalize_openai_aborted(
+                    &state,
+                    id,
+                    &dir,
+                    &project,
+                    &start.result,
+                    &mid,
+                    &pid,
+                    "",
+                    &[],
+                    None,
+                );
+            }
+            let mut info = start.result.info.clone();
+            info["error"] = provider_error(ProviderError::Api(err));
+            info["finish"] = json!("error");
             let assistant = state.store.append_message_record(
                 id,
                 MessageAppendInput {
-                    info: assistant_error_info(
-                        &user,
-                        &input,
-                        provider_error(ProviderError::Api(err)),
-                    ),
+                    info,
                     parts: Vec::new(),
                 },
             )?;
@@ -122,6 +137,7 @@ pub(crate) async fn prompt_openai_stream(
         Some(paths.directory.as_str()),
         Some(paths.config.as_str()),
         Some(paths.home.as_str()),
+        agent_prompt(&state, &input).as_deref(),
     );
     let tools = real_tools(&state, &input);
     let base_messages = real_messages(&state, id, &text);
@@ -202,6 +218,8 @@ pub(crate) async fn prompt_openai_stream(
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let iter_text: Arc<std::sync::Mutex<String>> =
             Arc::new(std::sync::Mutex::new(String::new()));
+        let iter_reasoning: Arc<std::sync::Mutex<BTreeMap<String, String>>> =
+            Arc::new(std::sync::Mutex::new(BTreeMap::new()));
         let stream_root = root.clone();
         let stream_mid = mid.clone();
         let stream_pid = pid.clone();
@@ -213,6 +231,8 @@ pub(crate) async fn prompt_openai_stream(
         let stream_model = stream_model.clone();
         let stream_dir = dir.clone();
         let stream_project = project.clone();
+        let stream_text_pid = iteration_text_part_id(&pid, iteration);
+        let stream_reasoning = iter_reasoning.clone();
         let base_idx = tool_parts.len();
         let start_time = start.result.time;
 
@@ -234,12 +254,36 @@ pub(crate) async fn prompt_openai_stream(
             &cancel,
             |event| match event {
                 StreamEvent::TextDelta(delta) => {
-                    publish_part_delta(&state, id, &mid, &pid, &delta);
+                    publish_part_delta(&state, id, &mid, &stream_text_pid, &delta);
                     if let Ok(mut buf) = iter_text.lock() {
                         buf.push_str(&delta);
                     }
                     deltas.push_str(&delta);
                 }
+                StreamEvent::ReasoningStart { id: rid } => {
+                    let pid = reasoning_part_id(&pid, iteration, &rid);
+                    if let Ok(mut map) = stream_reasoning.lock() {
+                        map.entry(rid).or_default();
+                    }
+                    let part = reasoning_part(&pid, "", start_time, None);
+                    if let Ok(record) = state.store.append_message_record(
+                        id,
+                        MessageAppendInput {
+                            info: start.result.info.clone(),
+                            parts: vec![part],
+                        },
+                    ) {
+                        publish_events(&state, dir.clone(), project.clone(), record.events);
+                    }
+                }
+                StreamEvent::ReasoningDelta { id: rid, delta } => {
+                    let pid = reasoning_part_id(&pid, iteration, &rid);
+                    publish_part_delta(&state, id, &mid, &pid, &delta);
+                    if let Ok(mut map) = stream_reasoning.lock() {
+                        map.entry(rid).or_default().push_str(&delta);
+                    }
+                }
+                StreamEvent::ReasoningEnd { .. } => {}
                 StreamEvent::ToolCall(call) => {
                     // Intercept the synthetic `StructuredOutput` tool: the
                     // model invoking this means it's providing the final
@@ -369,7 +413,15 @@ pub(crate) async fn prompt_openai_stream(
             }
         }
         iter_tools.sort_by_key(|(idx, _)| *idx);
-        let iter_tools_only: Vec<Value> = iter_tools.into_iter().map(|(_, part)| part).collect();
+        let mut iter_tools_only: Vec<Value> =
+            iter_tools.into_iter().map(|(_, part)| part).collect();
+        iter_tools_only.extend(missing_tool_output_parts(
+            &mid,
+            &pid,
+            start_time,
+            &pending_tools,
+            &iter_tools_only,
+        ));
         let had_tools_this_iter = !iter_tools_only.is_empty();
         let denied_this_iter = iter_tools_only.iter().any(is_permission_denial);
         let malformed_this_iter = iter_tools_only.iter().find_map(malformed_tool_arguments);
@@ -419,6 +471,7 @@ pub(crate) async fn prompt_openai_stream(
                         id,
                         MessageAppendInput {
                             info: assistant_error_info(
+                                &paths,
                                 &user,
                                 &input,
                                 crate::agent::compaction::compaction_error_envelope(
@@ -461,6 +514,7 @@ pub(crate) async fn prompt_openai_stream(
                             id,
                             MessageAppendInput {
                                 info: assistant_error_info(
+                                    &paths,
                                     &user,
                                     &input,
                                     crate::agent::compaction::compaction_error_envelope(&err),
@@ -480,7 +534,7 @@ pub(crate) async fn prompt_openai_stream(
                 let assistant = state.store.append_message_record(
                     id,
                     MessageAppendInput {
-                        info: assistant_error_info(&user, &input, provider_error(err)),
+                        info: assistant_error_info(&paths, &user, &input, provider_error(err)),
                         parts: Vec::new(),
                     },
                 )?;
@@ -499,6 +553,62 @@ pub(crate) async fn prompt_openai_stream(
         }
         last_finish = provider_out.finish.clone();
 
+        // Track this iteration's text before writing step-finish so persisted
+        // part order matches what the user saw: tools first, then the later
+        // conclusion text in the continuation step. Reusing the initial empty
+        // text part for every iteration made final answers appear above long
+        // tool transcripts in the UI.
+        let this_iter_text = if !provider_out.text.is_empty() {
+            provider_out.text.clone()
+        } else {
+            iter_text
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default()
+        };
+        last_text = this_iter_text.clone();
+        let reasoning_parts = iter_reasoning
+            .lock()
+            .map(|map| {
+                map.iter()
+                    .filter(|(_, text)| !text.is_empty())
+                    .map(|(rid, text)| {
+                        reasoning_part(
+                            &reasoning_part_id(&pid, iteration, rid),
+                            text,
+                            start_time,
+                            Some(start_time),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for part in reasoning_parts {
+            if let Ok(record) = state.store.append_message_record(
+                id,
+                MessageAppendInput {
+                    info: start.result.info.clone(),
+                    parts: vec![part.clone()],
+                },
+            ) {
+                publish_events(&state, dir.clone(), project.clone(), record.events);
+            }
+            tool_parts.push(part);
+        }
+        if !this_iter_text.is_empty() {
+            let text_part = text_part(&iteration_text_part_id(&pid, iteration), &this_iter_text);
+            if let Ok(record) = state.store.append_message_record(
+                id,
+                MessageAppendInput {
+                    info: start.result.info.clone(),
+                    parts: vec![text_part.clone()],
+                },
+            ) {
+                publish_events(&state, dir.clone(), project.clone(), record.events);
+            }
+            tool_parts.push(text_part);
+        }
+
         // Per-iteration `step-finish` part. Bun emits this from the AI SDK
         // `finish-step` event (`processor.ts:414-473`). Carries the
         // *iteration*'s usage (not the cumulative total) so consumers can
@@ -509,6 +619,7 @@ pub(crate) async fn prompt_openai_stream(
             &mid,
             &pid,
             iteration,
+            input.model.as_ref(),
             last_iter_usage.as_ref(),
             last_finish.as_deref(),
         );
@@ -522,18 +633,6 @@ pub(crate) async fn prompt_openai_stream(
             publish_events(&state, dir.clone(), project.clone(), record.events);
         }
         tool_parts.push(step_finish);
-        // Track this iteration's text so the loop terminator below has
-        // the right text body, and so the next iteration can attribute
-        // the prior assistant turn into `history_extension` correctly.
-        let this_iter_text = if !provider_out.text.is_empty() {
-            provider_out.text.clone()
-        } else {
-            iter_text
-                .lock()
-                .map(|guard| guard.clone())
-                .unwrap_or_default()
-        };
-        last_text = this_iter_text.clone();
 
         // Structured output capture (Bun: `prompt.ts:1629-1634`). Once
         // the model has called the synthetic `StructuredOutput` tool, the
@@ -607,6 +706,7 @@ pub(crate) async fn prompt_openai_stream(
                     id,
                     MessageAppendInput {
                         info: assistant_error_info(
+                            &paths,
                             &user,
                             &input,
                             malformed_tool_arguments_error(&err.err),
@@ -667,6 +767,7 @@ pub(crate) async fn prompt_openai_stream(
                 id,
                 MessageAppendInput {
                     info: assistant_error_info(
+                        &paths,
                         &user,
                         &input,
                         max_iterations_error(OPENAI_OAUTH_MAX_ITERATIONS),
@@ -711,7 +812,7 @@ pub(crate) async fn prompt_openai_stream(
         let assistant = state.store.append_message_record(
             id,
             MessageAppendInput {
-                info: assistant_error_info(&user, &input, structured_output_error()),
+                info: assistant_error_info(&paths, &user, &input, structured_output_error()),
                 parts,
             },
         )?;
@@ -722,8 +823,12 @@ pub(crate) async fn prompt_openai_stream(
         return Ok(assistant.result);
     }
 
-    let mut info =
-        assistant_stream_completed_info(&start.result, Some(&total_usage), last_finish.as_deref());
+    let mut info = assistant_stream_completed_info(
+        &start.result,
+        input.model.as_ref(),
+        Some(&total_usage),
+        last_finish.as_deref(),
+    );
     if let Some(structured) = captured_structured {
         info["structured"] = structured;
     }
@@ -757,6 +862,40 @@ fn pending_abort_parts(
                         &item.call,
                         &item.input,
                         "Tool call aborted".to_string(),
+                        time,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn missing_tool_output_parts(
+    mid: &str,
+    pid: &str,
+    time: i64,
+    pending: &Arc<std::sync::Mutex<Vec<PendingTool>>>,
+    settled: &[Value],
+) -> Vec<Value> {
+    let done = settled
+        .iter()
+        .filter_map(|part| part.get("callID").and_then(Value::as_str))
+        .collect::<HashSet<_>>();
+    pending
+        .lock()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| !done.contains(item.call.as_str()))
+                .map(|item| {
+                    tool_error(
+                        mid,
+                        pid,
+                        item.idx,
+                        &item.tool,
+                        &item.call,
+                        &item.input,
+                        "Tool call did not return an output".to_string(),
                         time,
                     )
                 })
@@ -977,13 +1116,65 @@ fn assistant_parts_with(
     finish: Option<&str>,
     sid: &str,
 ) -> Vec<Value> {
-    let mut parts = vec![json!({
+    let mut parts = Vec::new();
+    parts.extend(tool_parts.iter().cloned());
+    if !text.is_empty() && !parts.iter().any(is_nonempty_text_part) {
+        parts.push(text_part(pid, text));
+    }
+    if parts.is_empty() {
+        parts.push(text_part(pid, ""));
+    }
+    parts
+}
+
+fn iteration_text_part_id(pid: &str, iteration: usize) -> String {
+    if iteration == 0 {
+        return pid.to_string();
+    }
+    format!("{pid}_text_{iteration}")
+}
+
+fn text_part(pid: &str, text: &str) -> Value {
+    json!({
         "id": pid,
         "type": "text",
         "text": text,
-    })];
-    parts.extend(tool_parts.iter().cloned());
-    parts
+    })
+}
+
+fn reasoning_part_id(pid: &str, iteration: usize, id: &str) -> String {
+    let clean = id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("{pid}_reasoning_{iteration}_{clean}")
+}
+
+fn reasoning_part(pid: &str, text: &str, start: i64, end: Option<i64>) -> Value {
+    let mut part = json!({
+        "id": pid,
+        "type": "reasoning",
+        "text": text,
+        "time": { "start": start },
+    });
+    if let Some(end) = end {
+        part["time"]["end"] = json!(end);
+    }
+    part
+}
+
+fn is_nonempty_text_part(part: &Value) -> bool {
+    part.get("type").and_then(Value::as_str) == Some("text")
+        && part
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
 }
 
 pub(crate) fn model_provider(model: Option<&Value>) -> Option<&str> {
@@ -1085,7 +1276,7 @@ pub(crate) fn prompt_instructions(
     input: &PromptInput,
     working_dir: Option<&str>,
 ) -> Option<String> {
-    prompt_instructions_with_root(input, working_dir, None, None)
+    prompt_instructions_with_root(input, working_dir, None, None, None)
 }
 
 pub(crate) fn prompt_instructions_with_root(
@@ -1093,9 +1284,16 @@ pub(crate) fn prompt_instructions_with_root(
     working_dir: Option<&str>,
     config_dir: Option<&str>,
     home_dir: Option<&str>,
+    agent_prompt: Option<&str>,
 ) -> Option<String> {
     let mut pieces: Vec<String> = vec![OPENAI_OAUTH_SOUL_RAW.trim().to_string()];
-    pieces.push(OPENAI_OAUTH_CODEX_RAW.trim().to_string());
+    match agent_prompt
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+    {
+        Some(prompt) => pieces.push(prompt.to_string()),
+        None => pieces.push(OPENAI_OAUTH_CODEX_RAW.trim().to_string()),
+    }
     if let Some(dir) = working_dir {
         pieces.push(env_block(input, dir));
         let fallback = Path::new(dir).join(".kilo");
@@ -1134,6 +1332,19 @@ pub(crate) fn prompt_instructions_with_root(
     Some(pieces.join("\n"))
 }
 
+fn agent_prompt(state: &AppState, input: &PromptInput) -> Option<String> {
+    input
+        .agent
+        .as_deref()
+        .and_then(|agent| state.agent_info(agent))
+        .and_then(|agent| {
+            agent
+                .get("prompt")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
 /// Build the `<env>` block Bun emits at
 /// [`session/system.ts:86-105`](../../../../../opencode/src/session/system.ts:86):
 /// model attribution line, then a `<env>...</env>` section with working
@@ -1155,7 +1366,7 @@ fn env_block(input: &PromptInput, working_dir: &str) -> String {
            Working directory: {working_dir}\n  \
            Platform: {platform}\n  \
            Today's date: {today}\n  \
-           Project config: .kilo/command/*.md, .kilo/agent/*.md, kilo.json, AGENTS.md. Put new commands and agents in .kilo/. Do not use .kilocode/ or .opencode/.\n\
+           Optional project config: AGENTS.md, kilo.json[c], .kilo/kilo.json[c], .kilo/command/*.md, .kilo/agent/*.md. Do not assume optional config files exist; list/glob before reading them. Put new commands and agents in .kilo/. Do not use .kilocode/ or .opencode/.\n\
          </env>",
     )
 }
@@ -1166,7 +1377,11 @@ fn format_type(value: Option<&Value>) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-fn assistant_openai_info(user: &MessageAppendResult, input: &PromptInput) -> Value {
+fn assistant_openai_info(
+    paths: &KiloPath,
+    user: &MessageAppendResult,
+    input: &PromptInput,
+) -> Value {
     let agent = input.agent.as_deref().unwrap_or("code");
     let model = input
         .model
@@ -1185,7 +1400,7 @@ fn assistant_openai_info(user: &MessageAppendResult, input: &PromptInput) -> Val
         "providerID": "openai",
         "modelID": model,
         "agent": agent,
-        "path": {},
+        "path": crate::agent::parts::assistant_path(paths),
         "cost": 0,
         "tokens": zero_tokens(),
     })
@@ -1193,6 +1408,7 @@ fn assistant_openai_info(user: &MessageAppendResult, input: &PromptInput) -> Val
 
 fn assistant_stream_completed_info(
     start: &MessageAppendResult,
+    model: Option<&Value>,
     usage: Option<&ChatUsage>,
     finish: Option<&str>,
 ) -> Value {
@@ -1200,6 +1416,7 @@ fn assistant_stream_completed_info(
     info["finish"] = json!(finish.unwrap_or("stop"));
     if let Some(usage) = usage {
         info["tokens"] = tokens_value(usage);
+        info["cost"] = usage_cost_value(model, usage);
     }
     info
 }

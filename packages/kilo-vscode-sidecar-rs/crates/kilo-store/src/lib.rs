@@ -241,7 +241,18 @@ impl Store {
                 seq integer not null,
                 type text not null,
                 data text not null
-            );",
+            );
+            create table todo (
+                session_id text not null references session(id) on delete cascade,
+                content text not null,
+                status text not null,
+                priority text not null,
+                position integer not null,
+                time_created integer not null,
+                time_updated integer not null,
+                primary key (session_id, position)
+            );
+            create index todo_session_idx on todo(session_id);",
         )
         .unwrap();
     }
@@ -345,6 +356,47 @@ impl Store {
     pub fn replace_permission_rules(&self, rules: &[JsonValue]) -> std::io::Result<()> {
         fs::create_dir_all(&self.paths.data)?;
         write_permission_rules(&self.paths.data, rules)
+    }
+
+    pub fn todos(&self, id: &str) -> Option<Vec<JsonValue>> {
+        self.with_db(|db| read_todos(db, id)).unwrap_or(None)
+    }
+
+    pub fn update_todos(
+        &self,
+        id: &str,
+        todos: &[JsonValue],
+    ) -> rusqlite::Result<Option<Vec<JsonValue>>> {
+        self.with_write(|db| {
+            let time = now_millis();
+            let tx = db.transaction()?;
+            ensure_table(&tx, "session")?;
+            ensure_table(&tx, "todo")?;
+            if read_session(&tx, id).is_none() {
+                tx.commit()?;
+                return Ok(None);
+            }
+            tx.execute("delete from todo where session_id = ?1", params![id])?;
+            for (idx, todo) in todos.iter().enumerate() {
+                let content = todo.get("content").and_then(JsonValue::as_str).unwrap_or("");
+                let status = todo.get("status").and_then(JsonValue::as_str).unwrap_or("");
+                let priority = todo
+                    .get("priority")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("");
+                tx.execute(
+                    "insert into todo (session_id, content, status, priority, position, time_created, time_updated) \
+                     values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![id, content, status, priority, idx as i64, time, time],
+                )?;
+            }
+            tx.execute(
+                "update session set time_updated = ?1 where id = ?2",
+                params![time, id],
+            )?;
+            tx.commit()?;
+            Ok(read_todos(db, id))
+        })
     }
 
     pub fn mcp_auth(&self, id: &str) -> Option<JsonValue> {
@@ -1232,9 +1284,25 @@ impl Store {
                     | OpenFlags::SQLITE_OPEN_URI
                     | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
+            // Mirrors Bun's `packages/opencode/src/storage/db.ts:88-93`
+            // pragma block, in the same order. `synchronous=NORMAL` plus
+            // WAL is the SQLite-recommended pairing; `cache_size=-64000`
+            // is 64 MiB of page cache (negative => kibibytes); the
+            // passive checkpoint trims a stale WAL left over from a
+            // previous run. `foreign_keys=ON` keeps the cascade rules in
+            // `init_schema` honored.
             conn.execute_batch(
-                "pragma journal_mode = WAL; pragma busy_timeout = 5000; pragma foreign_keys = ON;",
+                "pragma journal_mode = WAL; \
+                 pragma synchronous = NORMAL; \
+                 pragma busy_timeout = 5000; \
+                 pragma cache_size = -64000; \
+                 pragma foreign_keys = ON;",
             )?;
+            // Non-fatal: a checkpoint can fail under contention or if the
+            // WAL is empty. We only swallow the error so the connection
+            // still opens; the WAL will get checkpointed on the next
+            // write anyway.
+            let _ = conn.execute_batch("pragma wal_checkpoint(PASSIVE);");
             // First-run schema bootstrap. `init_schema` uses
             // `create table if not exists` so it is safe to run on every
             // open. The migration runner then walks `PRAGMA user_version`
@@ -1314,7 +1382,18 @@ fn init_schema(db: &Connection) -> rusqlite::Result<()> {
             seq integer not null,
             type text not null,
             data text not null
-        );",
+        );
+        create table if not exists todo (
+            session_id text not null references session(id) on delete cascade,
+            content text not null,
+            status text not null,
+            priority text not null,
+            position integer not null,
+            time_created integer not null,
+            time_updated integer not null,
+            primary key (session_id, position)
+        );
+        create index if not exists todo_session_idx on todo(session_id);",
     )
 }
 
@@ -1450,6 +1529,13 @@ fn auth_temp_path(path: &Path) -> PathBuf {
 /// `auth.json.bak`. On Windows `std::fs::rename` cannot replace an existing
 /// file, so the backup gives `read_auths` a recovery point if the process dies
 /// between removing the old file and installing the new one.
+///
+/// On POSIX, the temp file is restricted to `0o600` *before* the rename so
+/// the secret blob is never world-readable, even briefly. The `.bak` and
+/// final paths are also forced to `0o600` after each fs op so a stale
+/// umask or pre-existing 0644 backup gets tightened on every write. Mirrors
+/// Bun's `fsys.writeJson(file, ..., 0o600)` at
+/// `packages/opencode/src/auth/index.ts:81,90`.
 fn write_replace(path: &Path, body: &[u8]) -> std::io::Result<()> {
     let temp = auth_temp_path(path);
     let bak = auth_backup_path(path);
@@ -1465,21 +1551,42 @@ fn write_replace(path: &Path, body: &[u8]) -> std::io::Result<()> {
         file.write_all(body)?;
         file.sync_all()?;
     }
+    // Tighten the temp file before it becomes visible at `path`.
+    chmod_secret(&temp);
     if path.exists() {
         let _ = fs::copy(path, &bak);
+        chmod_secret(&bak);
         fs::remove_file(path)?;
     }
     match fs::rename(&temp, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            chmod_secret(path);
+            Ok(())
+        }
         Err(err) => {
             let _ = fs::remove_file(&temp);
             if !path.exists() && bak.exists() {
                 let _ = fs::copy(&bak, path);
+                chmod_secret(path);
             }
             Err(err)
         }
     }
 }
+
+/// POSIX-only: force `path` to mode `0o600` so secret blobs (`auth.json`,
+/// `auth.json.bak`, `mcp-auth.json`, and the temp files we rename through)
+/// are never world-readable. No-op on Windows where ACLs come from the
+/// parent directory. Failures are swallowed — best-effort hardening, not a
+/// correctness gate.
+#[cfg(unix)]
+fn chmod_secret(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn chmod_secret(_path: &Path) {}
 
 fn read_mcp_auths(dir: &PathBuf) -> BTreeMap<String, JsonValue> {
     let path = dir.join("mcp-auth.json");
@@ -1514,7 +1621,10 @@ fn write_mcp_auths(dir: &PathBuf, data: &BTreeMap<String, JsonValue>) -> std::io
     let path = dir.join("mcp-auth.json");
     let body = serde_json::to_string_pretty(data)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    fs::write(path, body)
+    fs::write(&path, body)?;
+    // Match `auth.json`: secret blob, force `0o600` on POSIX. No-op on Windows.
+    chmod_secret(&path);
+    Ok(())
 }
 
 const PROJECT_COLUMNS: &str = "id, worktree, vcs, name, time_created, time_updated, \
@@ -1658,6 +1768,35 @@ fn ensure_table(db: &Connection, name: &str) -> rusqlite::Result<()> {
     Err(rusqlite::Error::InvalidParameterName(format!(
         "missing table {name}"
     )))
+}
+
+fn read_todos(db: &Connection, id: &str) -> Option<Vec<JsonValue>> {
+    ensure_table(db, "session").ok()?;
+    ensure_table(db, "todo").ok()?;
+    read_session(db, id)?;
+    let mut stmt = match db.prepare(
+        "select content, status, priority from todo where session_id = ?1 order by position asc",
+    ) {
+        Ok(stmt) => stmt,
+        Err(err) => {
+            log_db_err("read_todos.prepare", err);
+            return Some(Vec::new());
+        }
+    };
+    let rows = match stmt.query_map([id], |row| {
+        Ok(json!({
+            "content": row.get::<_, String>(0)?,
+            "status": row.get::<_, String>(1)?,
+            "priority": row.get::<_, String>(2)?,
+        }))
+    }) {
+        Ok(rows) => rows,
+        Err(err) => {
+            log_db_err("read_todos.query", err);
+            return Some(Vec::new());
+        }
+    };
+    Some(rows.filter_map(Result::ok).collect())
 }
 
 fn read_sessions(db: &Connection, query: &SessionQuery) -> Vec<Session> {
@@ -3343,6 +3482,190 @@ mod tests {
         );
         assert_columns("event_sequence", &["aggregate_id", "seq"]);
         assert_columns("event", &["id", "aggregate_id", "seq", "type", "data"]);
+        assert_columns(
+            "todo",
+            &[
+                "session_id",
+                "content",
+                "status",
+                "priority",
+                "position",
+                "time_created",
+                "time_updated",
+            ],
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn todos_update_get_and_delete_with_session() {
+        let root = unique_root();
+        let store = store(&root);
+        let session = store.create_session(SessionCreateInput::default()).unwrap();
+        let todos = vec![
+            json!({ "content": "plan", "status": "in_progress", "priority": "high" }),
+            json!({ "content": "ship", "status": "pending", "priority": "medium" }),
+        ];
+
+        let saved = store.update_todos(&session.id, &todos).unwrap().unwrap();
+        assert_eq!(saved, todos);
+        assert_eq!(store.todos(&session.id).unwrap(), todos);
+        assert!(store.todos("missing").is_none());
+
+        store.delete_session_record(&session.id).unwrap();
+        assert!(store.todos(&session.id).is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// P2 hardening: `auth.json` (and `mcp-auth.json`) must land at mode
+    /// `0o600` on POSIX. Bun parity — `packages/opencode/src/auth/index.ts:81,90`.
+    #[cfg(unix)]
+    #[test]
+    fn auth_files_chmodded_to_0600_on_posix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_root();
+        let store = store(&root);
+
+        store
+            .set_provider_auth(
+                "openai",
+                json!({
+                    "type": "oauth",
+                    "refresh": "r",
+                    "access": "a",
+                    "expires": 1
+                }),
+            )
+            .expect("set provider auth");
+
+        let auth_path = store.paths.data.join("auth.json");
+        let mode = fs::metadata(&auth_path)
+            .expect("auth.json exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "auth.json must be 0o600, got {:o}", mode);
+
+        // Trigger a second write so the `.bak` exists, then check it too.
+        store
+            .set_provider_auth(
+                "openai",
+                json!({
+                    "type": "oauth",
+                    "refresh": "r2",
+                    "access": "a2",
+                    "expires": 2
+                }),
+            )
+            .expect("set provider auth twice");
+        let bak_path = store.paths.data.join("auth.json.bak");
+        let bak_mode = fs::metadata(&bak_path)
+            .expect("auth.json.bak exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            bak_mode, 0o600,
+            "auth.json.bak must be 0o600, got {:o}",
+            bak_mode
+        );
+
+        // mcp-auth.json takes the same hardening path.
+        store
+            .set_mcp_auth("github", json!({ "type": "oauth", "access": "x" }))
+            .expect("set mcp auth");
+        let mcp_path = store.paths.data.join("mcp-auth.json");
+        let mcp_mode = fs::metadata(&mcp_path)
+            .expect("mcp-auth.json exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mcp_mode, 0o600,
+            "mcp-auth.json must be 0o600, got {:o}",
+            mcp_mode
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// P2 hardening: PRAGMA stamp on writer open mirrors Bun's
+    /// `packages/opencode/src/storage/db.ts:88-93`. Read back the values
+    /// the new code adds (`synchronous=NORMAL`, `cache_size=-64000`)
+    /// straight off the live writer connection so any future regression
+    /// in the pragma block surfaces here.
+    #[test]
+    fn writer_connection_applies_bun_parity_pragmas() {
+        let root = unique_root();
+        let store = store(&root);
+        seed(&store);
+
+        // First write forces the writer connection to open and stamp pragmas.
+        store
+            .create_session(SessionCreateInput::default())
+            .expect("create session");
+
+        let synchronous: i64 = store
+            .with_write(|conn| conn.query_row("pragma synchronous", [], |row| row.get(0)))
+            .expect("read synchronous pragma");
+        // 1 == NORMAL.
+        assert_eq!(synchronous, 1, "synchronous must be NORMAL (1)");
+
+        let cache_size: i64 = store
+            .with_write(|conn| conn.query_row("pragma cache_size", [], |row| row.get(0)))
+            .expect("read cache_size pragma");
+        assert_eq!(cache_size, -64_000, "cache_size must be -64000 (KiB)");
+
+        let journal_mode: String = store
+            .with_write(|conn| conn.query_row("pragma journal_mode", [], |row| row.get(0)))
+            .expect("read journal_mode pragma");
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+
+        let foreign_keys: i64 = store
+            .with_write(|conn| conn.query_row("pragma foreign_keys", [], |row| row.get(0)))
+            .expect("read foreign_keys pragma");
+        assert_eq!(foreign_keys, 1, "foreign_keys must be ON");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// P2 hardening: kilo-store's auth-blob persistence path is
+    /// type-discriminator-agnostic — it round-trips raw JSON values.
+    /// Bun's auth schema (`packages/opencode/src/auth/index.ts:30-37`) is
+    /// a `Oauth | Api | Wellknown` union; the wellknown shape was added
+    /// after the Rust port was forked. This test pins the round-trip so
+    /// a future "validate the type field" change can't silently drop
+    /// wellknown rows during the OpenAI-Pro narrowing.
+    #[test]
+    fn provider_auth_preserves_wellknown_shape_unchanged() {
+        let root = unique_root();
+        let store = store(&root);
+
+        let blob = json!({
+            "type": "wellknown",
+            "key": "kilo-cloud",
+            "token": "wk_live_xxx",
+            "extra": { "kept": true }
+        });
+        store
+            .set_provider_auth("kilo-cloud", blob.clone())
+            .expect("set wellknown auth");
+
+        // Single-key read path.
+        assert_eq!(store.provider_auth("kilo-cloud"), Some(blob.clone()));
+        // Bulk read path.
+        let all = store.provider_auths();
+        assert_eq!(all.get("kilo-cloud"), Some(&blob));
+
+        // And the on-disk file holds the blob byte-for-byte (modulo
+        // pretty-printing). Read the raw JSON to confirm no field was
+        // stripped.
+        let on_disk = fs::read_to_string(store.paths.data.join("auth.json")).unwrap();
+        let parsed: JsonValue = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(parsed["kilo-cloud"], blob);
 
         let _ = fs::remove_dir_all(root);
     }

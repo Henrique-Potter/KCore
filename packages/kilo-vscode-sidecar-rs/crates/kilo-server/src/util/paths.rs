@@ -22,16 +22,45 @@ pub(crate) fn slash(path: &FsPath) -> String {
 }
 
 pub(crate) fn resolve_under(root: &FsPath, input: &str) -> Result<PathBuf, StatusCode> {
-    let rel = input.trim_start_matches(['/', '\\']);
+    let raw = input.trim();
+    let path = PathBuf::from(raw);
+    if path
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    if path.is_absolute() && is_within_path(root, &path) {
+        return Ok(path);
+    }
+
+    let rel = raw.trim_start_matches(['/', '\\']);
     let path = PathBuf::from(rel);
-    if path.components().any(|part| {
-        matches!(
-            part,
-            Component::ParentDir | Component::Prefix(_) | Component::RootDir
-        )
-    }) {
+    if path
+        .components()
+        .any(|part| matches!(part, Component::Prefix(_) | Component::RootDir))
+    {
         return Err(StatusCode::FORBIDDEN);
     }
 
     Ok(root.join(path))
+}
+
+fn is_within_path(root: &FsPath, path: &FsPath) -> bool {
+    let root = cmp_path(root);
+    let path = cmp_path(path);
+    kilo_store::paths::is_within(&root, &path)
+}
+
+fn cmp_path(path: &FsPath) -> String {
+    let out = kilo_store::paths::clean(path.to_string_lossy().as_ref());
+    #[cfg(windows)]
+    {
+        return out.to_ascii_lowercase();
+    }
+    #[cfg(not(windows))]
+    {
+        out
+    }
 }

@@ -19,10 +19,12 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, LazyLock,
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use kilo_protocol::{
-    MessageAppendInput, MessageAppendResult, PromptInput, Session, SessionCreateInput,
+    GlobalEvent, KiloPath, MessageAppendInput, MessageAppendResult, PromptInput, Session,
+    SessionCreateInput,
 };
 use kilo_provider::{
     ChatMessage, ChatOutput, ChatResponseItem, ChatTool, ChatToolCall, ProviderError,
@@ -31,13 +33,18 @@ use serde_json::{json, Map, Value};
 use tokio::sync::Semaphore;
 
 use crate::agent::permission::ask_permission;
-use crate::agent::shape::{repair_tool_name, step_finish_part_usage};
-use crate::agent::tools::bash::fake_bash;
+use crate::agent::shape::{
+    repair_tool_name, step_finish_part_usage, tokens_value, usage_cost_value,
+};
 use crate::agent::tools::common::{model_toolcall, tool_enabled};
 use crate::agent::tools::defs::{
-    apply_patch_def, bash_def, edit_def, grep_def, question_def, read_def, task_def, write_def,
+    apply_patch_def, bash_def, edit_def, glob_def, grep_def, lsp_def, plan_exit_def, question_def,
+    read_def, skill_def, suggest_def, task_def, todowrite_def, webfetch_def, write_def,
 };
-use crate::agent::tools::fs::{fake_edit, fake_grep, fake_read, fake_write};
+use crate::agent::tools::fs::{
+    fake_edit, fake_glob_cancel, fake_grep, fake_grep_cancel, fake_read, fake_read_cancel,
+    fake_write,
+};
 use crate::agent::tools::patch::fake_apply_patch;
 use crate::{AppState, PermissionRule, Repair, KNOWN_TOOLS};
 
@@ -64,7 +71,8 @@ where
         let rt = guard
             .as_ref()
             .ok_or_else(|| "Task runtime is unavailable".to_string())?;
-        Ok(rt.block_on(future))
+        let local = tokio::task::LocalSet::new();
+        Ok(rt.block_on(local.run_until(future)))
     })
 }
 
@@ -88,14 +96,20 @@ pub(crate) fn append_assistant(
     dir: String,
     project: String,
 ) -> rusqlite::Result<MessageAppendResult> {
+    let has = !out.tool_calls.is_empty();
+    let paths = state.store.paths();
     let start = state.store.append_message_record(
         id,
         MessageAppendInput {
-            info: assistant_provider_info(user, input, &out),
-            parts: vec![json!({
-                "type": "text",
-                "text": "",
-            })],
+            info: assistant_provider_info(&paths, user, input, &out),
+            parts: if has {
+                Vec::new()
+            } else {
+                vec![json!({
+                    "type": "text",
+                    "text": "",
+                })]
+            },
         },
     )?;
     crate::publish_events(state, dir.clone(), project.clone(), start.events);
@@ -104,11 +118,16 @@ pub(crate) fn append_assistant(
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let pid = start.result.parts[0]["id"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    crate::publish_part_delta(state, id, &mid, &pid, &out.text);
+    let pid = start
+        .result
+        .parts
+        .first()
+        .and_then(|part| part["id"].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("prt_{mid}"));
+    if !has {
+        crate::publish_part_delta(state, id, &mid, &pid, &out.text);
+    }
 
     let parts = assistant_parts(
         &PathBuf::from(state.store.paths().directory),
@@ -141,30 +160,55 @@ pub(crate) fn assistant_parts(
     out: ChatOutput,
     time: i64,
 ) -> Vec<Value> {
-    let mut parts = vec![json!({
-        "id": pid,
-        "type": "text",
-        "text": out.text,
-    })];
-    parts.extend(real_tool_parts(root, mid, pid, &out.tool_calls, time));
+    let mut parts = real_tool_parts(root, mid, pid, &out.tool_calls, time);
+    if parts.is_empty() || !out.text.is_empty() {
+        parts.push(assistant_text_part(pid, out.text));
+    }
+    let anchor = parts
+        .first()
+        .cloned()
+        .unwrap_or_else(|| assistant_text_part(pid, ""));
     parts.push(step_finish_part_usage(
         sid,
         mid,
-        &parts[0],
+        &anchor,
         out.usage.as_ref(),
         out.finish.as_deref(),
     ));
     parts
 }
 
+fn assistant_text_part(pid: &str, text: impl Into<String>) -> Value {
+    json!({
+        "id": pid,
+        "type": "text",
+        "text": text.into(),
+    })
+}
+
 pub(crate) fn real_tools(state: &AppState, input: &PromptInput) -> Vec<ChatTool> {
     let enabled = tools_on(input);
     let mut tools = if enabled {
-        let mut t = vec![read_def(), grep_def(), task_def(), question_def()];
-        if state.mutating_tools_enabled() {
-            t.extend([write_def(), edit_def(), apply_patch_def(), bash_def()]);
+        let mut out = vec![
+            read_def(),
+            glob_def(),
+            grep_def(),
+            webfetch_def(),
+            todowrite_def(),
+            skill_def(),
+            suggest_def(),
+            lsp_def(),
+            task_def(),
+            question_def(),
+        ];
+        if input.agent.as_deref() == Some("plan") {
+            out.push(plan_exit_def());
         }
-        t
+        if state.mutating_tools_enabled() {
+            out.extend([write_def(), edit_def(), apply_patch_def(), bash_def()]);
+        }
+        out.retain(|tool| tool_available(input, &tool.name));
+        out
     } else {
         Vec::new()
     };
@@ -173,12 +217,32 @@ pub(crate) fn real_tools(state: &AppState, input: &PromptInput) -> Vec<ChatTool>
     }
     // Connected MCP servers expose namespaced tools (Bun: `mcp/index.ts:685`).
     // Disabled / failed / pending servers contribute nothing.
-    if enabled {
+    if enabled && tool_available(input, "mcp") {
         tools.extend(crate::agent::mcp_dispatch::mcp_chat_tools(state));
+    }
+    if enabled && tool_available(input, "plugin") {
         // Registered plugin tools (Bun parity: `plugin.tool()` decoration).
         tools.extend(crate::agent::plugin::plugin_chat_tools(state));
     }
     tools
+}
+
+fn tool_available(input: &PromptInput, name: &str) -> bool {
+    match input.tools.as_ref() {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::String(value)) => value == name || value == "*",
+        Some(Value::Array(items)) => items.iter().any(|item| match item {
+            Value::String(value) => value == name || value == "*",
+            value => tool_enabled(value),
+        }),
+        Some(Value::Object(map)) => map
+            .get(name)
+            .or_else(|| map.get("*"))
+            .map(tool_enabled)
+            .unwrap_or(false),
+        Some(_) => false,
+        None => true,
+    }
 }
 
 /// Synthesize a per-turn `StructuredOutput` tool when the user's
@@ -229,6 +293,7 @@ pub(crate) async fn mcp_tool_part(
     descriptor: &crate::agent::mcp_dispatch::McpToolDescriptor,
     call: &ChatToolCall,
     time: i64,
+    cancel: &AtomicBool,
 ) -> Value {
     use crate::agent::mcp_dispatch::{mcp_invoke, McpInvokeResult};
     use crate::agent::permission::ask_mcp_permission;
@@ -238,7 +303,10 @@ pub(crate) async fn mcp_tool_part(
     {
         return tool_error(mid, pid, idx, tool_name, &call.id, &call.input, err, time);
     }
-    match mcp_invoke(state, descriptor, call.input.clone()).await {
+    if is_tool_canceled(cancel) {
+        return aborted_tool_part(mid, pid, idx, tool_name, call, time);
+    }
+    match mcp_invoke(state, descriptor, call.input.clone(), cancel).await {
         McpInvokeResult::Ok(result) => {
             let output = mcp_result_text(&result);
             let title = format!("{} ({})", descriptor.tool, descriptor.client);
@@ -276,6 +344,7 @@ pub(crate) async fn plugin_tool_part(
     tool: &crate::agent::plugin::PluginTool,
     call: &ChatToolCall,
     time: i64,
+    cancel: &AtomicBool,
 ) -> Value {
     use crate::agent::permission::ask_plugin_permission;
     use crate::agent::plugin::invoke_plugin_tool;
@@ -283,6 +352,9 @@ pub(crate) async fn plugin_tool_part(
         ask_plugin_permission(state, sid, mid, pid, idx, &tool.name, &call.id, &call.input).await
     {
         return tool_error(mid, pid, idx, &tool.name, &call.id, &call.input, err, time);
+    }
+    if is_tool_canceled(cancel) {
+        return aborted_tool_part(mid, pid, idx, &tool.name, call, time);
     }
     match invoke_plugin_tool(tool, call) {
         Ok((title, output, metadata)) => tool_completed(
@@ -337,11 +409,17 @@ fn tools_on(input: &PromptInput) -> bool {
             Value::Object(map) => {
                 map.get("read").is_some_and(tool_enabled)
                     || map.get("grep").is_some_and(tool_enabled)
+                    || map.get("webfetch").is_some_and(tool_enabled)
+                    || map.get("todowrite").is_some_and(tool_enabled)
+                    || map.get("skill").is_some_and(tool_enabled)
+                    || map.get("suggest").is_some_and(tool_enabled)
+                    || map.get("lsp").is_some_and(tool_enabled)
                     || map.get("write").is_some_and(tool_enabled)
                     || map.get("edit").is_some_and(tool_enabled)
                     || map.get("apply_patch").is_some_and(tool_enabled)
                     || map.get("bash").is_some_and(tool_enabled)
                     || map.get("task").is_some_and(tool_enabled)
+                    || map.get("plan_exit").is_some_and(tool_enabled)
                     || map.get("mcp").is_some_and(tool_enabled)
                     || map.get("*").is_some_and(tool_enabled)
             }
@@ -459,6 +537,7 @@ fn tool_part_calls(parts: &[Value]) -> Vec<ChatResponseItem> {
     parts
         .iter()
         .filter(|part| part.get("type").and_then(Value::as_str) == Some("tool"))
+        .filter(|part| is_settled_tool_part(part))
         .filter_map(|part| {
             Some(ChatResponseItem::FunctionCall(ChatToolCall {
                 id: part.get("callID")?.as_str()?.to_string(),
@@ -470,6 +549,9 @@ fn tool_part_calls(parts: &[Value]) -> Vec<ChatResponseItem> {
 }
 
 pub(crate) fn tool_part_response(part: &Value) -> Option<ChatResponseItem> {
+    if !is_settled_tool_part(part) {
+        return None;
+    }
     let id = part.get("callID")?.as_str()?.to_string();
     let state = part.get("state")?;
     let raw = state
@@ -486,6 +568,18 @@ pub(crate) fn tool_part_response(part: &Value) -> Option<ChatResponseItem> {
         raw
     };
     Some(ChatResponseItem::FunctionOutput { id, output })
+}
+
+fn is_settled_tool_part(part: &Value) -> bool {
+    let Some(state) = part.get("state") else {
+        return false;
+    };
+    match state.get("status").and_then(Value::as_str) {
+        Some("completed" | "error") => true,
+        Some("pending" | "running") => false,
+        Some(_) => false,
+        None => state.get("output").is_some() || state.get("error").is_some(),
+    }
 }
 
 pub(crate) fn real_tool_parts(
@@ -604,11 +698,23 @@ pub(crate) async fn real_tool_part(
             // `mcp/index.ts:685`), reverse-resolved by string match
             // against the live client list — never by string-split.
             if let Some(descriptor) = crate::agent::mcp_dispatch::mcp_lookup(state, &call.name) {
-                return mcp_tool_part(state, sid, mid, pid, idx, &descriptor, call, time).await;
+                return mcp_tool_part(state, sid, mid, pid, idx, &descriptor, call, time, &cancel)
+                    .await;
             }
             // Then check the plugin registry (Bun parity: `plugin.tool()`).
             if let Some(plugin_tool) = state.plugin_tool_lookup(&call.name) {
-                return plugin_tool_part(state, sid, mid, pid, idx, &plugin_tool, call, time).await;
+                return plugin_tool_part(
+                    state,
+                    sid,
+                    mid,
+                    pid,
+                    idx,
+                    &plugin_tool,
+                    call,
+                    time,
+                    &cancel,
+                )
+                .await;
             }
             return tool_error(
                 mid,
@@ -622,8 +728,11 @@ pub(crate) async fn real_tool_part(
             );
         }
     };
+    if is_tool_canceled(&cancel) {
+        return aborted_tool_part(mid, pid, idx, &canonical, call, time);
+    }
     match canonical.as_str() {
-        "read" => match fake_read(root, &call.input) {
+        "read" => match fake_read_cancel(root, &call.input, Some(&cancel)) {
             Ok((title, output, metadata)) => tool_completed(
                 mid,
                 pid,
@@ -638,7 +747,7 @@ pub(crate) async fn real_tool_part(
             ),
             Err(err) => tool_error(mid, pid, idx, &canonical, &call.id, &call.input, err, time),
         },
-        "grep" => match fake_grep(root, &call.input) {
+        "glob" => match fake_glob_cancel(root, &call.input, Some(&cancel)) {
             Ok((title, output, metadata)) => tool_completed(
                 mid,
                 pid,
@@ -653,10 +762,150 @@ pub(crate) async fn real_tool_part(
             ),
             Err(err) => tool_error(mid, pid, idx, &canonical, &call.id, &call.input, err, time),
         },
+        "grep" => match fake_grep_cancel(root, &call.input, Some(&cancel)) {
+            Ok((title, output, metadata)) => tool_completed(
+                mid,
+                pid,
+                idx,
+                &canonical,
+                &call.id,
+                &call.input,
+                title,
+                output,
+                metadata,
+                time,
+            ),
+            Err(err) => tool_error(mid, pid, idx, &canonical, &call.id, &call.input, err, time),
+        },
+        "webfetch" => {
+            match ask_permission(state, sid, mid, pid, idx, &canonical, &call.id, &call.input).await
+            {
+                Ok(()) => {
+                    if is_tool_canceled(&cancel) {
+                        aborted_tool_part(mid, pid, idx, &canonical, call, time)
+                    } else {
+                        match crate::agent::tools::webfetch::fake_webfetch_cancel(
+                            &call.input,
+                            Some(&cancel),
+                        )
+                        .await
+                        {
+                            Ok((title, output, metadata)) => tool_completed(
+                                mid,
+                                pid,
+                                idx,
+                                &canonical,
+                                &call.id,
+                                &call.input,
+                                title,
+                                output,
+                                metadata,
+                                time,
+                            ),
+                            Err(err) => tool_error(
+                                mid,
+                                pid,
+                                idx,
+                                &canonical,
+                                &call.id,
+                                &call.input,
+                                err,
+                                time,
+                            ),
+                        }
+                    }
+                }
+                Err(err) => tool_error(mid, pid, idx, &canonical, &call.id, &call.input, err, time),
+            }
+        }
+        "todowrite" => {
+            match ask_permission(state, sid, mid, pid, idx, &canonical, &call.id, &call.input).await
+            {
+                Ok(()) => {
+                    if is_tool_canceled(&cancel) {
+                        aborted_tool_part(mid, pid, idx, &canonical, call, time)
+                    } else {
+                        match todowrite_tool_part(state, sid, mid, pid, idx, call, time) {
+                            Ok(part) => part,
+                            Err(err) => tool_error(
+                                mid,
+                                pid,
+                                idx,
+                                &canonical,
+                                &call.id,
+                                &call.input,
+                                err,
+                                time,
+                            ),
+                        }
+                    }
+                }
+                Err(err) => tool_error(mid, pid, idx, &canonical, &call.id, &call.input, err, time),
+            }
+        }
+        "skill" => {
+            match ask_permission(state, sid, mid, pid, idx, &canonical, &call.id, &call.input).await
+            {
+                Ok(()) => {
+                    if is_tool_canceled(&cancel) {
+                        aborted_tool_part(mid, pid, idx, &canonical, call, time)
+                    } else {
+                        match skill_tool_part(state, mid, pid, idx, call, time) {
+                            Ok(part) => part,
+                            Err(err) => tool_error(
+                                mid,
+                                pid,
+                                idx,
+                                &canonical,
+                                &call.id,
+                                &call.input,
+                                err,
+                                time,
+                            ),
+                        }
+                    }
+                }
+                Err(err) => tool_error(mid, pid, idx, &canonical, &call.id, &call.input, err, time),
+            }
+        }
+        "suggest" => suggest_tool_part(state, sid, mid, pid, idx, call, time).await,
+        "lsp" => {
+            match ask_permission(state, sid, mid, pid, idx, &canonical, &call.id, &call.input).await
+            {
+                Ok(()) => {
+                    if is_tool_canceled(&cancel) {
+                        aborted_tool_part(mid, pid, idx, &canonical, call, time)
+                    } else {
+                        match lsp_tool_part(root, mid, pid, idx, call, time) {
+                            Ok(part) => part,
+                            Err(err) => tool_error(
+                                mid,
+                                pid,
+                                idx,
+                                &canonical,
+                                &call.id,
+                                &call.input,
+                                err,
+                                time,
+                            ),
+                        }
+                    }
+                }
+                Err(err) => tool_error(mid, pid, idx, &canonical, &call.id, &call.input, err, time),
+            }
+        }
         "write" | "edit" | "apply_patch" | "bash" => {
             match ask_permission(state, sid, mid, pid, idx, &canonical, &call.id, &call.input).await
             {
-                Ok(()) => real_mutating_tool_part(root, mid, pid, idx, &canonical, call, time),
+                Ok(()) => {
+                    if is_tool_canceled(&cancel) {
+                        aborted_tool_part(mid, pid, idx, &canonical, call, time)
+                    } else {
+                        real_mutating_tool_part(
+                            root, mid, pid, idx, &canonical, call, time, &cancel,
+                        )
+                    }
+                }
                 Err(err) => tool_error(mid, pid, idx, &canonical, &call.id, &call.input, err, time),
             }
         }
@@ -664,12 +913,29 @@ pub(crate) async fn real_tool_part(
             match ask_permission(state, sid, mid, pid, idx, &canonical, &call.id, &call.input).await
             {
                 Ok(()) => {
-                    task_tool_part(state, sid, mid, pid, idx, call, time, cancel, model).await
+                    if is_tool_canceled(&cancel) {
+                        aborted_tool_part(mid, pid, idx, &canonical, call, time)
+                    } else {
+                        task_tool_part(state, sid, mid, pid, idx, call, time, cancel, model, None)
+                            .await
+                    }
                 }
                 Err(err) => tool_error(mid, pid, idx, &canonical, &call.id, &call.input, err, time),
             }
         }
         "question" => question_tool_part(state, sid, mid, pid, idx, call, time).await,
+        "plan_exit" => tool_completed(
+            mid,
+            pid,
+            idx,
+            "plan_exit",
+            &call.id,
+            &call.input,
+            "Planning complete".to_string(),
+            "Plan is ready. Ending planning turn.".to_string(),
+            json!({}),
+            time,
+        ),
         _ => tool_error(
             mid,
             pid,
@@ -681,6 +947,446 @@ pub(crate) async fn real_tool_part(
             time,
         ),
     }
+}
+
+fn is_tool_canceled(cancel: &AtomicBool) -> bool {
+    crate::agent::is_canceled(cancel)
+}
+
+fn aborted_tool_part(
+    mid: &str,
+    pid: &str,
+    idx: usize,
+    tool: &str,
+    call: &ChatToolCall,
+    time: i64,
+) -> Value {
+    tool_error(
+        mid,
+        pid,
+        idx,
+        tool,
+        &call.id,
+        &call.input,
+        "Tool call aborted".to_string(),
+        time,
+    )
+}
+
+fn lsp_tool_part(
+    root: &FsPath,
+    mid: &str,
+    pid: &str,
+    idx: usize,
+    call: &ChatToolCall,
+    time: i64,
+) -> Result<Value, String> {
+    let operation = call
+        .input
+        .get("operation")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "operation is required".to_string())?;
+    let path = call
+        .input
+        .get("filePath")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "filePath is required".to_string())?;
+    let line = tool_position(&call.input, "line")?;
+    let character = tool_position(&call.input, "character")?;
+    let target = crate::util::paths::resolve_under(root, path)
+        .map_err(|_| format!("Unsafe path: {path}"))?;
+    if !target.exists() {
+        return Err(format!("File not found: {}", target.to_string_lossy()));
+    }
+    let rel = crate::util::paths::slash(target.strip_prefix(root).unwrap_or(&target));
+    let title = format!("{operation} {rel}:{line}:{character}");
+    let result = match operation {
+        "documentSymbol" => {
+            let mut out = Vec::new();
+            crate::routes::files::collect_symbols(root, &target, "", 200, &mut out);
+            out
+        }
+        "workspaceSymbol" => crate::routes::files::search_symbols(root, "", 200),
+        "goToDefinition"
+        | "findReferences"
+        | "hover"
+        | "goToImplementation"
+        | "prepareCallHierarchy"
+        | "incomingCalls"
+        | "outgoingCalls" => return Err("No LSP server available for this file type.".to_string()),
+        _ => return Err(format!("Unsupported LSP operation: {operation}")),
+    };
+    let output = if result.is_empty() {
+        format!("No results found for {operation}")
+    } else {
+        serde_json::to_string_pretty(&result).unwrap_or_else(|_| "[]".to_string())
+    };
+    Ok(tool_completed(
+        mid,
+        pid,
+        idx,
+        "lsp",
+        &call.id,
+        &call.input,
+        title,
+        output,
+        json!({ "result": result }),
+        time,
+    ))
+}
+
+fn tool_position(input: &Value, key: &str) -> Result<usize, String> {
+    let Some(value) = input.get(key).and_then(Value::as_u64) else {
+        return Err(format!("{key} must be greater than or equal to 1"));
+    };
+    if value == 0 {
+        return Err(format!("{key} must be greater than or equal to 1"));
+    }
+    Ok(value as usize)
+}
+
+async fn suggest_tool_part(
+    state: &Arc<AppState>,
+    sid: &str,
+    mid: &str,
+    pid: &str,
+    idx: usize,
+    call: &ChatToolCall,
+    time: i64,
+) -> Value {
+    let text = match call.input.get("suggest").and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => value.to_string(),
+        _ => {
+            return tool_error(
+                mid,
+                pid,
+                idx,
+                "suggest",
+                &call.id,
+                &call.input,
+                "suggest is required".to_string(),
+                time,
+            );
+        }
+    };
+    let actions = match validate_suggestion_actions(&call.input) {
+        Ok(value) => value,
+        Err(err) => {
+            return tool_error(mid, pid, idx, "suggest", &call.id, &call.input, err, time);
+        }
+    };
+    let id = format!("suggestion_{mid}_{pid}_{idx}");
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let info = json!({
+        "id": id,
+        "sessionID": sid,
+        "text": text,
+        "actions": actions,
+        "blocking": false,
+        "tool": {
+            "messageID": mid,
+            "callID": call.id,
+        },
+    });
+    state.suggestions.lock().unwrap().insert(
+        id.clone(),
+        crate::PendingSuggestion {
+            info: info.clone(),
+            reply: tx,
+        },
+    );
+    crate::http::sse::publish(state, GlobalEvent::bus("suggestion.shown", info.clone()));
+    crate::publish_idle(state, sid);
+
+    match rx.await {
+        Ok(crate::SuggestionDecision::Dismiss) => tool_completed(
+            mid,
+            pid,
+            idx,
+            "suggest",
+            &call.id,
+            &call.input,
+            "Suggestion dismissed".to_string(),
+            "User dismissed the suggestion.".to_string(),
+            json!({ "dismissed": true, "truncated": false }),
+            time,
+        ),
+        Ok(crate::SuggestionDecision::Accept(index)) => {
+            crate::publish_status(state, sid, "busy");
+            let Some(action) = info
+                .get("actions")
+                .and_then(Value::as_array)
+                .and_then(|items| items.get(index))
+                .cloned()
+            else {
+                return tool_error(
+                    mid,
+                    pid,
+                    idx,
+                    "suggest",
+                    &call.id,
+                    &call.input,
+                    format!("Invalid action index: {index}"),
+                    time,
+                );
+            };
+            let label = action
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or("Suggestion");
+            let prompt = action.get("prompt").and_then(Value::as_str).unwrap_or("");
+            let resolved = resolve_suggestion_prompt(state, prompt);
+            tool_completed(
+                mid,
+                pid,
+                idx,
+                "suggest",
+                &call.id,
+                &call.input,
+                format!("User accepted: {label}"),
+                format!(
+                    "User accepted the suggestion \"{label}\". Carry out the following request now:\n\n{resolved}"
+                ),
+                json!({ "accepted": action, "dismissed": false, "truncated": false }),
+                time,
+            )
+        }
+        Err(_) => tool_error(
+            mid,
+            pid,
+            idx,
+            "suggest",
+            &call.id,
+            &call.input,
+            "Suggestion was cancelled".to_string(),
+            time,
+        ),
+    }
+}
+
+fn validate_suggestion_actions(input: &Value) -> Result<Vec<Value>, String> {
+    let Some(items) = input.get("actions").and_then(Value::as_array) else {
+        return Err("actions is required".to_string());
+    };
+    if items.is_empty() || items.len() > 2 {
+        return Err("actions must contain 1 or 2 items".to_string());
+    }
+    items
+        .iter()
+        .map(|item| {
+            let label = item
+                .get("label")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "action.label is required".to_string())?;
+            let prompt = item
+                .get("prompt")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "action.prompt is required".to_string())?;
+            let mut action = json!({ "label": label, "prompt": prompt });
+            if let Some(description) = item.get("description").and_then(Value::as_str) {
+                action["description"] = json!(description);
+            }
+            Ok(action)
+        })
+        .collect()
+}
+
+fn resolve_suggestion_prompt(state: &AppState, prompt: &str) -> String {
+    let Some((name, args)) = crate::registry::slash(prompt) else {
+        return prompt.to_string();
+    };
+    let paths = state.store.paths();
+    let root = FsPath::new(&paths.directory);
+    let config = FsPath::new(&paths.config);
+    let home = FsPath::new(&paths.home);
+    let Some(cmd) = crate::registry::command(root, config, home, name) else {
+        return prompt.to_string();
+    };
+    let out = crate::registry::expand(&cmd.template, args);
+    if out.is_empty() {
+        prompt.to_string()
+    } else {
+        out
+    }
+}
+
+fn skill_tool_part(
+    state: &Arc<AppState>,
+    mid: &str,
+    pid: &str,
+    idx: usize,
+    call: &ChatToolCall,
+    time: i64,
+) -> Result<Value, String> {
+    let name = call
+        .input
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "name is required".to_string())?;
+    let paths = state.store.paths();
+    let root = FsPath::new(&paths.directory);
+    let config = FsPath::new(&paths.config);
+    let home = FsPath::new(&paths.home);
+    let list = crate::registry::skills(root, config, home);
+    let info = list.iter().find(|item| item.name == name).ok_or_else(|| {
+        let available = list
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "Skill \"{name}\" not found. Available skills: {}",
+            if available.is_empty() {
+                "none".to_string()
+            } else {
+                available
+            }
+        )
+    })?;
+    let dir = FsPath::new(&info.location)
+        .parent()
+        .ok_or_else(|| "skill has no parent directory".to_string())?;
+    let files = sample_skill_files(dir);
+    let base = file_url(dir);
+    let output = [
+        format!("<skill_content name=\"{}\">", info.name),
+        format!("# Skill: {}", info.name),
+        String::new(),
+        info.content.trim().to_string(),
+        String::new(),
+        format!("Base directory for this skill: {base}"),
+        "Relative paths in this skill (e.g., scripts/, reference/) are relative to this base directory.".to_string(),
+        "Note: file list is sampled.".to_string(),
+        String::new(),
+        "<skill_files>".to_string(),
+        files,
+        "</skill_files>".to_string(),
+        "</skill_content>".to_string(),
+    ]
+    .join("\n");
+    Ok(tool_completed(
+        mid,
+        pid,
+        idx,
+        "skill",
+        &call.id,
+        &call.input,
+        format!("Loaded skill: {}", info.name),
+        output,
+        json!({ "name": info.name, "dir": dir.to_string_lossy() }),
+        time,
+    ))
+}
+
+fn sample_skill_files(dir: &FsPath) -> String {
+    let mut todo = vec![dir.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(path) = todo.pop() {
+        let Ok(items) = std::fs::read_dir(path) else {
+            continue;
+        };
+        let mut items = items.flatten().map(|item| item.path()).collect::<Vec<_>>();
+        items.sort();
+        for item in items.into_iter().rev() {
+            if files.len() >= 10 {
+                break;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(&item) else {
+                continue;
+            };
+            if meta.is_dir() {
+                todo.push(item);
+                continue;
+            }
+            if item.file_name().and_then(|value| value.to_str()) == Some("SKILL.md") {
+                continue;
+            }
+            files.push(format!("<file>{}</file>", item.to_string_lossy()));
+        }
+        if files.len() >= 10 {
+            break;
+        }
+    }
+    files.join("\n")
+}
+
+fn file_url(path: &FsPath) -> String {
+    let value = path.to_string_lossy().replace('\\', "/");
+    if value.starts_with('/') {
+        format!("file://{value}")
+    } else {
+        format!("file:///{value}")
+    }
+}
+
+fn todowrite_tool_part(
+    state: &Arc<AppState>,
+    sid: &str,
+    mid: &str,
+    pid: &str,
+    idx: usize,
+    call: &ChatToolCall,
+    time: i64,
+) -> Result<Value, String> {
+    let todos = validate_todos(&call.input)?;
+    let saved = state
+        .store
+        .update_todos(sid, &todos)
+        .map_err(|err| format!("Failed to update todos: {err}"))?
+        .ok_or_else(|| format!("Session not found: {sid}"))?;
+    crate::http::sse::publish(
+        state,
+        GlobalEvent::bus("todo.updated", json!({ "sessionID": sid, "todos": saved })),
+    );
+    let active = saved
+        .iter()
+        .filter(|todo| todo.get("status").and_then(Value::as_str) != Some("completed"))
+        .count();
+    Ok(tool_completed(
+        mid,
+        pid,
+        idx,
+        "todowrite",
+        &call.id,
+        &call.input,
+        format!("{active} todos"),
+        serde_json::to_string_pretty(&saved).unwrap_or_else(|_| "[]".to_string()),
+        json!({ "todos": saved }),
+        time,
+    ))
+}
+
+fn validate_todos(input: &Value) -> Result<Vec<Value>, String> {
+    let Some(items) = input.get("todos").and_then(Value::as_array) else {
+        return Err("todos is required".to_string());
+    };
+    items
+        .iter()
+        .map(|item| {
+            let content = required_todo_str(item, "content")?;
+            let status = required_todo_str(item, "status")?;
+            let priority = required_todo_str(item, "priority")?;
+            Ok(json!({
+                "content": content,
+                "status": status,
+                "priority": priority,
+            }))
+        })
+        .collect()
+}
+
+fn required_todo_str(input: &Value, key: &str) -> Result<String, String> {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("todo.{key} is required"))
 }
 
 /// Built-in `question` tool: surfaces a UI prompt via [`ask_question`]
@@ -781,6 +1487,7 @@ pub(crate) async fn task_tool_part(
     time: i64,
     cancel: Arc<AtomicBool>,
     model: Option<Value>,
+    provider: Option<Value>,
 ) -> Value {
     match execute_task_tool(
         state,
@@ -793,6 +1500,7 @@ pub(crate) async fn task_tool_part(
         &call.input,
         cancel,
         model,
+        provider,
     )
     .await
     {
@@ -813,15 +1521,12 @@ pub(crate) async fn task_tool_part(
 }
 
 fn validate_task_agent(state: &AppState, agent: &str) -> Result<(), String> {
-    if agent == "general" {
-        return Ok(());
-    }
-    let Some(_) = state.agent_config(agent) else {
+    let Some(info) = state.agent_info(agent) else {
         return Err(format!(
             "Unknown agent type: {agent} is not a valid agent type"
         ));
     };
-    if state.agent_mode(agent).as_deref() == Some("primary") {
+    if info.get("mode").and_then(Value::as_str) == Some("primary") {
         return Err(format!(
             "Agent \"{agent}\" is a primary agent and cannot be used as a subagent"
         ));
@@ -853,6 +1558,53 @@ fn task_child_permission(state: &AppState, parent: &Session) -> Value {
 
 fn task_inherits(rule: &PermissionRule) -> bool {
     matches!(rule.permission.as_str(), "edit" | "bash" | "mcp")
+        || is_mcp_tool_permission(&rule.permission)
+}
+
+fn is_mcp_tool_permission(permission: &str) -> bool {
+    permission.ends_with("_*") || permission.contains('_')
+}
+
+fn task_child_tools() -> Value {
+    json!({
+        "read": true,
+        "glob": true,
+        "grep": true,
+        "webfetch": true,
+        "skill": true,
+        "suggest": true,
+        "lsp": true,
+        "todowrite": false,
+        "write": true,
+        "edit": true,
+        "apply_patch": true,
+        "bash": true,
+        "question": true,
+        "task": false,
+        "plan_exit": false,
+        "mcp": true,
+        "plugin": true,
+    })
+}
+
+fn task_child_model(state: &AppState, agent: &str, parent: Option<Value>) -> Value {
+    state
+        .agent_info(agent)
+        .and_then(|info| info.get("model").cloned())
+        .or(parent)
+        .unwrap_or_else(|| {
+            json!({
+                "providerID": "openai",
+                "modelID": "gpt-5.1-codex"
+            })
+        })
+}
+
+fn task_child_variant(input: &Value, model: &Value) -> Option<Value> {
+    input
+        .get("variant")
+        .cloned()
+        .or_else(|| model.get("variant").cloned())
 }
 
 fn session_permission_rules(value: Option<&Value>) -> Vec<PermissionRule> {
@@ -909,6 +1661,7 @@ async fn execute_task_tool(
     input: &Value,
     cancel: Arc<AtomicBool>,
     model: Option<Value>,
+    provider: Option<Value>,
 ) -> Result<(String, String, Value), String> {
     let description = required_str(input, "description")?;
     let prompt = required_str(input, "prompt")?;
@@ -945,12 +1698,8 @@ async fn execute_task_tool(
             .map_err(|err| format!("Failed to create task session: {err}"))?,
     };
     publish_task_child(state, sid, mid, pid, idx, call, time, &child.id);
-    let model = model.unwrap_or_else(|| {
-        json!({
-            "providerID": "openai",
-            "modelID": "gpt-5.1-codex"
-        })
-    });
+    let model = task_child_model(state, &agent, model);
+    let variant = task_child_variant(input, &model);
     let _slot = TASK_TOOL_SLOTS
         .clone()
         .acquire_owned()
@@ -962,13 +1711,19 @@ async fn execute_task_tool(
     // runtime instead of constructing one for every task call.
     let got = state.clone();
     let child_id = child.id.clone();
+    let parent_id = sid.to_string();
     let child_prompt = prompt.clone();
     let child_agent = agent.clone();
     let child_model = model.clone();
+    let child_variant = variant.clone();
     let result = tokio::task::spawn_blocking(move || {
         block_on_task_runtime(async move {
-            let guard = crate::agent::turn::start_runner(got.clone(), &child_id)
-                .map_err(|err| format!("Task session is busy: {err:?}"))?;
+            let guard = crate::agent::turn::start_runner_with_parent(
+                got.clone(),
+                &child_id,
+                Some(parent_id),
+            )
+            .map_err(|err| format!("Task session is busy: {err:?}"))?;
             let child_cancel = guard.cancel.clone();
             let bridge = tokio::spawn(async move {
                 while !cancel.load(Ordering::SeqCst) && !child_cancel.load(Ordering::SeqCst) {
@@ -978,19 +1733,34 @@ async fn execute_task_tool(
                     child_cancel.store(true, Ordering::SeqCst);
                 }
             });
-            let result = crate::agent::turn::prompt_turn(
-                &guard.state,
-                &child_id,
-                PromptInput {
-                    parts: vec![json!({ "type": "text", "text": child_prompt })],
-                    agent: Some(child_agent),
-                    model: Some(child_model),
-                    ..Default::default()
-                },
-                guard.cancel.clone(),
-            )
-            .await
-            .map_err(|err| format!("Task prompt failed: {err:?}"));
+            let run_state = guard.state.clone();
+            let run_id = child_id.clone();
+            let run_cancel = guard.cancel.clone();
+            let task = tokio::task::spawn_local(async move {
+                crate::agent::turn::prompt_turn(
+                    &run_state,
+                    &run_id,
+                    PromptInput {
+                        parts: vec![json!({ "type": "text", "text": child_prompt })],
+                        agent: Some(child_agent),
+                        model: Some(child_model),
+                        tools: Some(task_child_tools()),
+                        variant: child_variant,
+                        provider,
+                        ..Default::default()
+                    },
+                    run_cancel,
+                )
+                .await
+            });
+            if let Some(runner) = guard.state.runners.lock().unwrap().get(&child_id) {
+                *runner.abort.lock().unwrap() = Some(task.abort_handle());
+            }
+            let result = match task.await {
+                Ok(result) => result.map_err(|err| format!("Task prompt failed: {err:?}")),
+                Err(err) if err.is_cancelled() => Err("Task prompt aborted".to_string()),
+                Err(err) => Err(format!("Task prompt failed: {err}")),
+            };
             bridge.abort();
             drop(guard);
             result
@@ -1093,12 +1863,13 @@ pub(crate) fn real_mutating_tool_part(
     tool: &str,
     call: &ChatToolCall,
     time: i64,
+    cancel: &AtomicBool,
 ) -> Value {
     let res = match tool {
         "write" => fake_write(root, &call.input),
         "edit" => fake_edit(root, &call.input),
         "apply_patch" => fake_apply_patch(root, &call.input),
-        "bash" => fake_bash(root, &call.input),
+        "bash" => crate::agent::tools::bash::fake_bash_with_cancel(root, &call.input, Some(cancel)),
         _ => Err(format!("Unsupported tool: {tool}")),
     };
     match res {
@@ -1118,7 +1889,21 @@ pub(crate) fn real_mutating_tool_part(
     }
 }
 
-pub(crate) fn assistant_info(user: &MessageAppendResult, input: &PromptInput) -> Value {
+/// Build the `path: { cwd, root }` object Bun emits at
+/// [`session/prompt.ts:1537`](../../../../../opencode/src/session/prompt.ts:1537).
+/// `cwd` is the request directory; `root` is the project worktree.
+pub(crate) fn assistant_path(paths: &KiloPath) -> Value {
+    json!({
+        "cwd": paths.directory,
+        "root": paths.worktree,
+    })
+}
+
+pub(crate) fn assistant_info(
+    paths: &KiloPath,
+    user: &MessageAppendResult,
+    input: &PromptInput,
+) -> Value {
     let agent = input.agent.as_deref().unwrap_or("code");
     json!({
         "role": "assistant",
@@ -1126,7 +1911,7 @@ pub(crate) fn assistant_info(user: &MessageAppendResult, input: &PromptInput) ->
         "providerID": "local",
         "modelID": "fake-echo",
         "agent": agent,
-        "path": {},
+        "path": assistant_path(paths),
         "cost": 0,
         "tokens": {
             "input": 0,
@@ -1138,51 +1923,66 @@ pub(crate) fn assistant_info(user: &MessageAppendResult, input: &PromptInput) ->
 }
 
 pub(crate) fn assistant_provider_info(
+    paths: &KiloPath,
     user: &MessageAppendResult,
     input: &PromptInput,
     out: &ChatOutput,
 ) -> Value {
     let agent = input.agent.as_deref().unwrap_or("code");
+    let cost = out
+        .usage
+        .as_ref()
+        .map(|usage| usage_cost_value(input.model.as_ref(), usage))
+        .unwrap_or_else(|| json!(0));
+    let tokens = out
+        .usage
+        .as_ref()
+        .map(tokens_value)
+        .unwrap_or_else(crate::agent::openai_stream::zero_tokens);
     json!({
         "role": "assistant",
         "parentID": user.info["id"].clone(),
         "providerID": out.provider,
         "modelID": out.model,
         "agent": agent,
-        "path": {},
-        "cost": 0,
-        "tokens": {
-            "input": 0,
-            "output": 0,
-            "reasoning": 0,
-            "cache": { "read": 0, "write": 0 }
-        },
+        "path": assistant_path(paths),
+        "cost": cost,
+        "tokens": tokens,
     })
 }
 
 pub(crate) fn assistant_completed_info(start: &MessageAppendResult) -> Value {
     let mut info = start.info.clone();
+    let now = now_millis();
     info["finish"] = json!("stop");
     if let Some(time) = info.get_mut("time").and_then(Value::as_object_mut) {
-        time.insert("updated".to_string(), json!(start.time));
-        time.insert("completed".to_string(), json!(start.time));
+        time.insert("updated".to_string(), json!(now));
+        time.insert("completed".to_string(), json!(now));
         return info;
     }
 
     info["time"] = json!({
         "created": start.time,
-        "updated": start.time,
-        "completed": start.time,
+        "updated": now,
+        "completed": now,
     });
     info
 }
 
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub(crate) fn assistant_error_info(
+    paths: &KiloPath,
     user: &MessageAppendResult,
     input: &PromptInput,
     error: Value,
 ) -> Value {
-    let mut info = assistant_info(user, input);
+    let mut info = assistant_info(paths, user, input);
     info["error"] = error;
     info["finish"] = json!("error");
     info
@@ -1363,10 +2163,10 @@ pub(crate) fn prompt_text(parts: &[Value]) -> String {
     text
 }
 
-pub(crate) fn user_info(input: &PromptInput) -> Value {
+pub(crate) fn user_info(paths: &KiloPath, input: &PromptInput) -> Value {
     let mut info = json!({
         "role": "user",
-        "path": {},
+        "path": assistant_path(paths),
     });
     if let Some(id) = input.message_id.as_deref() {
         info["id"] = json!(id);

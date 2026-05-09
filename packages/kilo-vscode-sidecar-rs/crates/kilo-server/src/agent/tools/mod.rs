@@ -13,7 +13,7 @@
 //! `agent::fake` MUST NOT import `tools::fs::fake_read` etc. directly —
 //! the whole point of `dispatch` is to centralise the match arm.
 
-use std::path::Path as FsPath;
+use std::{path::Path as FsPath, sync::atomic::AtomicBool};
 
 use serde_json::Value;
 
@@ -21,11 +21,14 @@ pub(crate) mod bash;
 pub(crate) mod common;
 pub(crate) mod defs;
 pub(crate) mod diff;
+pub(crate) mod encoding;
 pub(crate) mod fs;
 pub(crate) mod patch;
+pub(crate) mod replacers;
+pub(crate) mod webfetch;
 
-use bash::fake_bash;
-use fs::{fake_edit, fake_grep, fake_read, fake_write};
+use bash::{fake_bash, fake_bash_with_cancel};
+use fs::{fake_edit, fake_glob, fake_glob_cancel, fake_grep, fake_read, fake_write};
 use patch::fake_apply_patch;
 
 /// The single seam `agent::fake` reaches into. Matches on the canonical
@@ -39,18 +42,35 @@ use patch::fake_apply_patch;
 /// `agent::fake::fake_tool_part` carries the FakeCall-specific shape
 /// (e.g. the `invalid: Some(name)` field) that informs the error
 /// message; reproducing it here would just be a forwarding wrapper.
+#[allow(dead_code)]
 pub(crate) fn dispatch(
     name: &str,
     input: &Value,
     root: &FsPath,
 ) -> Option<Result<(String, String, Value), String>> {
+    dispatch_with_cancel(name, input, root, None)
+}
+
+pub(crate) fn dispatch_with_cancel(
+    name: &str,
+    input: &Value,
+    root: &FsPath,
+    cancel: Option<&AtomicBool>,
+) -> Option<Result<(String, String, Value), String>> {
     Some(match name {
         "read" => fake_read(root, input),
+        "glob" => match cancel {
+            Some(cancel) => fake_glob_cancel(root, input, Some(cancel)),
+            None => fake_glob(root, input),
+        },
         "grep" => fake_grep(root, input),
         "write" => fake_write(root, input),
         "edit" => fake_edit(root, input),
         "apply_patch" => fake_apply_patch(root, input),
-        "bash" => fake_bash(root, input),
+        "bash" => match cancel {
+            Some(cancel) => fake_bash_with_cancel(root, input, Some(cancel)),
+            None => fake_bash(root, input),
+        },
         _ => return None,
     })
 }

@@ -439,7 +439,7 @@ async fn m7_abort_mid_stream_oauth_path_has_no_orphan_message() {
         json!({
             "type": "oauth",
             "refresh": "rt",
-            "access": "at",
+            "access": "e30.eyJleHAiOjQxMDI0NDQ4MDAsImNoYXRncHRfYWNjb3VudF9pZCI6ImFjY3RfMSJ9.sig",
             "expires": 9999999999999i64,
             "accountId": "acct_1"
         }),

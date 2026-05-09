@@ -64,13 +64,20 @@ impl Drop for AppState {
 
 pub(crate) const KNOWN_TOOLS: &[&str] = &[
     "read",
+    "glob",
     "grep",
+    "webfetch",
+    "todowrite",
+    "skill",
+    "suggest",
+    "lsp",
     "write",
     "edit",
     "apply_patch",
     "bash",
     "task",
     "question",
+    "plan_exit",
 ];
 
 pub async fn serve(

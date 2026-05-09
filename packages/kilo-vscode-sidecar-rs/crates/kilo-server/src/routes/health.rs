@@ -2,12 +2,13 @@
 //! status, PTY stubs, and the remote-feature stub. MCP runtime moved to
 //! `routes::mcp`; the OAuth-related provider routes live in `routes::config`.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use axum::{extract::State, response::IntoResponse, Json};
-use kilo_protocol::Health;
+use kilo_protocol::{GlobalEvent, Health};
 use serde_json::json;
 
+use crate::http::sse;
 use crate::AppState;
 
 pub(crate) async fn health() -> Json<Health> {
@@ -18,22 +19,27 @@ pub(crate) async fn paths(State(state): State<Arc<AppState>>) -> impl IntoRespon
     Json(state.store.paths())
 }
 
-/// `POST /global/dispose` — Bun returns `true`. Bun also fires a
-/// `global.disposed` SSE event and clears its in-memory config cache.
-/// In Rust, the config cache is per-request (`Store::config()` re-reads
-/// from disk every call), so a no-op is contract-equivalent for now. The
-/// event is not emitted because no Rust subscriber listens for it; if a
-/// future webview gains a `global.disposed` handler, this should fire
-/// through `state.bus`.
-pub(crate) async fn global_dispose() -> impl IntoResponse {
+/// `POST /global/dispose` — Bun returns `true` and publishes
+/// `global.disposed` so webview subscribers (`event-reducer.ts:27`,
+/// `KiloProvider.ts:2712`, `AutocompleteServiceManager.ts:106`)
+/// re-bootstrap after login/logout/org-switch. The Rust config cache is
+/// per-request, so the response stays a no-op `true`; only the event is
+/// added.
+pub(crate) async fn global_dispose(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    sse::publish(&state, GlobalEvent::bus("global.disposed", json!({})));
     Json(true)
 }
 
-/// `POST /instance/dispose` — Bun returns `true` after disposing the
-/// per-directory `Instance`. Rust does not yet have a per-directory
-/// instance container (single-store-per-process model in M5), so this is
-/// a no-op. M9 will revisit when worktree concurrency lands.
-pub(crate) async fn instance_dispose() -> impl IntoResponse {
+/// `POST /instance/dispose` — Bun returns `true` and publishes
+/// `server.instance.disposed`, which the `/event` SSE loop watches to
+/// terminate the stream so the SDK reconnect callback chain refires
+/// (`event-reducer.ts:105`, `KiloProvider.ts:2717-2723`). Rust still has
+/// no per-directory instance container; the response remains `true`.
+pub(crate) async fn instance_dispose(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    sse::publish(
+        &state,
+        GlobalEvent::bus("server.instance.disposed", json!({})),
+    );
     Json(true)
 }
 
@@ -41,25 +47,8 @@ pub(crate) async fn warnings() -> impl IntoResponse {
     Json(Vec::<serde_json::Value>::new())
 }
 
-pub(crate) async fn agents() -> impl IntoResponse {
-    Json(json!([
-        {
-            "name": "code",
-            "description": "Default coding agent.",
-            "mode": "primary",
-            "native": true,
-            "permission": [],
-            "options": {}
-        },
-        {
-            "name": "plan",
-            "description": "Plan mode.",
-            "mode": "primary",
-            "native": true,
-            "permission": [],
-            "options": {}
-        }
-    ]))
+pub(crate) async fn agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(crate::agent::catalog::list(&state))
 }
 
 // PTY routes moved to `crate::routes::pty`. This module no longer
@@ -70,8 +59,13 @@ pub(crate) async fn project(State(state): State<Arc<AppState>>) -> impl IntoResp
     Json(state.store.project())
 }
 
-pub(crate) async fn status() -> impl IntoResponse {
-    Json(json!({}))
+pub(crate) async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let runners = state.runners.lock().unwrap();
+    let status = runners
+        .keys()
+        .map(|id| (id.clone(), json!({ "type": "busy" })))
+        .collect::<BTreeMap<_, _>>();
+    Json(status)
 }
 
 /// `GET /remote/status` — the extension's RemoteStatusService polls this.

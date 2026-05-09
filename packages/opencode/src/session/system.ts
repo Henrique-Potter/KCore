@@ -96,7 +96,7 @@ export const layer = Layer.effect(
             `  Is directory a git repo: ${project.vcs === "git" ? "yes" : "no"}`,
             `  Platform: ${process.platform}`,
             `  Today's date: ${new Date().toDateString()}`,
-            `  Project config: .kilo/command/*.md, .kilo/agent/*.md, kilo.json, AGENTS.md. Put new commands and agents in .kilo/. Do not use .kilocode/ or .opencode/.`, // kilocode_change
+            `  Optional project config: AGENTS.md, kilo.json[c], .kilo/kilo.json[c], .kilo/command/*.md, .kilo/agent/*.md. Do not assume optional config files exist; list/glob before reading them. Put new commands and agents in .kilo/. Do not use .kilocode/ or .opencode/.`, // kilocode_change
             `  Global config: ${Global.Path.config}/ (same structure)`, // kilocode_change
             ...staticEnvLines(editorContext), // kilocode_change
             `</env>`,

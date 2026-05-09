@@ -46,6 +46,58 @@ pub(crate) const ALLOWED_INTERNAL_ERROR_NAMES: &[&str] = &[
     "shell_unavailable",
     "schema_migration_failed",
     "store_unavailable",
+    // OAuth flow errors (4xx; emitted by routes/config.rs OAuth handlers).
+    "OauthUnsupportedProvider",
+    "OauthUnsupportedMethod",
+    "OauthCodeMissing",
+    "OauthPendingMissing",
+    "OauthStateMismatch",
+    "OauthCallbackTimeout",
+    // PTY route errors (Rust-only surface; routes/pty.rs).
+    "RustPtyOpenError",
+    "RustPtySpawnError",
+    "RustPtyWriterError",
+    "RustPtyReaderError",
+    "RustPtyNotFoundError",
+    "RustPtyWriteError",
+    "RustPtyResizeError",
+    // Worktree route errors (routes/worktree.rs).
+    "WorktreeInvalidInputError",
+    "WorktreeCreateFailedError",
+    "WorktreeRemoveFailedError",
+    "WorktreeResetFailedError",
+    "WorktreeResetUnsafeError",
+    "WorktreeNotGitError",
+    "WorktreeListFailedError",
+    "WorktreePathSafetyError",
+    // MCP route errors (Rust-only surface; routes/mcp.rs and kilo-mcp).
+    "RustMcpAuthInvalidError",
+    "RustMcpNotFoundError",
+    "RustMcpAuthPersistError",
+    "RustMcpOAuthConfigError",
+    "RustMcpOAuthPersistError",
+    "RustMcpOAuthCallbackError",
+    "RustMcpOAuthStateError",
+    "RustMcpDisabledError",
+    "RustMcpDisconnectedError",
+    "RustMcpOAuthDiscoveryError",
+    "RustMcpOAuthRegistrationError",
+    "RustMcpAuthRefreshError",
+    "RustMcpRemoteConfigError",
+    "RustMcpHttpError",
+    "RustMcpTimeoutError",
+    "RustMcpMalformedResponseError",
+    "RustMcpToolError",
+    "RustMcpWriteError",
+    "RustMcpClosedError",
+    "RustMcpNotImplementedError",
+    // Assistant-side error-envelope names. These are emitted via direct
+    // `json!` into `assistant.info.error` (NOT via `internal_error_named`)
+    // and are documented in CONTRACT.md's "Assistant message error
+    // envelopes" table. Listed here so the registry stays the single
+    // source of truth for every named error the sidecar emits.
+    "CompactionError",
+    "APIError",
 ];
 
 #[derive(Debug)]
@@ -121,6 +173,22 @@ pub(crate) fn internal_error_named(name: &str, message: impl Into<String>) -> Re
          add it to error.rs and CONTRACT.md so the SDK type union stays in sync",
     );
     named_response(StatusCode::INTERNAL_SERVER_ERROR, name, message)
+}
+
+/// Bun-compatible 400 NamedError response with the registry assertion
+/// that `internal_error_named` enforces. Canonical replacement for the
+/// free `bad_request_named` helper in `routes/config.rs`, which bypasses
+/// `ALLOWED_INTERNAL_ERROR_NAMES` and is therefore deprecated. Call
+/// sites are migrated in a separate pass; new code should call this
+/// helper.
+#[allow(dead_code)]
+pub(crate) fn bad_request_named(name: &'static str, message: impl Into<String>) -> Response {
+    debug_assert!(
+        ALLOWED_INTERNAL_ERROR_NAMES.contains(&name),
+        "bad_request_named({name:?}) uses a name absent from ALLOWED_INTERNAL_ERROR_NAMES — \
+         add it to error.rs and CONTRACT.md so the SDK type union stays in sync",
+    );
+    named_response(StatusCode::BAD_REQUEST, name, message)
 }
 
 /// Build a non-2xx Bun-compatible NamedError response with a non-default

@@ -18,12 +18,12 @@
 //!   helper. Permission gating is the caller's responsibility — see
 //!   `agent::parts::mcp_tool_part`.
 
-use std::time::Duration;
+use std::{sync::atomic::AtomicBool, time::Duration};
 
 use kilo_provider::ChatTool;
 use serde_json::{json, Value};
 
-use crate::routes::mcp::{mcp_call_child, mcp_call_remote, mcp_config, MCP_DEFAULT_TIMEOUT_MS};
+use crate::routes::mcp::{mcp_call_remote, mcp_config, MCP_DEFAULT_TIMEOUT_MS};
 use crate::AppState;
 
 /// Namespaced view of an MCP tool: the public name the model sees, the
@@ -99,6 +99,7 @@ pub(crate) async fn mcp_invoke(
     state: &AppState,
     descriptor: &McpToolDescriptor,
     arguments: Value,
+    cancel: &AtomicBool,
 ) -> McpInvokeResult {
     let cfg = match mcp_config(state, &descriptor.client) {
         Some(cfg) => cfg,
@@ -118,6 +119,16 @@ pub(crate) async fn mcp_invoke(
     };
     match cfg {
         kilo_mcp::Config::Local { timeout, .. } => {
+            // M1 hardening gap (deferred): the global `mcp_children`
+            // Mutex is held across the synchronous `mcp_call_child_cancel`
+            // poll loop, blocking concurrent MCP status / refresh / second
+            // tool calls until this one settles. The cancel race inside
+            // `mcp_wait_response_cancel` still wins promptly, so Stop is
+            // honored — but unrelated MCP traffic is gated. Fixing this
+            // safely means lifting per-server children behind their own
+            // `Arc<Mutex<McpChild>>` so the BTreeMap lock releases before
+            // the poll. ~13 access sites in routes/mcp.rs need the same
+            // change; punted to a follow-up to avoid a half-done refactor.
             let timeout = Duration::from_millis(timeout.unwrap_or(MCP_DEFAULT_TIMEOUT_MS).max(1));
             let mut children = state.mcp_children.lock().unwrap();
             let Some(child) = children.get_mut(&descriptor.client) else {
@@ -126,7 +137,7 @@ pub(crate) async fn mcp_invoke(
                     descriptor.client
                 ));
             };
-            match mcp_call_child(child, input, timeout) {
+            match crate::routes::mcp::mcp_call_child_cancel(child, input, timeout, Some(cancel)) {
                 Ok(value) => McpInvokeResult::Ok(value),
                 Err(err) => McpInvokeResult::Err(err.message().to_string()),
             }
@@ -140,10 +151,21 @@ pub(crate) async fn mcp_invoke(
             // Remote dispatch needs request headers (potentially OAuth-resolved). For
             // the agent-loop slice we use the static configured headers only —
             // OAuth refresh on demand is route-only for now.
-            match mcp_call_remote(&url, headers.as_ref(), input, timeout).await {
-                Ok(value) => McpInvokeResult::Ok(value),
-                Err(err) => McpInvokeResult::Err(err.message().to_string()),
+            tokio::select! {
+                res = mcp_call_remote(&url, headers.as_ref(), input, timeout) => {
+                    match res {
+                        Ok(value) => McpInvokeResult::Ok(value),
+                        Err(err) => McpInvokeResult::Err(err.message().to_string()),
+                    }
+                }
+                _ = wait_cancel(cancel) => McpInvokeResult::Err("MCP tool call aborted".to_string()),
             }
         }
+    }
+}
+
+async fn wait_cancel(cancel: &AtomicBool) {
+    while !crate::agent::is_canceled(cancel) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

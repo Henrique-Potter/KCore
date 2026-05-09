@@ -6,6 +6,9 @@
 //! preserves any non-token fields (`enterpriseUrl`, future fields) across a
 //! refresh — Audit Fix 7.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
 use serde_json::{json, Value};
 
 use crate::util::encoding::unix_millis;
@@ -15,11 +18,33 @@ use super::crypto::{claim_account, jwt_claims};
 use super::url::url_encode;
 use super::OPENAI_CLIENT_ID;
 
+/// 30s cap on the token endpoint. Independent of the cancel race so a
+/// stuck endpoint with no Stop press still surfaces a timeout instead of
+/// hanging indefinitely.
+const TOKEN_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Polling helper mirroring `kilo_provider::until_cancel`. Used to race
+/// the synchronous `reqwest` send/json futures against an `AtomicBool`
+/// cancel signal at 10ms cadence.
+async fn until_cancel(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn token_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(TOKEN_HTTP_TIMEOUT)
+        .build()
+        .map_err(|err| err.to_string())
+}
+
 pub(crate) async fn exchange_code(
     endpoint: &str,
     code: &str,
     redirect: &str,
     verifier: &str,
+    cancel: &AtomicBool,
 ) -> Result<Value, String> {
     let body = format!(
         "grant_type=authorization_code&code={}&redirect_uri={}&client_id={OPENAI_CLIENT_ID}&code_verifier={}",
@@ -27,17 +52,24 @@ pub(crate) async fn exchange_code(
         url_encode(redirect),
         url_encode(verifier),
     );
-    let res = reqwest::Client::new()
+    let client = token_client()?;
+    let send = client
         .post(endpoint)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
-        .send()
-        .await
-        .map_err(|err| err.to_string())?;
+        .send();
+    let res = tokio::select! {
+        _ = until_cancel(cancel) => return Err("aborted".to_string()),
+        res = send => res.map_err(|err| err.to_string())?,
+    };
     if !res.status().is_success() {
         return Err(format!("Token exchange failed: {}", res.status()));
     }
-    let tokens = res.json::<Value>().await.map_err(|err| err.to_string())?;
+    let body = res.json::<Value>();
+    let tokens = tokio::select! {
+        _ = until_cancel(cancel) => return Err("aborted".to_string()),
+        tokens = body => tokens.map_err(|err| err.to_string())?,
+    };
     token_auth(&tokens, None)
 }
 
@@ -46,28 +78,36 @@ pub(crate) async fn refresh_access(
     existing: &Value,
     refresh: &str,
     account: Option<String>,
+    cancel: &AtomicBool,
 ) -> Result<Value, String> {
     let body = format!(
         "grant_type=refresh_token&refresh_token={}&client_id={OPENAI_CLIENT_ID}",
         url_encode(refresh),
     );
-    let res = reqwest::Client::new()
+    let client = token_client()?;
+    let send = client
         .post(endpoint)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
-        .send()
-        .await
-        .map_err(|err| err.to_string())?;
+        .send();
+    let res = tokio::select! {
+        _ = until_cancel(cancel) => return Err("aborted".to_string()),
+        res = send => res.map_err(|err| err.to_string())?,
+    };
     if !res.status().is_success() {
         return Err(format!("Token refresh failed: {}", res.status()));
     }
-    let tokens = res.json::<Value>().await.map_err(|err| err.to_string())?;
+    let body = res.json::<Value>();
+    let tokens = tokio::select! {
+        _ = until_cancel(cancel) => return Err("aborted".to_string()),
+        tokens = body => tokens.map_err(|err| err.to_string())?,
+    };
     // Audit Fix 7: merge fresh tokens into the existing auth blob so non-token
     // fields (`enterpriseUrl`, future fields) survive the refresh.
     merge_token_auth(existing, &tokens, account)
 }
 
-pub(crate) async fn fresh_auths(state: &AppState) -> Result<Value, String> {
+pub(crate) async fn fresh_auths(state: &AppState, cancel: &AtomicBool) -> Result<Value, String> {
     let mut auths = state.store.provider_auths();
     let Some(auth) = auths.get("openai") else {
         return Ok(json!(auths));
@@ -92,7 +132,7 @@ pub(crate) async fn fresh_auths(state: &AppState) -> Result<Value, String> {
         .get("accountId")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let next = refresh_access(&state.oauth_token_endpoint, auth, refresh, account).await?;
+    let next = refresh_access(&state.oauth_token_endpoint, auth, refresh, account, cancel).await?;
     state
         .store
         .set_provider_auth("openai", next.clone())

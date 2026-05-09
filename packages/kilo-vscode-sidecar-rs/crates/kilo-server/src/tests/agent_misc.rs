@@ -7,22 +7,25 @@ use axum::{
     http::{header, Method, Request, StatusCode},
 };
 use http_body_util::BodyExt;
-use kilo_protocol::PromptInput;
-use kilo_provider::ChatToolCall;
+use kilo_protocol::{MessageAppendInput, MessageAppendResult, PromptInput, SessionCreateInput};
+use kilo_provider::{ChatOutput, ChatToolCall};
 use serde_json::{json, Value};
 use std::fs;
 use tower::ServiceExt;
 
 use crate::agent::openai_stream::{
-    prompt_instructions, prompt_instructions_with_root, should_inject_noop, OPENAI_OAUTH_SOUL_RAW,
+    prompt_instructions, prompt_instructions_with_root, should_inject_noop, OPENAI_OAUTH_CODEX_RAW,
+    OPENAI_OAUTH_SOUL_RAW,
 };
-use crate::agent::parts::real_tool_parts;
+use crate::agent::parts::{
+    assistant_completed_info, assistant_parts, real_messages, real_tool_parts, tool_running,
+};
 use crate::agent::shape::repair_tool_name;
 use crate::agent::tools::defs::read_def;
 use crate::http::build_router as app;
 use crate::{Repair, KNOWN_TOOLS};
 
-use super::common::{response_to_value, state, state_at, unique_root};
+use super::common::{response_to_value, seed, state, state_at, unique_root};
 
 #[tokio::test]
 async fn pty_routes_404_unknown_id_and_succeed_for_real_lifecycle() {
@@ -187,6 +190,57 @@ async fn skill_and_command_routes_return_discovered_registry_data() {
         .any(|item| item["name"] == "off"));
 }
 
+#[test]
+fn assistant_parts_places_followup_text_after_tools() {
+    let root = unique_root();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("note.txt"), "hello\n").unwrap();
+    let out = ChatOutput {
+        provider: "test".to_string(),
+        model: "test-model".to_string(),
+        text: "done".to_string(),
+        tool_calls: vec![ChatToolCall {
+            id: "call_read".to_string(),
+            name: "read".to_string(),
+            input: json!({ "filePath": "note.txt" }),
+        }],
+        usage: None,
+        finish: Some("stop".to_string()),
+    };
+
+    let parts = assistant_parts(&repo, "ses_x", "msg_x", "prt_x", out, 1);
+
+    assert_eq!(parts[0]["type"], "tool");
+    assert_eq!(parts[0]["tool"], "read");
+    assert_eq!(parts[1]["type"], "text");
+    assert_eq!(parts[1]["text"], "done");
+    assert_eq!(parts[2]["type"], "step-finish");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn assistant_completed_info_uses_completion_time_not_start_time() {
+    let start = MessageAppendResult {
+        info: json!({
+            "role": "assistant",
+            "time": {
+                "created": 1,
+                "updated": 1,
+            }
+        }),
+        parts: Vec::new(),
+        time: 1,
+    };
+
+    let info = assistant_completed_info(&start);
+
+    assert_eq!(info["time"]["created"], 1);
+    assert!(info["time"]["updated"].as_i64().unwrap_or_default() > 1);
+    assert!(info["time"]["completed"].as_i64().unwrap_or_default() > 1);
+}
+
 /// M7 Fix 5: when the live OAuth path receives a tool call whose name
 /// is uppercased (`READ`, `Read`), it must be lowercased and dispatched
 /// to the canonical handler — not fall through to "Unsupported tool".
@@ -268,6 +322,62 @@ async fn real_tool_parts_rejects_invalid_argument_repairs() {
 }
 
 #[test]
+fn real_messages_skips_unsettled_tool_parts() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+    let user = state
+        .store
+        .append_message_record(
+            &session.id,
+            MessageAppendInput {
+                info: json!({ "role": "user" }),
+                parts: vec![json!({ "type": "text", "text": "spawn agents" })],
+            },
+        )
+        .unwrap()
+        .result;
+    state
+        .store
+        .append_message_record(
+            &session.id,
+            MessageAppendInput {
+                info: json!({
+                    "id": "msg_assistant",
+                    "role": "assistant",
+                    "parentID": user.info["id"].clone()
+                }),
+                parts: vec![tool_running(
+                    "msg_assistant",
+                    "prt_assistant",
+                    0,
+                    "task",
+                    "call_missing_output",
+                    &json!({
+                        "description": "Map repo",
+                        "prompt": "map repo",
+                        "subagent_type": "explore"
+                    }),
+                    1,
+                )],
+            },
+        )
+        .unwrap();
+
+    let messages = real_messages(&state, &session.id, "continue");
+    assert!(
+        messages.iter().all(|message| message.responses.is_empty()),
+        "unsettled running tool calls must not replay as bare function_call items: {messages:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn tool_repair_matches_case_and_invalid_fallback() {
     assert_eq!(
         repair_tool_name("Read", KNOWN_TOOLS),
@@ -336,6 +446,9 @@ fn openai_oauth_instructions_include_codex_prompt_and_env_block_when_dir_set() {
     assert!(composed.contains("</env>"));
     assert!(composed.contains("Working directory: /repo"));
     assert!(composed.contains("openai/gpt-5.1-codex"));
+    assert!(composed.contains("Optional project config:"));
+    assert!(composed.contains("Do not assume optional config files exist"));
+    assert!(composed.contains("list/glob before reading them"));
     assert!(composed.contains("Today's date:"));
 }
 
@@ -358,12 +471,30 @@ fn openai_oauth_instructions_include_discovered_skill_guidance() {
         Some(repo.to_str().unwrap()),
         Some(root.join("config").join("kilo").to_str().unwrap()),
         Some(root.to_str().unwrap()),
+        None,
     )
     .expect("composed");
     assert!(composed.contains("Skills provide specialized instructions"));
     assert!(composed.contains("<available_skills>"));
     assert!(composed.contains("<name>focus</name>"));
     assert!(composed.contains("<description>Stay narrowly scoped</description>"));
+}
+
+#[test]
+fn openai_oauth_instructions_use_agent_prompt_over_codex_prompt() {
+    let input = PromptInput::default();
+    let composed = prompt_instructions_with_root(
+        &input,
+        Some("/repo"),
+        None,
+        None,
+        Some("Agent-specific instructions."),
+    )
+    .expect("composed instructions");
+
+    assert!(composed.contains(OPENAI_OAUTH_SOUL_RAW.trim()));
+    assert!(composed.contains("Agent-specific instructions."));
+    assert!(!composed.contains(OPENAI_OAUTH_CODEX_RAW.trim()));
 }
 
 #[test]

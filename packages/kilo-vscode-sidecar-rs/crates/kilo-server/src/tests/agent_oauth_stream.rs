@@ -88,12 +88,12 @@ data: [DONE]\n\n",
     .expect("prompt turn");
 
     assert_eq!(out.info["providerID"], "openai");
-    assert_eq!(out.parts[0]["text"], "Hello");
+    assert_eq!(out.parts[1]["text"], "Hello");
     assert_eq!(out.info["tokens"]["input"], 2);
     // Per-iteration step parts (Bun parity, processor.ts:402-473): each
     // iteration emits a step-start at the top and a step-finish at the
-    // bottom. Single-iteration turns therefore produce: [text, step-start, step-finish].
-    assert_eq!(out.parts[1]["type"], "step-start");
+    // bottom. Text produced in that step sits between them.
+    assert_eq!(out.parts[0]["type"], "step-start");
     assert_eq!(out.parts[2]["type"], "step-finish");
     assert_eq!(out.parts[2]["tokens"]["total"], 3);
     let events = drain(&mut rx);
@@ -127,6 +127,60 @@ data: [DONE]\n\n",
     assert!(
         body.contains("chatgpt-account-id: acct_1") || body.contains("ChatGPT-Account-Id: acct_1")
     );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn prompt_turn_openai_oauth_persists_reasoning_summary_parts() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    std::fs::create_dir_all(root.join("repo")).unwrap();
+    let server = stream_provider_server(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\"}}\n\n\
+data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_1\",\"summary_index\":0,\"delta\":\"thinking \"}\n\n\
+data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_1\",\"summary_index\":0,\"delta\":\"hard\"}\n\n\
+data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\"}}\n\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n\
+data: [DONE]\n\n",
+    )
+    .await;
+    state
+        .store
+        .set_provider_auth("openai", oauth_auth())
+        .unwrap();
+    write_openai_config(&root, &server.url);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+
+    let out = prompt_turn(
+        &state,
+        &session.id,
+        PromptInput {
+            parts: vec![json!({ "type": "text", "text": "think visibly" })],
+            model: Some(json!({ "providerID": "openai", "modelID": "gpt-5.1-codex" })),
+            ..Default::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .expect("prompt turn");
+
+    let reasoning = out
+        .parts
+        .iter()
+        .find(|part| part.get("type").and_then(|value| value.as_str()) == Some("reasoning"))
+        .expect("reasoning part");
+    assert_eq!(reasoning["text"], "thinking hard");
+    assert_eq!(reasoning["time"]["start"], reasoning["time"]["end"]);
+    assert!(out
+        .parts
+        .iter()
+        .any(|part| part.get("text").and_then(|value| value.as_str()) == Some("done")));
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -228,7 +282,7 @@ async fn prompt_turn_openai_oauth_regular_prompt_unchanged_by_command_registry()
         "normal prompt missing: {body}"
     );
     assert!(
-        !body.contains("changed"),
+        !body.contains("changed plain text"),
         "normal prompt was command-expanded: {body}"
     );
 
@@ -405,10 +459,23 @@ data: [DONE]\n\n",
     .await
     .expect("prompt turn");
 
-    assert_eq!(out.parts[0]["text"], "done");
-    // Layout: [text, step-start_0, tool, step-finish_0, step-start_1, step-finish_1]
-    assert_eq!(out.parts[1]["type"], "step-start");
-    assert_eq!(out.parts[2]["type"], "tool");
+    // Layout: [step-start_0, tool, step-finish_0, step-start_1, text, step-finish_1].
+    // The final answer must come after the inspected tool output; otherwise
+    // the UI inserts the conclusion above a long tool transcript and it looks
+    // like the agent never replied.
+    assert_eq!(out.parts[0]["type"], "step-start");
+    assert_eq!(out.parts[1]["type"], "tool");
+    let text_idx = out
+        .parts
+        .iter()
+        .position(|part| part.get("text").and_then(|value| value.as_str()) == Some("done"))
+        .expect("final text part");
+    let tool_idx = out
+        .parts
+        .iter()
+        .position(|part| part.get("type").and_then(|value| value.as_str()) == Some("tool"))
+        .expect("tool part");
+    assert!(text_idx > tool_idx, "final text must follow tool output");
     let bodies = server.bodies.lock().unwrap().clone();
     assert_eq!(bodies.len(), 2);
     let body = &bodies[1];
@@ -448,7 +515,10 @@ async fn prompt_turn_openai_oauth_executes_parallel_task_tool_calls() {
     let session = state
         .store
         .create_session(SessionCreateInput {
-            permission: Some(json!({ "task": "allow" })),
+            permission: Some(json!({
+                "task": "allow",
+                "github_*": "deny"
+            })),
             ..Default::default()
         })
         .unwrap();
@@ -480,12 +550,22 @@ async fn prompt_turn_openai_oauth_executes_parallel_task_tool_calls() {
         .all(|part| part["state"]["status"] == "completed"));
     let children = state.store.children(&session.id).unwrap();
     assert_eq!(children.len(), 2);
-    assert!(children
-        .iter()
-        .all(|child| child.permission == Some(json!({ "task": { "*": "deny" } }))));
+    assert!(children.iter().all(|child| {
+        child.permission
+            == Some(json!({
+                "task": { "*": "deny" },
+                "github_*": { "*": "deny" }
+            }))
+    }));
     let bodies = server.bodies.lock().unwrap().clone();
     assert_eq!(bodies.len(), 4);
     let child_bodies = &bodies[1..3];
+    assert!(
+        child_bodies
+            .iter()
+            .all(|body| !body.contains("\"name\":\"task\"")),
+        "child tools must not expose recursive task: {child_bodies:?}"
+    );
     assert!(
         child_bodies.iter().any(|body| body.contains("first child")),
         "{child_bodies:?}"
@@ -812,10 +892,13 @@ data: [DONE]\n\n",
     assert_eq!(res.status(), StatusCode::OK);
 
     let out = task.await.unwrap().expect("prompt turn");
-    assert_eq!(out.parts[0]["text"], "wrote it");
-    // Layout: [text, step-start_0, tool(write), step-finish_0, step-start_1, step-finish_1]
-    assert_eq!(out.parts[1]["type"], "step-start");
-    assert_eq!(out.parts[2]["state"]["status"], "completed");
+    assert!(out
+        .parts
+        .iter()
+        .any(|part| part.get("text").and_then(|value| value.as_str()) == Some("wrote it")));
+    // Layout: [step-start_0, tool(write), step-finish_0, step-start_1, text, step-finish_1]
+    assert_eq!(out.parts[0]["type"], "step-start");
+    assert_eq!(out.parts[1]["state"]["status"], "completed");
     assert_eq!(
         std::fs::read_to_string(root.join("repo").join("approved.txt")).unwrap(),
         "yes\n"
@@ -913,14 +996,14 @@ data: [DONE]\n\n",
     assert_eq!(res.status(), StatusCode::OK);
 
     let out = task.await.unwrap().expect("prompt turn");
-    // Layout: [text, step-start_0, tool(write), step-finish_0]. parts[2] is the rejected tool.
-    assert_eq!(out.parts[1]["type"], "step-start");
-    assert_eq!(out.parts[2]["state"]["status"], "error");
+    // Layout: [step-start_0, tool(write), step-finish_0]. parts[1] is the rejected tool.
+    assert_eq!(out.parts[0]["type"], "step-start");
+    assert_eq!(out.parts[1]["state"]["status"], "error");
     assert_eq!(
-        out.parts[2]["state"]["metadata"]["error"]["name"],
+        out.parts[1]["state"]["metadata"]["error"]["name"],
         "PermissionRejectedError"
     );
-    assert!(out.parts[2]["state"]["error"]
+    assert!(out.parts[1]["state"]["error"]
         .as_str()
         .unwrap()
         .contains("Permission rejected"));
@@ -992,30 +1075,30 @@ data: [DONE]\n\n";
         .unwrap_or_default()
         .contains("Invalid tool arguments JSON"));
     // Layout (2 malformed iterations):
-    //   [text, step-start_0, tool(invalid_0), step-finish_0,
-    //          step-start_1, tool(invalid_1), step-finish_1]
-    assert_eq!(out.parts[1]["type"], "step-start");
-    assert_eq!(out.parts[2]["type"], "tool");
-    assert_eq!(out.parts[2]["tool"], "invalid");
-    assert_eq!(out.parts[2]["callID"], "call_bad");
+    //   [step-start_0, tool(invalid_0), step-finish_0,
+    //    step-start_1, tool(invalid_1), step-finish_1]
+    assert_eq!(out.parts[0]["type"], "step-start");
+    assert_eq!(out.parts[1]["type"], "tool");
+    assert_eq!(out.parts[1]["tool"], "invalid");
+    assert_eq!(out.parts[1]["callID"], "call_bad");
     assert_eq!(
-        out.parts[2]["state"]["input"]["arguments"],
+        out.parts[1]["state"]["input"]["arguments"],
         "{\"filePath\":} trailing"
     );
-    assert!(out.parts[2]["state"]["error"]
+    assert!(out.parts[1]["state"]["error"]
         .as_str()
         .unwrap_or_default()
         .contains("Invalid tool arguments JSON"));
-    assert_eq!(out.parts[3]["type"], "step-finish");
-    assert_eq!(out.parts[4]["type"], "step-start");
-    assert_eq!(out.parts[5]["type"], "tool");
-    assert_eq!(out.parts[5]["tool"], "invalid");
-    assert_eq!(out.parts[5]["callID"], "call_bad");
+    assert_eq!(out.parts[2]["type"], "step-finish");
+    assert_eq!(out.parts[3]["type"], "step-start");
+    assert_eq!(out.parts[4]["type"], "tool");
+    assert_eq!(out.parts[4]["tool"], "invalid");
+    assert_eq!(out.parts[4]["callID"], "call_bad");
     assert_eq!(
-        out.parts[5]["state"]["input"]["arguments"],
+        out.parts[4]["state"]["input"]["arguments"],
         "{\"filePath\":} trailing"
     );
-    assert!(out.parts[6]["type"]
+    assert!(out.parts[5]["type"]
         .as_str()
         .unwrap_or_default()
         .contains("finish"));
@@ -1185,37 +1268,61 @@ async fn prompt_turn_openai_oauth_replays_recorded_codex_fixture_and_persists_tr
     assert_eq!(out.info["tokens"]["input"], 166);
     assert_eq!(out.info["tokens"]["output"], 33);
     assert_eq!(out.info["tokens"]["total"], 199);
-    // Layout: [text, step-start_0, tool(read), step-finish_0(133),
-    //          step-start_1, step-finish_1(66)]
-    assert_eq!(out.parts[0]["type"], "text");
-    assert_eq!(out.parts[0]["text"], "The file says: `fixture ok`.");
-    assert_eq!(out.parts[1]["type"], "step-start");
-    assert_eq!(out.parts[2]["type"], "tool");
-    assert_eq!(out.parts[2]["tool"], "read");
-    assert_eq!(out.parts[2]["callID"], "call_read_note");
-    assert_eq!(out.parts[2]["state"]["status"], "completed");
-    assert_eq!(out.parts[2]["state"]["input"]["filePath"], "repo/note.txt");
-    assert!(out.parts[2]["state"]["output"]
+    // The continuation's final answer must follow the tool result; the first
+    // model step may also include a short preamble before/around the tool.
+    assert_eq!(out.parts[0]["type"], "step-start");
+    let read_idx = out
+        .parts
+        .iter()
+        .position(|part| part.get("tool").and_then(|value| value.as_str()) == Some("read"))
+        .expect("read tool");
+    let final_idx = out
+        .parts
+        .iter()
+        .position(|part| {
+            part.get("text").and_then(|value| value.as_str())
+                == Some("The file says: `fixture ok`.")
+        })
+        .expect("final text");
+    assert!(final_idx > read_idx);
+    assert_eq!(out.parts[read_idx]["callID"], "call_read_note");
+    assert_eq!(out.parts[read_idx]["state"]["status"], "completed");
+    assert_eq!(
+        out.parts[read_idx]["state"]["input"]["filePath"],
+        "repo/note.txt"
+    );
+    assert!(out.parts[read_idx]["state"]["output"]
         .as_str()
         .unwrap()
         .contains("fixture ok"));
-    assert_eq!(out.parts[3]["type"], "step-finish");
-    assert_eq!(out.parts[3]["reason"], "stop");
-    assert_eq!(out.parts[3]["cost"], 0);
-    assert_eq!(out.parts[3]["tokens"]["total"], 133);
-    assert_eq!(out.parts[4]["type"], "step-start");
-    assert_eq!(out.parts[5]["type"], "step-finish");
-    assert_eq!(out.parts[5]["tokens"]["total"], 66);
+    assert!(out.parts.iter().any(|part| {
+        part.get("type").and_then(|value| value.as_str()) == Some("step-finish")
+            && part["tokens"]["total"] == 133
+    }));
+    assert!(out.parts.iter().any(|part| {
+        part.get("type").and_then(|value| value.as_str()) == Some("step-finish")
+            && part["tokens"]["total"] == 66
+    }));
 
     let page = state.store.messages(&session.id, None, None).unwrap();
     assert_eq!(page.items.len(), 2);
     let msg = &page.items[1];
     assert_eq!(msg.info["role"], "assistant");
     assert_eq!(msg.info["tokens"]["total"], 199);
-    assert_eq!(msg.parts[0]["text"], "The file says: `fixture ok`.");
-    assert_eq!(msg.parts[1]["type"], "step-start");
-    assert_eq!(msg.parts[2]["type"], "tool");
-    assert_eq!(msg.parts[3]["type"], "step-finish");
+    let stored_text = msg
+        .parts
+        .iter()
+        .position(|part| {
+            part.get("text").and_then(|value| value.as_str())
+                == Some("The file says: `fixture ok`.")
+        })
+        .expect("stored final text");
+    let stored_tool = msg
+        .parts
+        .iter()
+        .position(|part| part.get("tool").and_then(|value| value.as_str()) == Some("read"))
+        .expect("stored tool");
+    assert!(stored_text > stored_tool);
 
     let bodies = server.bodies.lock().unwrap().clone();
     assert_eq!(bodies.len(), 2);
@@ -1762,6 +1869,104 @@ data: [DONE]\n\n",
         out.info["error"]["name"], "StructuredOutputError",
         "expected StructuredOutputError envelope, got: {:?}",
         out.info["error"]
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Provider mock that accepts a connection and never responds. Used by
+/// the compaction-cancel regression test to prove that `compact_session`
+/// observes the cancel atomic during the in-flight summarize call. The
+/// listener is held in scope so the OS-level connect succeeds; we just
+/// don't write any bytes back so reqwest blocks on the response.
+async fn stalling_provider_holds_connection() -> super::common::TestProvider {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = vec![0; 65536];
+            let _ = socket.read(&mut buf).await;
+            // Keep the socket open but write nothing — the client stalls
+            // waiting for headers. Park forever; the runtime cleans us up.
+            std::future::pending::<()>().await;
+        }
+    });
+    super::common::TestProvider {
+        url: format!("http://{addr}"),
+        body: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+    }
+}
+
+/// Fix C3: `compact_session` previously called `chat_tools_with_auth`
+/// which had no cancel parameter. A Stop press during summarization on
+/// a slow upstream did nothing. The fix routes through
+/// `chat_tools_with_auth_cancel` and maps `ProviderError::Aborted` to
+/// `CompactionError::Cancelled`. This test sets a hung token endpoint,
+/// trips cancel, and asserts the call returns within 250ms with the
+/// `Cancelled` variant.
+#[tokio::test]
+async fn compact_session_aborts_promptly_when_cancel_fires_during_summarize() {
+    use crate::agent::compaction::{compact_session, CompactionError};
+    use kilo_protocol::MessageAppendInput;
+
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    std::fs::create_dir_all(root.join("config").join("kilo")).unwrap();
+    let server = stalling_provider_holds_connection().await;
+    state
+        .store
+        .set_provider_auth("openai", oauth_auth())
+        .unwrap();
+    write_openai_config(&root, &server.url);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+    // Seed a non-trivial transcript so collect_history returns something.
+    state
+        .store
+        .append_message_record(
+            &session.id,
+            MessageAppendInput {
+                info: json!({
+                    "id": "msg_user_1",
+                    "role": "user",
+                    "sessionID": session.id.clone(),
+                    "time": { "created": 1, "updated": 1, "completed": 1 },
+                }),
+                parts: vec![json!({ "id": "p_user_1", "type": "text", "text": "compact me" })],
+            },
+        )
+        .unwrap();
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_handle = cancel.clone();
+    let st = state.clone();
+    let sid = session.id.clone();
+    let auths = json!(state.store.provider_auths());
+    let model = json!({ "providerID": "openai", "modelID": "gpt-5.1-codex" });
+    let task = tokio::spawn(async move {
+        compact_session(&st, &sid, Some(&model), &auths, &cancel_handle).await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancel.store(true, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let out = tokio::time::timeout(Duration::from_millis(250), task)
+        .await
+        .expect("compact_session must return within 250ms of cancel")
+        .expect("task join");
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "elapsed {:?} exceeded budget",
+        started.elapsed()
+    );
+    let err = out.expect_err("compact_session must surface an error on cancel");
+    assert!(
+        matches!(err, CompactionError::Cancelled),
+        "expected CompactionError::Cancelled, got: {err:?}"
     );
 
     let _ = std::fs::remove_dir_all(root);

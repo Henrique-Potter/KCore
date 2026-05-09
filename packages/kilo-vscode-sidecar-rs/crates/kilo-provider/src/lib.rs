@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, fmt,
     sync::{atomic::AtomicBool, LazyLock},
     time::Duration,
@@ -119,6 +119,16 @@ pub struct ChatParsed {
 #[derive(Clone, Debug, PartialEq)]
 pub enum StreamEvent {
     TextDelta(String),
+    ReasoningStart {
+        id: String,
+    },
+    ReasoningDelta {
+        id: String,
+        delta: String,
+    },
+    ReasoningEnd {
+        id: String,
+    },
     ToolDelta {
         id: String,
         name: Option<String>,
@@ -208,6 +218,32 @@ pub async fn chat_tools_with_auth(
 ) -> Result<ChatOutput, ProviderError> {
     let req = resolve_tools_with_auth(cfg, auths, model, instructions, messages, tools)?;
     let out = post(&req).await?;
+    Ok(ChatOutput {
+        provider: req.provider,
+        model: req.model,
+        text: out.text,
+        tool_calls: out.tool_calls,
+        usage: out.usage,
+        finish: out.finish,
+    })
+}
+
+/// Cancellable variant of [`chat_tools_with_auth`]. Used by the agent
+/// compaction path so a Stop press during a context-window summarize
+/// returns `ProviderError::Aborted` immediately instead of waiting for
+/// the upstream call to settle. Mirrors the `until_cancel` race already
+/// in `post_stream`.
+pub async fn chat_tools_with_auth_cancel(
+    cfg: &Config,
+    auths: &Value,
+    model: Option<&Value>,
+    instructions: Option<String>,
+    messages: Vec<ChatMessage>,
+    tools: Vec<ChatTool>,
+    cancel: &AtomicBool,
+) -> Result<ChatOutput, ProviderError> {
+    let req = resolve_tools_with_auth(cfg, auths, model, instructions, messages, tools)?;
+    let out = post_cancel(&req, cancel).await?;
     Ok(ChatOutput {
         provider: req.provider,
         model: req.model,
@@ -601,16 +637,84 @@ fn api_is_context_window(status: u16, raw: &str) -> bool {
         || lower.contains("token limit")
 }
 
-/// Polling helper used by [`post_stream`] to race against cancellation.
-/// Resolves only when `cancel` is set. We poll on a short interval rather
-/// than swap to `tokio_util::sync::CancellationToken` because the rest of
-/// kilo-server runs on `Arc<AtomicBool>` (~50 sites); converting now would
-/// be a coordinated change that's out of scope for the M7 OAuth fix. The
-/// 10ms cadence matches the existing `wait_fake` helper in kilo-server.
+/// Polling helper used by [`post_stream`] / [`post_cancel`] to race
+/// against cancellation. Resolves only when `cancel` is set. We poll on
+/// a short interval rather than swap to
+/// `tokio_util::sync::CancellationToken` because the rest of
+/// kilo-server runs on `Arc<AtomicBool>` (~50 sites); converting now
+/// would be a coordinated change that's out of scope for the M7 OAuth
+/// fix. The 10ms cadence matches the existing `wait_fake` helper in
+/// kilo-server.
 async fn until_cancel(cancel: &AtomicBool) {
     while !cancel.load(std::sync::atomic::Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// Cancellable mirror of [`post`]. Race the upstream send + body read
+/// against `cancel` so an abort during compaction or any other
+/// non-streaming call returns `ProviderError::Aborted` promptly. Body
+/// shape is identical to `post` once the futures settle — only the
+/// outer `tokio::select!` is added.
+async fn post_cancel(req: &ChatRequest, cancel: &AtomicBool) -> Result<ChatParsed, ProviderError> {
+    let client = http()?;
+    let call = match &req.auth {
+        ChatAuth::Oauth { access, account } if req.provider == "openai" => {
+            let url = format!("{}/responses", req.base.trim_end_matches('/'));
+            let mut call = client.post(url).bearer_auth(access).json(&json!({
+                "model": req.model,
+                "instructions": req.instructions,
+                "input": responses_input(&req.messages),
+                "stream": false,
+                "store": false,
+            }));
+            call = openai_oauth_headers(call, req.session_id.as_deref());
+            if let Some(account) = account {
+                call = call.header("ChatGPT-Account-Id", account);
+            }
+            call
+        }
+        ChatAuth::Oauth { .. } => {
+            return Err(ProviderError::MissingKey {
+                provider: req.provider.clone(),
+            })
+        }
+        ChatAuth::Api { key } => {
+            let url = format!("{}/chat/completions", req.base.trim_end_matches('/'));
+            let mut body = json!({
+                "model": req.model,
+                "messages": req.messages,
+                "stream": false,
+            });
+            if !req.tools.is_empty() {
+                body["tools"] = json!(openai_tools(&req.tools));
+                body["tool_choice"] = json!(tool_choice(&req.tools));
+            }
+            client.post(url).bearer_auth(key).json(&body)
+        }
+    };
+    let res = tokio::select! {
+        _ = until_cancel(cancel) => return Err(ProviderError::Aborted),
+        res = call.send() => res.map_err(|err| ProviderError::Http(err.to_string()))?,
+    };
+    let status = res.status();
+    let body = res.text();
+    let raw = tokio::select! {
+        _ = until_cancel(cancel) => return Err(ProviderError::Aborted),
+        body = body => body.map_err(|err| ProviderError::Response(err.to_string()))?,
+    };
+    let body = serde_json::from_str::<Value>(&raw)
+        .map_err(|err| ProviderError::Response(err.to_string()))?;
+
+    if !status.is_success() {
+        let msg = api_status_message(status.as_u16(), &raw);
+        if api_is_context_window(status.as_u16(), &raw) {
+            return Err(ProviderError::ContextWindow(msg));
+        }
+        return Err(ProviderError::Api(msg));
+    }
+
+    parse(&body)
 }
 
 async fn post_stream(
@@ -790,6 +894,7 @@ fn tool_choice(tools: &[ChatTool]) -> &'static str {
 }
 
 fn responses_input(messages: &[ChatMessage]) -> Vec<Value> {
+    let outputs = response_outputs(messages);
     let cap = messages.iter().fold(0, |sum, msg| {
         sum + msg.responses.len()
             + if !msg.content.is_empty() || msg.responses.is_empty() {
@@ -810,10 +915,31 @@ fn responses_input(messages: &[ChatMessage]) -> Vec<Value> {
             }));
         }
         for item in &msg.responses {
-            out.push(responses_item(item));
+            match item {
+                ChatResponseItem::FunctionCall(call) => {
+                    out.push(responses_item(item));
+                    match outputs.get(call.id.as_str()) {
+                        Some(output) => out.push(output_item(&call.id, output)),
+                        None => out.push(missing_output_item(&call.id)),
+                    }
+                }
+                ChatResponseItem::FunctionOutput { .. } => {}
+            }
         }
     }
     out
+}
+
+fn response_outputs<'a>(messages: &'a [ChatMessage]) -> BTreeMap<&'a str, &'a str> {
+    let mut ids = BTreeMap::new();
+    for msg in messages {
+        for item in &msg.responses {
+            if let ChatResponseItem::FunctionOutput { id, output } = item {
+                ids.insert(id.as_str(), output.as_str());
+            }
+        }
+    }
+    ids
 }
 
 fn responses_item(item: &ChatResponseItem) -> Value {
@@ -824,12 +950,20 @@ fn responses_item(item: &ChatResponseItem) -> Value {
             "name": call.name,
             "arguments": serde_json::to_string(&call.input).unwrap_or_else(|_| "{}".to_string()),
         }),
-        ChatResponseItem::FunctionOutput { id, output } => json!({
-            "type": "function_call_output",
-            "call_id": id,
-            "output": output,
-        }),
+        ChatResponseItem::FunctionOutput { id, output } => output_item(id, output),
     }
+}
+
+fn output_item(id: &str, output: &str) -> Value {
+    json!({
+        "type": "function_call_output",
+        "call_id": id,
+        "output": output,
+    })
+}
+
+fn missing_output_item(id: &str) -> Value {
+    output_item(id, "Tool call did not return an output")
 }
 
 fn parse_response_text(body: &Value) -> Option<String> {
@@ -852,6 +986,8 @@ fn parse_response_text(body: &Value) -> Option<String> {
 struct StreamState {
     text: String,
     tools: Vec<PartialTool>,
+    reasoning: BTreeMap<usize, PartialReasoning>,
+    current_reasoning: Option<usize>,
     calls: Vec<ChatToolCall>,
     ids: BTreeSet<String>,
     usage: Option<ChatUsage>,
@@ -864,6 +1000,12 @@ struct PartialTool {
     name: Option<String>,
     args: String,
     done: bool,
+}
+
+#[derive(Default)]
+struct PartialReasoning {
+    id: String,
+    summaries: BTreeSet<u64>,
 }
 
 pub fn parse_stream(input: &str) -> Result<Vec<StreamEvent>, ProviderError> {
@@ -965,6 +1107,7 @@ fn parse_stream_event(
         state.text.push_str(&delta);
         out.push(StreamEvent::TextDelta(delta));
     }
+    out.extend(stream_reasoning(&value, state));
     out.extend(stream_tool(&value, state));
     if let Some(usage) = parse_usage(&value) {
         state.usage = Some(usage.clone());
@@ -975,6 +1118,116 @@ fn parse_stream_event(
         out.push(StreamEvent::Finish(done));
     }
     Ok(out)
+}
+
+fn stream_reasoning(value: &Value, state: &mut StreamState) -> Vec<StreamEvent> {
+    let kind = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if kind == "response.output_item.added" {
+        let item = value.get("item").or_else(|| value.get("output"));
+        let Some(item) =
+            item.filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+        else {
+            return Vec::new();
+        };
+        let idx = response_output_index(value, state);
+        let id = item
+            .get("id")
+            .or_else(|| value.get("item_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("reasoning_{idx}"));
+        let part = state.reasoning.entry(idx).or_default();
+        part.id = id;
+        state.current_reasoning = Some(idx);
+        if part.summaries.insert(0) {
+            return vec![StreamEvent::ReasoningStart {
+                id: reasoning_id(&part.id, 0),
+            }];
+        }
+        return Vec::new();
+    }
+
+    if kind == "response.reasoning_summary_part.added"
+        || kind == "response.reasoning_summary_text.delta"
+    {
+        let idx = state
+            .current_reasoning
+            .unwrap_or_else(|| response_output_index(value, state));
+        let item = value
+            .get("item_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                state
+                    .reasoning
+                    .get(&idx)
+                    .map(|item| item.id.clone())
+                    .unwrap_or_else(|| format!("reasoning_{idx}"))
+            });
+        let summary = value
+            .get("summary_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let part = state.reasoning.entry(idx).or_default();
+        if part.id.is_empty() {
+            part.id = item;
+        }
+        let id = reasoning_id(&part.id, summary);
+        let mut out = Vec::new();
+        if part.summaries.insert(summary) {
+            out.push(StreamEvent::ReasoningStart { id: id.clone() });
+        }
+        if kind.ends_with(".delta") {
+            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                out.push(StreamEvent::ReasoningDelta {
+                    id,
+                    delta: delta.to_string(),
+                });
+            }
+        }
+        return out;
+    }
+
+    if kind == "response.output_item.done" {
+        let item = value.get("item").or_else(|| value.get("output"));
+        let Some(_) =
+            item.filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+        else {
+            return Vec::new();
+        };
+        let idx = response_output_index(value, state);
+        let Some(part) = state.reasoning.remove(&idx) else {
+            return Vec::new();
+        };
+        if state.current_reasoning == Some(idx) {
+            state.current_reasoning = None;
+        }
+        return part
+            .summaries
+            .into_iter()
+            .map(|summary| StreamEvent::ReasoningEnd {
+                id: reasoning_id(&part.id, summary),
+            })
+            .collect();
+    }
+
+    Vec::new()
+}
+
+fn response_output_index(value: &Value, state: &StreamState) -> usize {
+    value
+        .get("output_index")
+        .or_else(|| value.get("item_index"))
+        .and_then(Value::as_u64)
+        .or(state.current_reasoning.map(|idx| idx as u64))
+        .unwrap_or(state.reasoning.len() as u64) as usize
+}
+
+fn reasoning_id(item: &str, summary: u64) -> String {
+    format!("{item}:{summary}")
 }
 
 fn stream_error(value: &Value) -> Option<String> {
@@ -1744,6 +1997,44 @@ data: [DONE]
     }
 
     #[test]
+    fn parses_openai_responses_reasoning_summary_events() {
+        let events = parse_stream(
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}
+
+data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":0,"delta":"thinking "}
+
+data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":0,"delta":"hard"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}
+
+data: [DONE]
+
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ReasoningStart {
+                    id: "rs_1:0".to_string()
+                },
+                StreamEvent::ReasoningDelta {
+                    id: "rs_1:0".to_string(),
+                    delta: "thinking ".to_string()
+                },
+                StreamEvent::ReasoningDelta {
+                    id: "rs_1:0".to_string(),
+                    delta: "hard".to_string()
+                },
+                StreamEvent::ReasoningEnd {
+                    id: "rs_1:0".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn replays_recorded_codex_tool_call_stream_fixture() {
         let raw = fixture_stream(CODEX_TOOL_CALL_STREAM);
         let events = parse_stream(&raw).unwrap();
@@ -2119,6 +2410,40 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_read
     }
 
     #[test]
+    fn responses_input_synthesizes_missing_tool_output() {
+        let input = responses_input(&[ChatMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            responses: vec![ChatResponseItem::FunctionCall(ChatToolCall {
+                id: "call_orphan".to_string(),
+                name: "task".to_string(),
+                input: json!({ "description": "Map repo" }),
+            })],
+        }]);
+
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], "call_orphan");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_orphan");
+        assert_eq!(input[1]["output"], "Tool call did not return an output");
+    }
+
+    #[test]
+    fn responses_input_drops_orphan_tool_output() {
+        let input = responses_input(&[ChatMessage {
+            role: "tool".to_string(),
+            content: String::new(),
+            responses: vec![ChatResponseItem::FunctionOutput {
+                id: "call_orphan".to_string(),
+                output: "late output".to_string(),
+            }],
+        }]);
+
+        assert!(input.is_empty(), "orphan tool output must not be replayed");
+    }
+
+    #[test]
     fn tool_choice_requires_structured_output_tool() {
         let tools = vec![ChatTool {
             name: "StructuredOutput".to_string(),
@@ -2335,6 +2660,10 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_read
 
     #[test]
     fn list_without_oauth_auth_does_not_zero_cost_or_filter() {
+        let _guard = env_guard();
+        env::remove_var("KILO_AUTH_CONTENT");
+        env::remove_var("OPENAI_API_KEY");
+        env::remove_var("OPENAI_BASE_URL");
         let cfg = Config {
             data: BTreeMap::new(),
         };

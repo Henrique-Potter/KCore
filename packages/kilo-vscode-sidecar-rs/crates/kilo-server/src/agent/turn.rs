@@ -16,7 +16,7 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 
-use kilo_protocol::{MessageAppendInput, MessageAppendResult, PromptInput};
+use kilo_protocol::{KiloPath, MessageAppendInput, MessageAppendResult, PromptInput};
 use kilo_provider::{ChatMessage, ChatToolCall};
 use serde_json::{json, Value};
 
@@ -25,8 +25,8 @@ use crate::agent::is_canceled;
 use crate::agent::openai_stream::zero_tokens;
 use crate::agent::openai_stream::{is_openai_oauth, prompt_instructions, prompt_openai_stream};
 use crate::agent::parts::{
-    aborted_error, api_error, append_assistant, assistant_error_info, prompt_text, provider_error,
-    real_tools, task_tool_part, user_info,
+    aborted_error, api_error, append_assistant, assistant_error_info, assistant_path, prompt_text,
+    provider_error, real_tools, task_tool_part, user_info,
 };
 use crate::{
     publish_error, publish_events, publish_idle, publish_status, publish_turn_close,
@@ -51,6 +51,14 @@ pub(crate) async fn prompt_guarded(
 }
 
 pub(crate) fn start_runner(state: Arc<AppState>, id: &str) -> Result<RunnerGuard, TurnError> {
+    start_runner_with_parent(state, id, None)
+}
+
+pub(crate) fn start_runner_with_parent(
+    state: Arc<AppState>,
+    id: &str,
+    parent: Option<String>,
+) -> Result<RunnerGuard, TurnError> {
     let cancel = {
         let mut runners = state.runners.lock().unwrap();
         if runners.contains_key(id) {
@@ -61,6 +69,8 @@ pub(crate) fn start_runner(state: Arc<AppState>, id: &str) -> Result<RunnerGuard
             id.to_string(),
             Runner {
                 cancel: cancel.clone(),
+                parent,
+                abort: std::sync::Mutex::new(None),
             },
         );
         cancel
@@ -86,7 +96,8 @@ pub(crate) async fn prompt_turn(
     ensure_prompt_supported(&state, &input, &text).map_err(TurnError::Unsupported)?;
     let (input, text) =
         expand_command(state.as_ref(), input, text).map_err(TurnError::Unsupported)?;
-    let dir = state.store.paths().directory;
+    let paths = state.store.paths();
+    let dir = paths.directory.clone();
     let project = session.project_id;
     // Record the agent name so the permission layer can derive its
     // hard-rule veto (Bun parity: `kilocode/session/prompt.ts:60-72`).
@@ -97,7 +108,7 @@ pub(crate) async fn prompt_turn(
     let user = state.store.append_message_record(
         id,
         MessageAppendInput {
-            info: user_info(&input),
+            info: user_info(&paths, &input),
             parts: input.parts.clone(),
         },
     )?;
@@ -110,7 +121,7 @@ pub(crate) async fn prompt_turn(
         let assistant = state.store.append_message_record(
             id,
             MessageAppendInput {
-                info: assistant_error_info(&user, &active, aborted_error()),
+                info: assistant_error_info(&paths, &user, &active, aborted_error()),
                 parts: Vec::new(),
             },
         )?;
@@ -126,7 +137,7 @@ pub(crate) async fn prompt_turn(
         let assistant = state.store.append_message_record(
             id,
             MessageAppendInput {
-                info: assistant_error_info(&user, &active, api_error()),
+                info: assistant_error_info(&paths, &user, &active, api_error()),
                 parts: Vec::new(),
             },
         )?;
@@ -152,6 +163,21 @@ pub(crate) async fn prompt_turn(
         user = next.user;
         active = next.input;
         active_text = next.text;
+    }
+    if is_canceled(&cancel) {
+        let assistant = state.store.append_message_record(
+            id,
+            MessageAppendInput {
+                info: assistant_error_info(&paths, &user, &active, aborted_error()),
+                parts: Vec::new(),
+            },
+        )?;
+        publish_events(&state, dir, project, assistant.events);
+        publish_error(&state, id, assistant.result.info["error"].clone());
+        publish_idle(&state, id);
+        publish_turn_close(&state, id, "interrupted");
+
+        return Ok(assistant.result);
     }
 
     if fake_provider(&active) {
@@ -191,7 +217,7 @@ pub(crate) async fn prompt_turn(
             let assistant = state.store.append_message_record(
                 id,
                 MessageAppendInput {
-                    info: assistant_error_info(&user, &active, provider_error(err)),
+                    info: assistant_error_info(&paths, &user, &active, provider_error(err)),
                     parts: Vec::new(),
                 },
             )?;
@@ -235,6 +261,9 @@ async fn handle_inline_subtasks(
 
     let mut command = false;
     for (idx, task) in tasks.iter().enumerate() {
+        if is_canceled(&cancel) {
+            break;
+        }
         let agent = task
             .get("agent")
             .and_then(Value::as_str)
@@ -253,7 +282,13 @@ async fn handle_inline_subtasks(
         let start = state.store.append_message_record(
             id,
             MessageAppendInput {
-                info: inline_assistant_info(user, input, agent, model.as_ref()),
+                info: inline_assistant_info(
+                    user,
+                    input,
+                    agent,
+                    model.as_ref(),
+                    &state.store.paths(),
+                ),
                 parts: Vec::new(),
             },
         )?;
@@ -283,8 +318,10 @@ async fn handle_inline_subtasks(
             start.result.time,
             cancel.clone(),
             model,
+            None,
         )
         .await;
+        let cancelled = is_canceled(&cancel);
         let mut info = crate::agent::parts::assistant_completed_info(&start.result);
         info["finish"] = json!("tool-calls");
         let result = state.store.append_message_record(
@@ -295,6 +332,9 @@ async fn handle_inline_subtasks(
             },
         )?;
         publish_events(state, dir.clone(), project.clone(), result.events);
+        if cancelled {
+            break;
+        }
     }
 
     if !command {
@@ -308,10 +348,11 @@ async fn handle_inline_subtasks(
         "text": text,
         "synthetic": true,
     })];
+    let paths = state.store.paths();
     let record = state.store.append_message_record(
         id,
         MessageAppendInput {
-            info: user_info(&next),
+            info: user_info(&paths, &next),
             parts: next.parts.clone(),
         },
     )?;
@@ -328,6 +369,7 @@ fn inline_assistant_info(
     input: &PromptInput,
     agent: &str,
     model: Option<&Value>,
+    paths: &KiloPath,
 ) -> Value {
     let provider = model
         .and_then(|value| value.get("providerID"))
@@ -350,7 +392,7 @@ fn inline_assistant_info(
         "providerID": provider,
         "modelID": model,
         "agent": agent,
-        "path": {},
+        "path": assistant_path(paths),
         "cost": 0,
         "tokens": zero_tokens(),
     })
@@ -413,6 +455,14 @@ fn expand_command(
         })];
         return Ok((input, text));
     }
-    input.parts = vec![json!({ "type": "text", "text": text })];
+    let mut parts = vec![json!({ "type": "text", "text": text })];
+    parts.extend(
+        input
+            .parts
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) != Some("text"))
+            .cloned(),
+    );
+    input.parts = parts;
     Ok((input, text))
 }

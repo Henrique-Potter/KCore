@@ -18,6 +18,7 @@ use kilo_protocol::{MessageAppendResult, PromptInput};
 
 use crate::{busy_error, turn_error, unsupported_provider_error, AppState, TurnError};
 
+pub(crate) mod catalog;
 pub(crate) mod compaction;
 pub(crate) mod diagnostics;
 pub(crate) mod fake;
@@ -73,7 +74,8 @@ pub(crate) async fn run_turn_async(
         Err(TurnError::Busy) => return busy_error(),
         Err(err) => return turn_error(err),
     };
-    tokio::spawn(async move {
+    let runner_id = guard.id.clone();
+    let task = tokio::spawn(async move {
         let id = guard.id.clone();
         let res = turn::prompt_turn(&guard.state, &id, input, guard.cancel.clone()).await;
         if let Err(err) = res {
@@ -81,5 +83,11 @@ pub(crate) async fn run_turn_async(
         }
         drop(guard);
     });
+    // Install the abort handle so `abort_session` can preempt a task
+    // suspended on a non-cooperative `.await`. The runner may already be
+    // gone by the time the task finishes — guard against that race.
+    if let Some(runner) = state.runners.lock().unwrap().get(&runner_id) {
+        *runner.abort.lock().unwrap() = Some(task.abort_handle());
+    }
     StatusCode::NO_CONTENT.into_response()
 }

@@ -20,6 +20,16 @@ fn file_content_reads_text_and_rejects_traversal() {
     let data = read_content(&file);
     assert_eq!(data["type"], "text");
     assert_eq!(data["content"], "hello");
+    assert_eq!(resolve_under(&repo, &file.to_string_lossy()).unwrap(), file);
+    assert_eq!(
+        resolve_under(&repo, &file.to_string_lossy().replace('\\', "/")).unwrap(),
+        file
+    );
+    #[cfg(windows)]
+    {
+        let lower = file.to_string_lossy().to_ascii_lowercase();
+        assert!(resolve_under(&repo, &lower).is_ok());
+    }
     assert_eq!(
         resolve_under(&repo, "../secret.txt"),
         Err(StatusCode::FORBIDDEN)

@@ -22,10 +22,11 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use kilo_protocol::MessageAppendInput;
-use kilo_provider::{chat_tools_with_auth, ChatMessage, ChatTool, ProviderError};
+use kilo_protocol::{GlobalEvent, MessageAppendInput};
+use kilo_provider::{chat_tools_with_auth_cancel, ChatMessage, ChatTool, ProviderError};
 use serde_json::{json, Value};
 
+use crate::http::sse;
 use crate::AppState;
 
 const SUMMARY_PROMPT: &str = "You are a session summarizer. The conversation below exceeded the model's context window and must be condensed to fit. Produce a concise, factual summary that preserves: \
@@ -59,7 +60,18 @@ pub(crate) async fn compact_session(
     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(CompactionError::Cancelled);
     }
-    let history = collect_history(state, sid);
+    // Move the (potentially large) sqlite transcript read off the runtime
+    // executor thread. The store/sqlite call itself can't be cancelled,
+    // but if Stop fires while it's in flight we observe it on the way out
+    // and bail before the (much more expensive) provider call.
+    let st = state.clone();
+    let sid_owned = sid.to_string();
+    let history = tokio::task::spawn_blocking(move || collect_history(&st, &sid_owned))
+        .await
+        .map_err(|err| CompactionError::Provider(ProviderError::Http(err.to_string())))?;
+    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(CompactionError::Cancelled);
+    }
     if history.is_empty() {
         return Err(CompactionError::EmptyHistory);
     }
@@ -69,21 +81,29 @@ pub(crate) async fn compact_session(
         content: format_history_for_summary(&history),
         responses: Vec::new(),
     }];
-    let out = chat_tools_with_auth(
+    let out = chat_tools_with_auth_cancel(
         &cfg,
         auths,
         model,
         Some(SUMMARY_PROMPT.to_string()),
         messages,
         Vec::<ChatTool>::new(),
+        cancel,
     )
     .await
-    .map_err(CompactionError::Provider)?;
+    .map_err(|err| match err {
+        ProviderError::Aborted => CompactionError::Cancelled,
+        other => CompactionError::Provider(other),
+    })?;
 
     if out.text.is_empty() {
         return Err(CompactionError::EmptyResult);
     }
     record_summary(state, sid, &out.text).map_err(CompactionError::Store)?;
+    sse::publish(
+        state,
+        GlobalEvent::bus("session.compaction.compacted", json!({ "sessionID": sid })),
+    );
     Ok(out.text)
 }
 

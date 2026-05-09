@@ -109,6 +109,14 @@ impl BusEvent {
         })
     }
 
+    /// Inspect the event's `payload.type` discriminator without paying
+    /// for serialization. Used by the `/event` SSE loop to detect the
+    /// `server.instance.disposed` close-stream signal Bun emits at
+    /// `server/routes/instance/event.ts:69-74`.
+    pub(crate) fn kind(&self) -> &str {
+        &self.source.payload.kind
+    }
+
     /// Test-only round-trip back to a typed `GlobalEvent`. Production
     /// subscribers consume the lazily-serialized bytes directly via
     /// [`global_json`] / [`instance_json`] and never need this; the
@@ -190,7 +198,20 @@ pub(crate) async fn instance_events(
             tokio::select! {
                 _ = interval.tick() => yield payload_frame_local(GlobalEvent::heartbeat()),
                 event = rx.recv() => match event {
-                    Ok(event) => yield frame_bus(&event, BusFrame::Instance),
+                    Ok(event) => {
+                        // Bun (`server/routes/instance/event.ts:69-74`)
+                        // emits the `server.instance.disposed` frame
+                        // and immediately closes the stream so the
+                        // SDK reconnect callback chain
+                        // (`SdkSSEAdapter` → `recoverPendingPrompts`
+                        // / `flushPendingSessionRefresh` /
+                        // `checkConfigWarnings`) refires.
+                        let stop = event.kind() == "server.instance.disposed";
+                        yield frame_bus(&event, BusFrame::Instance);
+                        if stop {
+                            break;
+                        }
+                    }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         eprintln!("[kilo-server] /event subscriber lagged, dropped {n} events");
                         telemetry().emit(TelemetryEvent::SseReconnect { stream: "instance" });

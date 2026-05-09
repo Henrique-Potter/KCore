@@ -302,7 +302,8 @@ async fn fresh_auths_refreshes_malformed_unexpired_access_token() {
         )
         .unwrap();
 
-    let auths = fresh_auths(&st).await.expect("fresh auths");
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let auths = fresh_auths(&st, &cancel).await.expect("fresh auths");
     assert_eq!(auths["openai"]["refresh"], "new-refresh");
     assert_eq!(auths["openai"]["accountId"], "acct_new");
     assert_ne!(auths["openai"]["access"], "not-a-jwt");
@@ -311,6 +312,62 @@ async fn fresh_auths_refreshes_malformed_unexpired_access_token() {
         .lock()
         .unwrap()
         .contains("refresh_token=old-refresh"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn fresh_auths_aborts_promptly_when_cancel_fires_during_token_request() {
+    // Fix C2: the token endpoint POST in `refresh_access` previously had
+    // no cancel race and no timeout. This test stands up a TCP listener
+    // that accepts connections and never replies, points the token
+    // endpoint at it, trips cancel, and asserts `fresh_auths` returns
+    // an `aborted` error within ~250ms.
+    let root = unique_root();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+    // Hold the listener so the OS-level connect succeeds; we just never
+    // write a response. The accepted socket stays in the listener's
+    // backlog (no `accept()` call) so reqwest hangs on read.
+    tokio::spawn(async move {
+        let _l = listener;
+        // Park forever — the test will drop us when the runtime shuts down.
+        std::future::pending::<()>().await;
+    });
+    let st = state_at_with(Some(store(&root)), "127.0.0.1:0".parse().unwrap(), endpoint);
+    st.store
+        .set_provider_auth(
+            "openai",
+            json!({
+                "type": "oauth",
+                "access": "not-a-jwt",
+                "refresh": "old-refresh",
+                "expires": unix_millis() + 3_600_000,
+                "accountId": "acct_old"
+            }),
+        )
+        .unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_handle = cancel.clone();
+    let st_clone = st.clone();
+    let task = tokio::spawn(async move { fresh_auths(&st_clone, &cancel_handle).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    let started = Instant::now();
+    let out = tokio::time::timeout(Duration::from_millis(250), task)
+        .await
+        .expect("fresh_auths must return within 250ms of cancel")
+        .expect("task join");
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "elapsed {:?} exceeded budget",
+        started.elapsed()
+    );
+    let err = out.expect_err("fresh_auths must surface an error on cancel");
+    assert!(
+        err.contains("aborted"),
+        "error must include `aborted`, got: {err}"
+    );
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -330,7 +387,8 @@ async fn fresh_auths_rejects_stale_oauth_without_refresh_token() {
         )
         .unwrap();
 
-    let err = fresh_auths(&st).await.unwrap_err();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let err = fresh_auths(&st, &cancel).await.unwrap_err();
     assert!(err.contains("Please sign in again"));
 
     let _ = std::fs::remove_dir_all(root);

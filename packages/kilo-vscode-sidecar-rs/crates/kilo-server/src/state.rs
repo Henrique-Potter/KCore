@@ -126,26 +126,12 @@ impl AppState {
             .unwrap_or_default()
     }
 
-    pub(crate) fn agent_config(&self, agent: &str) -> Option<Value> {
-        let cfg = self.store.config();
-        cfg.data
-            .get("agent")
-            .or_else(|| cfg.data.get("agents"))
-            .and_then(|agents| agents.get(agent))
-            .cloned()
-    }
-
-    pub(crate) fn agent_mode(&self, agent: &str) -> Option<String> {
-        self.agent_config(agent).and_then(|value| {
-            value
-                .get("mode")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+    pub(crate) fn agent_info(&self, agent: &str) -> Option<Value> {
+        crate::agent::catalog::get(self, agent)
     }
 
     pub(crate) fn agent_permission_rules(&self, agent: &str) -> Vec<crate::PermissionRule> {
-        self.agent_config(agent)
+        self.agent_info(agent)
             .and_then(|value| value.get("permission").cloned())
             .map(|value| permission_rules_from_value(&value))
             .unwrap_or_default()
@@ -168,6 +154,26 @@ impl AppState {
 
 fn permission_rules_from_value(value: &Value) -> Vec<crate::PermissionRule> {
     let mut out = Vec::new();
+    if let Some(items) = value.as_array() {
+        for item in items {
+            let Some(permission) = item.get("permission").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(action) = item.get("action").and_then(Value::as_str) else {
+                continue;
+            };
+            out.push(crate::PermissionRule {
+                permission: permission.to_string(),
+                pattern: item
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .unwrap_or("*")
+                    .to_string(),
+                action: action.to_string(),
+            });
+        }
+        return out;
+    }
     let Some(map) = value.as_object() else {
         return out;
     };
@@ -213,9 +219,18 @@ pub(crate) struct McpChild {
     pub(crate) tools_changed: bool,
 }
 
-#[derive(Clone)]
 pub(crate) struct Runner {
     pub(crate) cancel: Arc<AtomicBool>,
+    /// Parent runner for live delegated work. Store-backed children cover
+    /// normal task sessions, but this active edge lets abort propagate even
+    /// while a task is inside the non-Send child runtime.
+    pub(crate) parent: Option<String>,
+    /// Abort handle for the spawned turn task (async path only). Set
+    /// after `tokio::spawn` returns so `abort_session` can preempt a
+    /// task suspended on a non-cooperative `.await` (OAuth refresh, slow
+    /// plugin handler, etc.). The sync `prompt` path leaves this `None`
+    /// — its future is owned by the calling task.
+    pub(crate) abort: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 pub(crate) struct RunnerGuard {

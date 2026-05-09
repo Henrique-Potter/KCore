@@ -8,6 +8,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
     process::{ChildStdin, Command, Stdio},
+    sync::atomic::AtomicBool,
     sync::{mpsc, Arc},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -495,6 +496,10 @@ pub(crate) fn mcp_refresh_changed(state: &AppState, name: &str, timeout: Duratio
                 .lock()
                 .unwrap()
                 .insert(name.to_string(), kilo_mcp::Status::Connected { tools });
+            crate::http::sse::publish(
+                state,
+                kilo_protocol::GlobalEvent::bus("mcp.tools.changed", json!({ "server": name })),
+            );
         }
         Err(err) => {
             state.mcp_children.lock().unwrap().remove(name);
@@ -720,6 +725,15 @@ pub(crate) fn mcp_call_child(
     input: kilo_mcp::CallInput,
     timeout: Duration,
 ) -> Result<Value, McpCallError> {
+    mcp_call_child_cancel(child, input, timeout, None)
+}
+
+pub(crate) fn mcp_call_child_cancel(
+    child: &mut McpChild,
+    input: kilo_mcp::CallInput,
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> Result<Value, McpCallError> {
     let req = json!({
         "jsonrpc": "2.0",
         "id": MCP_CALL_ID,
@@ -731,7 +745,8 @@ pub(crate) fn mcp_call_child(
     });
     mcp_write_message(&mut child.stdin, &req)
         .map_err(|err| McpCallError::Write(format!("MCP tools/call write failed: {err}")))?;
-    let res = mcp_wait_response(child, MCP_CALL_ID, timeout).map_err(McpCallError::from_wait)?;
+    let res = mcp_wait_response_cancel(child, MCP_CALL_ID, timeout, cancel)
+        .map_err(McpCallError::from_wait)?;
     mcp_response_error(&res).map_err(McpCallError::Rpc)?;
     res.get("result")
         .cloned()
@@ -743,8 +758,20 @@ pub(crate) fn mcp_wait_response(
     id: i64,
     timeout: Duration,
 ) -> Result<Value, String> {
+    mcp_wait_response_cancel(child, id, timeout, None)
+}
+
+pub(crate) fn mcp_wait_response_cancel(
+    child: &mut McpChild,
+    id: i64,
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> Result<Value, String> {
     let start = Instant::now();
     loop {
+        if cancel.is_some_and(crate::agent::is_canceled) {
+            return Err("tool call aborted".to_string());
+        }
         if let Some(status) = child
             .child
             .try_wait()

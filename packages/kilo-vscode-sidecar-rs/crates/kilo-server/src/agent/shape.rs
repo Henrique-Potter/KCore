@@ -55,6 +55,53 @@ pub(crate) fn tokens_value(usage: &ChatUsage) -> Value {
     })
 }
 
+pub(crate) fn usage_cost(model: Option<&Value>, usage: &ChatUsage) -> f64 {
+    let Some(cost) = model.and_then(|value| value.get("cost")) else {
+        return 0.0;
+    };
+    let input = usage
+        .input
+        .saturating_sub(usage.cache_read)
+        .saturating_sub(usage.cache_write);
+    let output = usage.output.saturating_sub(usage.reasoning);
+    let over = input.saturating_add(usage.cache_read) > 200_000;
+    let cost = if over {
+        cost.get("experimentalOver200K").unwrap_or(cost)
+    } else {
+        cost
+    };
+    let rate = |path: &[&str]| -> f64 {
+        let mut value = cost;
+        for key in path {
+            let Some(next) = value.get(*key) else {
+                return 0.0;
+            };
+            value = next;
+        }
+        value.as_f64().unwrap_or(0.0)
+    };
+    let amount = (input as f64 * rate(&["input"])
+        + output as f64 * rate(&["output"])
+        + usage.reasoning as f64 * rate(&["output"])
+        + usage.cache_read as f64 * rate(&["cache", "read"])
+        + usage.cache_write as f64 * rate(&["cache", "write"]))
+        / 1_000_000.0;
+    if amount.is_finite() {
+        amount
+    } else {
+        0.0
+    }
+}
+
+pub(crate) fn usage_cost_value(model: Option<&Value>, usage: &ChatUsage) -> Value {
+    let cost = usage_cost(model, usage);
+    if cost == 0.0 {
+        json!(0)
+    } else {
+        json!(cost)
+    }
+}
+
 /// Sum a per-iteration usage record into a turn-level accumulator. Bun's
 /// `Session.getUsage` (`session.ts:308-385`) computes the per-step usage and
 /// the `step-finish` writer adds it into `assistantMessage.tokens`
@@ -89,6 +136,7 @@ pub(crate) fn step_finish_part_iter(
     mid: &str,
     pid: &str,
     iteration: usize,
+    model: Option<&Value>,
     usage: Option<&ChatUsage>,
     reason: Option<&str>,
 ) -> Value {
@@ -98,7 +146,7 @@ pub(crate) fn step_finish_part_iter(
         "messageID": mid,
         "sessionID": sid,
         "reason": reason.unwrap_or("stop"),
-        "cost": 0,
+        "cost": usage.map(|u| usage_cost_value(model, u)).unwrap_or_else(|| json!(0)),
         "tokens": match usage {
             Some(u) => tokens_value(u),
             None => json!({
@@ -119,4 +167,32 @@ pub(crate) fn repair_tool_name(name: &str, known: &[&str]) -> Repair {
         .find(|tool| tool.eq_ignore_ascii_case(name))
         .map(|tool| Repair::Valid((*tool).to_string()))
         .unwrap_or_else(|| Repair::Invalid(name.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_cost_uses_model_rates_and_cache_buckets() {
+        let model = json!({
+            "cost": {
+                "input": 1.0,
+                "output": 10.0,
+                "cache": { "read": 0.1, "write": 2.0 }
+            }
+        });
+        let usage = ChatUsage {
+            input: 120,
+            output: 50,
+            total: 170,
+            reasoning: 10,
+            cache_read: 20,
+            cache_write: 5,
+        };
+
+        let cost = usage_cost(Some(&model), &usage);
+
+        assert!((cost - 0.000607).abs() < 0.0000001);
+    }
 }

@@ -16,23 +16,25 @@ use std::{
 };
 
 use kilo_protocol::{MessageAppendInput, MessageAppendResult, PromptInput};
+use kilo_provider::ChatToolCall;
 use serde_json::{json, Value};
 use tokio::task::JoinSet;
 
 use crate::agent::is_canceled;
 use crate::agent::parts::{
-    aborted_error, assistant_completed_info, assistant_error_info, assistant_info, tool_completed,
-    tool_error,
+    aborted_error, assistant_completed_info, assistant_error_info, assistant_info, task_tool_part,
+    tool_completed, tool_error,
 };
+use crate::agent::permission::ask_permission;
 use crate::agent::shape::{repair_tool_name, step_finish_part};
-use crate::agent::tools::dispatch;
+use crate::agent::tools::dispatch_with_cancel;
 use crate::{
     publish_error, publish_events, publish_idle, publish_part_delta, publish_turn_close, AppState,
     FakeCall, Repair, KNOWN_TOOLS,
 };
 
 pub(crate) async fn prompt_fake(
-    state: &AppState,
+    state: &Arc<AppState>,
     id: &str,
     input: PromptInput,
     user: MessageAppendResult,
@@ -41,6 +43,7 @@ pub(crate) async fn prompt_fake(
     project: String,
     cancel: Arc<AtomicBool>,
 ) -> rusqlite::Result<MessageAppendResult> {
+    let paths = state.store.paths();
     let calls = fake_tool_calls(&input);
     let body = if calls.is_empty() {
         format!("Echo: {text}")
@@ -59,7 +62,7 @@ pub(crate) async fn prompt_fake(
         let assistant = state.store.append_message_record(
             id,
             MessageAppendInput {
-                info: assistant_error_info(&user, &input, aborted_error()),
+                info: assistant_error_info(&paths, &user, &input, aborted_error()),
                 parts: Vec::new(),
             },
         )?;
@@ -73,7 +76,7 @@ pub(crate) async fn prompt_fake(
     let start = state.store.append_message_record(
         id,
         MessageAppendInput {
-            info: assistant_info(&user, &input),
+            info: assistant_info(&paths, &user, &input),
             parts: vec![json!({
                 "type": "text",
                 "text": "",
@@ -94,21 +97,22 @@ pub(crate) async fn prompt_fake(
 
     publish_part_delta(state, id, &mid, &pid, &body);
 
-    let root = PathBuf::from(state.store.paths().directory);
     let tools = fake_tool_parts(
-        root,
+        state.clone(),
+        id.to_string(),
         mid.clone(),
         pid.clone(),
         calls,
         start.result.time,
         cancel.clone(),
+        input.model.clone(),
     )
     .await;
     if is_canceled(&cancel) {
         let assistant = state.store.append_message_record(
             id,
             MessageAppendInput {
-                info: assistant_error_info(&user, &input, aborted_error()),
+                info: assistant_error_info(&paths, &user, &input, aborted_error()),
                 parts: Vec::new(),
             },
         )?;
@@ -208,19 +212,23 @@ fn fake_tool_calls(input: &PromptInput) -> Vec<FakeCall> {
 }
 
 pub(crate) async fn fake_tool_parts(
-    root: PathBuf,
+    state: Arc<AppState>,
+    sid: String,
     mid: String,
     pid: String,
     calls: Vec<FakeCall>,
     time: i64,
     cancel: Arc<AtomicBool>,
+    model: Option<Value>,
 ) -> Vec<Value> {
     let mut set = JoinSet::new();
     for (idx, call) in calls.into_iter().enumerate() {
-        let root = root.clone();
+        let state = state.clone();
+        let sid = sid.clone();
         let mid = mid.clone();
         let pid = pid.clone();
         let cancel = cancel.clone();
+        let model = model.clone();
         set.spawn(async move {
             wait_fake(call.delay, &cancel).await;
             let part = if is_canceled(&cancel) {
@@ -235,7 +243,7 @@ pub(crate) async fn fake_tool_parts(
                     time,
                 )
             } else {
-                fake_tool_part(&root, &mid, &pid, idx, &call, time)
+                fake_tool_part(&state, &sid, &mid, &pid, idx, &call, time, cancel, model).await
             };
             (idx, part)
         });
@@ -250,13 +258,16 @@ pub(crate) async fn fake_tool_parts(
     parts.into_iter().map(|(_, part)| part).collect()
 }
 
-fn fake_tool_part(
-    root: &std::path::Path,
+async fn fake_tool_part(
+    state: &Arc<AppState>,
+    sid: &str,
     mid: &str,
     pid: &str,
     idx: usize,
     call: &FakeCall,
     time: i64,
+    cancel: Arc<AtomicBool>,
+    model: Option<Value>,
 ) -> Value {
     if call.tool == "invalid" {
         return tool_error(
@@ -273,7 +284,33 @@ fn fake_tool_part(
             time,
         );
     }
-    match dispatch(&call.tool, &call.input, root) {
+    if call.tool == "task" {
+        let got = ChatToolCall {
+            id: fake_call_id(pid, idx),
+            name: "task".to_string(),
+            input: call.input.clone(),
+        };
+        return match ask_permission(state, sid, mid, pid, idx, "task", &got.id, &got.input).await {
+            Ok(()) => {
+                task_tool_part(
+                    state,
+                    sid,
+                    mid,
+                    pid,
+                    idx,
+                    &got,
+                    time,
+                    cancel,
+                    model,
+                    Some(json!({ "fake": true })),
+                )
+                .await
+            }
+            Err(err) => tool_error(mid, pid, idx, "task", &got.id, &got.input, err, time),
+        };
+    }
+    let root = PathBuf::from(state.store.paths().directory);
+    match dispatch_with_cancel(&call.tool, &call.input, &root, Some(&cancel)) {
         Some(Ok((title, output, metadata))) => fake_tool_completed(
             mid,
             pid,

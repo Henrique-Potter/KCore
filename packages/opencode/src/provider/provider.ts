@@ -45,6 +45,69 @@ import {
 
 const log = Log.create({ service: "provider" })
 
+// kilocode_change start - deterministic Bun sidecar benchmark provider
+function fakeBenchmarkProvider(): Info {
+  const model: Model = {
+    id: ModelID.make("fake-echo"),
+    providerID: ProviderID.make("fake"),
+    name: "Fake Echo",
+    api: {
+      id: "fake-echo",
+      url: "",
+      npm: "@kilocode/bench-fake-provider",
+    },
+    status: "active",
+    headers: {},
+    options: {},
+    cost: {
+      input: 0,
+      output: 0,
+      cache: {
+        read: 0,
+        write: 0,
+      },
+    },
+    limit: {
+      context: 200_000,
+      output: 10_000,
+    },
+    capabilities: {
+      temperature: false,
+      reasoning: false,
+      attachment: false,
+      toolcall: true,
+      input: {
+        text: true,
+        audio: false,
+        image: false,
+        video: false,
+        pdf: false,
+      },
+      output: {
+        text: true,
+        audio: false,
+        image: false,
+        video: false,
+        pdf: false,
+      },
+      interleaved: false,
+    },
+    release_date: "2026-05-09",
+    variants: {},
+  }
+  return {
+    id: ProviderID.make("fake"),
+    name: "Benchmark Fake Provider",
+    source: "custom",
+    env: [],
+    options: {},
+    models: {
+      [model.id]: model,
+    },
+  }
+}
+// kilocode_change end
+
 function shouldUseCopilotResponsesApi(modelID: string): boolean {
   const match = /^gpt-(\d+)/.exec(modelID)
   if (!match) return false
@@ -1102,6 +1165,13 @@ const layer: Layer.Layer<
         const discoveryLoaders: {
           [providerID: string]: CustomDiscoverModels
         } = {}
+        // kilocode_change start - deterministic Bun sidecar benchmark provider
+        if (Flag.KILO_BENCH_FAKE_PROVIDER) {
+          const fake = fakeBenchmarkProvider()
+          database[fake.id] = fake
+          providers[fake.id] = fake
+        }
+        // kilocode_change end
         const dep = {
           auth: (id: string) => auth.get(id).pipe(Effect.orDie),
           config: () => config.get(),

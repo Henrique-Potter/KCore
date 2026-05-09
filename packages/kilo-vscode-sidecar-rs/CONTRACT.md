@@ -199,6 +199,88 @@ appending it to that constant *and* this table in the same commit.
 | `schema_migration_failed` | snake_case | 500 | `PRAGMA user_version` walk failed mid-migration |
 | `store_unavailable` | snake_case | 500 | Writer connection cannot be opened |
 
+OAuth flow errors (emitted by `routes/config.rs` OAuth handlers):
+
+| Name | Convention | Status | Trigger |
+|---|---|---|---|
+| `OauthUnsupportedProvider` | PascalCase | 400 | `/auth/{providerID}` for a provider other than `openai` |
+| `OauthUnsupportedMethod` | PascalCase | 400 | OAuth method other than `auto` |
+| `OauthCodeMissing` | PascalCase | 400 | OAuth callback body without `code` |
+| `OauthPendingMissing` | PascalCase | 400 | Callback for a flow with no pending entry (or expired) |
+| `OauthStateMismatch` | PascalCase | 400 | Callback `state` does not match the pending PKCE state |
+| `OauthCallbackTimeout` | PascalCase | 400 | Browser callback wait exceeded `OAUTH_PENDING_TTL` |
+
+PTY route errors (Rust-only surface; `routes/pty.rs`):
+
+| Name | Convention | Status | Trigger |
+|---|---|---|---|
+| `RustPtyOpenError` | PascalCase | 500 | `portable_pty::PtySystem::openpty` failure |
+| `RustPtySpawnError` | PascalCase | 500 | Child process spawn failure inside the PTY |
+| `RustPtyWriterError` | PascalCase | 500 | PTY writer handle could not be acquired |
+| `RustPtyReaderError` | PascalCase | 500 | PTY reader handle could not be acquired |
+| `RustPtyNotFoundError` | PascalCase | 404 | PUT/DELETE for an unknown PTY id |
+| `RustPtyWriteError` | PascalCase | 500 | Write to PTY writer failed |
+| `RustPtyResizeError` | PascalCase | 500 | PTY resize ioctl failed |
+
+Worktree route errors (`routes/worktree.rs`):
+
+| Name | Convention | Status | Trigger |
+|---|---|---|---|
+| `WorktreeInvalidInputError` | PascalCase | 400 | Body is missing `branch`/`path` or has an empty value |
+| `WorktreeCreateFailedError` | PascalCase | 500 | `git worktree add` failed |
+| `WorktreeRemoveFailedError` | PascalCase | 500 | `git worktree remove` (or filesystem retry) failed |
+| `WorktreeResetFailedError` | PascalCase | 500 | `git reset --hard` against a worktree failed |
+| `WorktreeResetUnsafeError` | PascalCase | 400 | Reset target is the primary worktree |
+| `WorktreeNotGitError` | PascalCase | 400 | Project root is not a git repository |
+| `WorktreeListFailedError` | PascalCase | 500 | `git worktree list --porcelain` failed |
+| `WorktreePathSafetyError` | PascalCase | 400 | Path canonicalization escaped the project root |
+
+MCP route errors (Rust-only surface; `routes/mcp.rs` and `kilo-mcp`):
+
+| Name | Convention | Status | Trigger |
+|---|---|---|---|
+| `RustMcpAuthInvalidError` | PascalCase | 400 | Auth body for `/mcp/{name}/auth` is malformed |
+| `RustMcpNotFoundError` | PascalCase | 404 | Unknown MCP server name |
+| `RustMcpAuthPersistError` | PascalCase | 500 | Persisting MCP auth blob to disk failed |
+| `RustMcpOAuthConfigError` | PascalCase | 400 | Remote MCP server config missing `oauth.*` fields |
+| `RustMcpOAuthPersistError` | PascalCase | 500 | Persisting MCP OAuth tokens failed |
+| `RustMcpOAuthCallbackError` | PascalCase | 400 | OAuth callback for an MCP server failed exchange |
+| `RustMcpOAuthStateError` | PascalCase | 400 | Pending MCP OAuth state mismatch / missing |
+| `RustMcpDisabledError` | PascalCase | 400 | Tool call against a server with `enabled = false` |
+| `RustMcpDisconnectedError` | PascalCase | 503 | Tool call against a not-currently-connected server |
+| `RustMcpOAuthDiscoveryError` | PascalCase | 400 | OAuth metadata discovery (issuer/registration endpoint) failed |
+| `RustMcpOAuthRegistrationError` | PascalCase | 400 | Dynamic client registration with the MCP OAuth server failed |
+| `RustMcpAuthRefreshError` | PascalCase | 500 | Refresh-token grant against the MCP server failed |
+| `RustMcpRemoteConfigError` | PascalCase | 400 | Remote MCP transport config invalid |
+| `RustMcpHttpError` | PascalCase | 502 | Upstream MCP HTTP transport error |
+| `RustMcpTimeoutError` | PascalCase | 504 | MCP RPC exceeded its budget |
+| `RustMcpMalformedResponseError` | PascalCase | 502 | MCP server returned an unparseable JSON-RPC frame |
+| `RustMcpToolError` | PascalCase | 502 | MCP `tools/call` returned a JSON-RPC error |
+| `RustMcpWriteError` | PascalCase | 500 | Writing to a local stdio MCP child failed |
+| `RustMcpClosedError` | PascalCase | 503 | Local stdio MCP child closed mid-flight |
+| `RustMcpNotImplementedError` | PascalCase | 501 | MCP lifecycle route reached the `not_implemented` placeholder |
+
+Assistant-side error envelopes (emitted via direct `json!` into
+`assistant.info.error`; documented also in "Assistant message error
+envelopes" below — listed here so this registry stays the single source
+of truth for every named error the sidecar emits):
+
+| Name | Convention | Surface | Trigger |
+|---|---|---|---|
+| `CompactionError` | PascalCase | assistant.info.error | Compaction provider/store failure (`agent/compaction.rs`) |
+| `APIError` | PascalCase | assistant.info.error | OpenAI Responses API failure surfaced through `kilo-provider` |
+
+The `Rust*` prefixed names are Rust-only HTTP route surfaces (PTY, MCP)
+that have no Bun analogue under the M10 OpenAI Pro narrowing — the
+prefix flags them as Rust-side identifiers.
+
+The `bad_request_named` helper in `routes/config.rs` is **deprecated**:
+it bypasses the registry's `debug_assert!`. The canonical replacement
+lives in `error.rs::bad_request_named` and enforces the same check used
+by `internal_error_named` / `named_response`. Existing call sites are
+migrated in a separate pass; new code should call the `error.rs`
+helper.
+
 The two case conventions are deliberate. `PascalCase` predates the
 operational-invariant work and matches Bun's `NamedError` class names. New
 boundary/policy errors specified by the migration plan's "Operational

@@ -6,7 +6,8 @@
 use std::{
     io::Read,
     path::Path as FsPath,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    sync::atomic::AtomicBool,
     time::{Duration, Instant},
 };
 
@@ -19,6 +20,14 @@ pub(crate) const DEFAULT_BASH_TIMEOUT_MS: u64 = 60_000;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fake_bash(root: &FsPath, input: &Value) -> Result<(String, String, Value), String> {
+    fake_bash_with_cancel(root, input, None)
+}
+
+pub(crate) fn fake_bash_with_cancel(
+    root: &FsPath,
+    input: &Value,
+    cancel: Option<&AtomicBool>,
+) -> Result<(String, String, Value), String> {
     let command = input
         .get("command")
         .and_then(Value::as_str)
@@ -43,6 +52,7 @@ pub(crate) fn fake_bash(root: &FsPath, input: &Value) -> Result<(String, String,
     let out = read_pipe(stdout);
     let err = read_pipe(stderr);
     let mut expired = false;
+    let mut cancelled = false;
     let code = loop {
         let status = child
             .try_wait()
@@ -50,10 +60,18 @@ pub(crate) fn fake_bash(root: &FsPath, input: &Value) -> Result<(String, String,
         if let Some(status) = status {
             break status.code();
         }
+        if cancel.is_some_and(crate::agent::is_canceled) {
+            cancelled = true;
+            kill_child(&mut child)
+                .map_err(|err| format!("Unable to kill cancelled command: {err}"))?;
+            child
+                .wait()
+                .map_err(|err| format!("Unable to wait for cancelled command: {err}"))?;
+            break None;
+        }
         if started.elapsed() >= timeout {
             expired = true;
-            child
-                .kill()
+            kill_child(&mut child)
                 .map_err(|err| format!("Unable to kill timed out command: {err}"))?;
             child
                 .wait()
@@ -81,9 +99,28 @@ pub(crate) fn fake_bash(root: &FsPath, input: &Value) -> Result<(String, String,
         "description": description,
         "truncated": truncated,
         "timeout": expired,
+        "cancelled": cancelled,
     });
 
     Ok((description.to_string(), output, metadata))
+}
+
+fn kill_child(child: &mut Child) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let killed = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if killed {
+            let _ = child.kill();
+            return Ok(());
+        }
+    }
+    child.kill()
 }
 
 fn shell_command(command: &str, cwd: &FsPath) -> Result<(std::process::Child, Instant), String> {

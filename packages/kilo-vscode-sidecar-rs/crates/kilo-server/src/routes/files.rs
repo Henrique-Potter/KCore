@@ -7,9 +7,18 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::{BufRead, BufReader, Read},
     path::{Path as FsPath, PathBuf},
-    sync::Arc,
+    sync::{atomic::AtomicBool, Arc},
 };
+
+/// Cancel cadence for the per-file streaming grep loop. Mirrors the
+/// constant in `agent::tools::fs` — checking the atomic on every line
+/// is wasteful; every 256 lines is a reasonable bound on stalled aborts.
+const GREP_CANCEL_CADENCE: usize = 256;
+/// Bytes peeked off the front of a file to decide whether it's binary
+/// without loading the whole thing into memory.
+const GREP_BINARY_SNIFF_BYTES: usize = 8192;
 
 use axum::{
     extract::{Query, State},
@@ -298,58 +307,127 @@ pub(crate) fn search_text_target(
     pattern: &str,
     limit: usize,
 ) -> Vec<Value> {
+    search_text_target_cancel(root, target, pattern, limit, None)
+}
+
+/// Cancel-aware variant of [`search_text_target`]. The agent dispatch
+/// path passes `Some(cancel)`; HTTP route handlers without a runner
+/// context pass `None` and observe the same legacy behavior. Cancel is
+/// checked between scanned files and at every line during a single
+/// file's scan.
+pub(crate) fn search_text_target_cancel(
+    root: &FsPath,
+    target: &FsPath,
+    pattern: &str,
+    limit: usize,
+    cancel: Option<&AtomicBool>,
+) -> Vec<Value> {
     let mut out = Vec::new();
     if target.is_file() {
-        collect_text_matches(root, target, pattern, limit, &mut out);
+        collect_text_matches_cancel(root, target, pattern, limit, &mut out, cancel);
         return out;
     }
 
-    walk(root, target, &mut |path, meta| {
-        if out.len() >= limit {
-            return false;
-        }
-        if meta.is_dir() {
-            return true;
-        }
-        collect_text_matches(root, path, pattern, limit, &mut out);
-        true
-    });
+    walk_cancel(
+        root,
+        target,
+        &mut |path, meta| {
+            if out.len() >= limit {
+                return false;
+            }
+            if meta.is_dir() {
+                return true;
+            }
+            collect_text_matches_cancel(root, path, pattern, limit, &mut out, cancel);
+            true
+        },
+        cancel,
+    );
     out
 }
 
-pub(crate) fn collect_text_matches(
+/// Stream-scan `path` for `pattern` line-by-line. Memory is bounded by
+/// the per-line buffer (one `Vec<u8>` reused across lines) plus
+/// whatever the caller's `out` accumulator already holds. The legacy
+/// implementation read the whole file into a `Vec<u8>` before scanning
+/// — pathological for multi-GB log files. Cancel is observed every
+/// `GREP_CANCEL_CADENCE` lines and after each match push.
+///
+/// Early exit: returns as soon as `out.len() >= limit` so a single
+/// huge file can't keep scanning past the caller's cap.
+pub(crate) fn collect_text_matches_cancel(
     root: &FsPath,
     path: &FsPath,
     pattern: &str,
     limit: usize,
     out: &mut Vec<Value>,
+    cancel: Option<&AtomicBool>,
 ) {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(_) => return,
-    };
-    if is_binary(path, &bytes) {
+    if cancel.is_some_and(crate::agent::is_canceled) {
         return;
     }
-    let text = String::from_utf8_lossy(&bytes);
-    for (idx, line) in text.lines().enumerate() {
+    if out.len() >= limit {
+        return;
+    }
+
+    // Sniff the first 8 KB to decide binary without loading the file.
+    let mut sniff_handle = match std::fs::File::open(path) {
+        Ok(handle) => handle,
+        Err(_) => return,
+    };
+    let mut sniff = vec![0u8; GREP_BINARY_SNIFF_BYTES];
+    let read_n = sniff_handle.read(&mut sniff).unwrap_or(0);
+    sniff.truncate(read_n);
+    if is_binary(path, &sniff) {
+        return;
+    }
+    drop(sniff_handle);
+
+    let handle = match std::fs::File::open(path) {
+        Ok(handle) => handle,
+        Err(_) => return,
+    };
+    let mut reader = BufReader::new(handle);
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    let mut idx = 0usize;
+    loop {
         if out.len() >= limit {
             return;
         }
-        let Some(pos) = line.find(pattern) else {
-            continue;
+        if idx % GREP_CANCEL_CADENCE == 0 && cancel.is_some_and(crate::agent::is_canceled) {
+            return;
+        }
+        buf.clear();
+        let Ok(n) = reader.read_until(b'\n', &mut buf) else {
+            return;
         };
-        out.push(json!({
-            "path": { "text": slash(path.strip_prefix(root).unwrap_or(path)) },
-            "lines": { "text": format!("{line}\n") },
-            "line_number": idx + 1,
-            "absolute_offset": 0,
-            "submatches": [{
-                "match": { "text": pattern },
-                "start": pos,
-                "end": pos + pattern.len(),
-            }],
-        }));
+        if n == 0 {
+            return;
+        }
+        // Strip trailing \r?\n to match prior `text.lines()` semantics
+        // (the persisted match text intentionally re-adds the trailing
+        // newline below).
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+        }
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+        let line = String::from_utf8_lossy(&buf);
+        if let Some(pos) = line.find(pattern) {
+            out.push(json!({
+                "path": { "text": slash(path.strip_prefix(root).unwrap_or(path)) },
+                "lines": { "text": format!("{line}\n") },
+                "line_number": idx + 1,
+                "absolute_offset": 0,
+                "submatches": [{
+                    "match": { "text": pattern },
+                    "start": pos,
+                    "end": pos + pattern.len(),
+                }],
+            }));
+        }
+        idx += 1;
     }
 }
 
@@ -358,10 +436,22 @@ pub(crate) fn walk(
     dir: &FsPath,
     visit: &mut impl FnMut(&FsPath, &fs::Metadata) -> bool,
 ) -> bool {
+    walk_cancel(root, dir, visit, None)
+}
+
+pub(crate) fn walk_cancel(
+    root: &FsPath,
+    dir: &FsPath,
+    visit: &mut impl FnMut(&FsPath, &fs::Metadata) -> bool,
+    cancel: Option<&AtomicBool>,
+) -> bool {
     let Ok(entries) = fs::read_dir(dir) else {
         return true;
     };
     for entry in entries.filter_map(Result::ok) {
+        if cancel.is_some_and(crate::agent::is_canceled) {
+            return false;
+        }
         if entry.file_name() == ".git" || entry.file_name() == ".DS_Store" {
             continue;
         }
@@ -372,7 +462,7 @@ pub(crate) fn walk(
         if !visit(&path, &meta) {
             return false;
         }
-        if meta.is_dir() && path.starts_with(root) && !walk(root, &path, visit) {
+        if meta.is_dir() && path.starts_with(root) && !walk_cancel(root, &path, visit, cancel) {
             return false;
         }
     }
