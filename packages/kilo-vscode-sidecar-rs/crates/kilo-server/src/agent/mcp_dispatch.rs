@@ -17,14 +17,27 @@
 //!   `mcp_call_child` (local stdio) or `mcp_call_remote` (HTTP/SSE)
 //!   helper. Permission gating is the caller's responsibility — see
 //!   `agent::parts::mcp_tool_part`.
+//! * [`read_resource`] resolves an MCP resource URI by issuing a
+//!   `resources/read` JSON-RPC against the named server (Bun parity:
+//!   `packages/opencode/src/mcp/index.ts:747` `MCP.readResource`). Used
+//!   by `agent::parts::resolve_user_multimodal` to inline `mcp://`
+//!   resource parts on user messages.
 
-use std::{sync::atomic::AtomicBool, time::Duration};
+use std::{collections::BTreeMap, sync::atomic::AtomicBool, time::Duration};
 
 use kilo_provider::ChatTool;
 use serde_json::{json, Value};
 
-use crate::routes::mcp::{mcp_call_remote, mcp_config, MCP_DEFAULT_TIMEOUT_MS};
+use crate::routes::mcp::{
+    mcp_call_remote, mcp_config, mcp_post_remote, mcp_remote_request_headers, mcp_response_error,
+    mcp_wait_response_cancel, mcp_write_message, MCP_DEFAULT_TIMEOUT_MS,
+};
 use crate::AppState;
+
+/// JSON-RPC id reserved for `resources/read` requests so the response
+/// pump can distinguish them from `tools/call` (which uses
+/// `MCP_CALL_ID = 3`) on the same shared child stdio.
+const MCP_RESOURCE_READ_ID: i64 = 7;
 
 /// Namespaced view of an MCP tool: the public name the model sees, the
 /// raw client name, and the original tool name as the upstream server
@@ -168,4 +181,137 @@ async fn wait_cancel(cancel: &AtomicBool) {
     while !crate::agent::is_canceled(cancel) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// Per-MCP-spec `resources/read` returns a `result.contents` array whose
+/// entries each carry `{uri, mimeType, text?, blob?}`. We keep the raw
+/// JSON values so the consumer (`agent::parts::resolve_user_multimodal`)
+/// can pattern-match on `text` (inline string) vs `blob` (base64) without
+/// committing to a specific Rust shape — matching how `mcp_invoke`
+/// returns the raw JSON-RPC `result` payload.
+pub(crate) type ResourceContents = Vec<Value>;
+
+/// Failure modes for [`read_resource`]. Mirrors the local/remote split
+/// in [`mcp_invoke`] so callers can tell config / connection / RPC
+/// errors apart and emit a useful placeholder. The `String` payload
+/// carries the upstream message for diagnostic surfaces (logs / future
+/// route handlers); the in-tree caller in `agent::parts` only branches
+/// on the variant.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum McpResourceError {
+    /// Server isn't configured at all in `kilo.json` / state.
+    NotConfigured(String),
+    /// Server is configured but disabled — refuse before dialing.
+    Disabled(String),
+    /// Local stdio server is not in `state.mcp_children` (never
+    /// connected, or already disconnected).
+    NotConnected(String),
+    /// Underlying transport / RPC / parsing error. Carries a
+    /// human-readable message.
+    Rpc(String),
+}
+
+impl McpResourceError {
+    #[allow(dead_code)]
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::NotConfigured(err)
+            | Self::Disabled(err)
+            | Self::NotConnected(err)
+            | Self::Rpc(err) => err,
+        }
+    }
+}
+
+/// Read a resource by URI from a named MCP server.
+///
+/// Bun parity: mirrors `MCP.readResource(clientName, resourceUri)` at
+/// `packages/opencode/src/mcp/index.ts:747-751`, which sends the
+/// `resources/read` JSON-RPC request and returns the result. We expose
+/// only the `contents` array since that's the only field
+/// `resolve_user_multimodal` consumes — wrapping in additional shape
+/// would force callers to drill back through `Value`.
+pub(crate) async fn read_resource(
+    state: &AppState,
+    server: &str,
+    uri: &str,
+) -> Result<ResourceContents, McpResourceError> {
+    let cfg = mcp_config(state, server).ok_or_else(|| {
+        McpResourceError::NotConfigured(format!("MCP server {server} is not configured"))
+    })?;
+    if !kilo_mcp::enabled(&cfg) {
+        return Err(McpResourceError::Disabled(format!(
+            "MCP server {server} is disabled"
+        )));
+    }
+    let result = match cfg {
+        kilo_mcp::Config::Local { timeout, .. } => {
+            let timeout = Duration::from_millis(timeout.unwrap_or(MCP_DEFAULT_TIMEOUT_MS).max(1));
+            // Same lock-and-poll shape as `mcp_invoke` — the
+            // `mcp_children` Mutex is held across the synchronous
+            // poll loop. See the M1 hardening note in `mcp_invoke`.
+            let mut children = state.mcp_children.lock().unwrap();
+            let child = children.get_mut(server).ok_or_else(|| {
+                McpResourceError::NotConnected(format!("MCP server {server} is not connected"))
+            })?;
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": MCP_RESOURCE_READ_ID,
+                "method": "resources/read",
+                "params": { "uri": uri }
+            });
+            mcp_write_message(&mut child.stdin, &req).map_err(|err| {
+                McpResourceError::Rpc(format!("MCP resources/read write failed: {err}"))
+            })?;
+            let res = mcp_wait_response_cancel(child, MCP_RESOURCE_READ_ID, timeout, None)
+                .map_err(McpResourceError::Rpc)?;
+            mcp_response_error(&res).map_err(McpResourceError::Rpc)?;
+            res.get("result").cloned().ok_or_else(|| {
+                McpResourceError::Rpc("MCP resources/read missing result".to_string())
+            })?
+        }
+        kilo_mcp::Config::Remote {
+            url,
+            headers,
+            timeout,
+            ..
+        } => {
+            // Connectedness mirrors the route handler in
+            // `routes::mcp::mcp_call_tool` — refuse if the registry
+            // hasn't observed a successful connect.
+            let connected = matches!(
+                state.mcp.lock().unwrap().get(server),
+                Some(kilo_mcp::Status::Connected { .. })
+            );
+            if !connected {
+                return Err(McpResourceError::NotConnected(format!(
+                    "MCP server {server} is not connected"
+                )));
+            }
+            let resolved: BTreeMap<String, String> =
+                mcp_remote_request_headers(state, server, headers.as_ref())
+                    .await
+                    .map_err(|err| McpResourceError::Rpc(err.message().to_string()))?;
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": MCP_RESOURCE_READ_ID,
+                "method": "resources/read",
+                "params": { "uri": uri }
+            });
+            let res = mcp_post_remote(&url, Some(&resolved), req, MCP_RESOURCE_READ_ID, timeout)
+                .await
+                .map_err(|err| McpResourceError::Rpc(err.message().to_string()))?;
+            mcp_response_error(&res).map_err(McpResourceError::Rpc)?;
+            res.get("result").cloned().ok_or_else(|| {
+                McpResourceError::Rpc("MCP resources/read missing result".to_string())
+            })?
+        }
+    };
+    let contents = result
+        .get("contents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(contents)
 }

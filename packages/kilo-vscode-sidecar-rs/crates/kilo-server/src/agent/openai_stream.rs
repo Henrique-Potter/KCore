@@ -177,7 +177,7 @@ pub(crate) async fn prompt_openai_stream(
         agent_prompt(&state, &input).as_deref(),
     );
     let tools = real_tools(&state, &input);
-    let mut base_messages = real_messages(&state, id, &text);
+    let mut base_messages = real_messages(&state, id, &text).await;
     let stream_model = input.model.clone();
     spawn_title_generation(
         state.clone(),
@@ -1016,14 +1016,12 @@ pub(crate) async fn prompt_openai_stream(
                     // streamed parts have been replaced by the
                     // summary anchor.
                     history_extension.clear();
-                    base_messages = real_messages(&state, id, &text);
+                    base_messages = real_messages(&state, id, &text).await;
                     total_usage = ChatUsage::default();
                     last_iter_usage = None;
                 }
                 Err(err) => {
-                    eprintln!(
-                        "[kilo-server] proactive compaction failed: {err}"
-                    );
+                    eprintln!("[kilo-server] proactive compaction failed: {err}");
                     let assistant = state.store.append_message_record(
                         id,
                         MessageAppendInput {

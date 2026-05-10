@@ -348,6 +348,124 @@ async fn question_round_trip_through_routes() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+// ---------- read_resource (Wave 5 follow-up) ----------
+//
+// Mirrors Bun's `MCP.readResource(server, uri)` at
+// `packages/opencode/src/mcp/index.ts:747-751`. The transport happy path
+// is covered by the routes-level `mcp_remote` / `mcp_local` tests
+// (`mcp_post_remote` / `mcp_call_child_cancel` are the same plumbing);
+// here we lock down the configuration / status guards.
+
+#[tokio::test]
+async fn read_resource_errors_when_server_not_configured() {
+    use crate::agent::mcp_dispatch::{read_resource, McpResourceError};
+    let root = unique_root();
+    let state = state_at(&root);
+    let err = read_resource(&state, "ghost", "mcp://ghost/x").await.err();
+    assert!(
+        matches!(err, Some(McpResourceError::NotConfigured(_))),
+        "missing server should surface NotConfigured"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_resource_errors_when_local_server_not_connected() {
+    use crate::agent::mcp_dispatch::{read_resource, McpResourceError};
+    let root = unique_root();
+    let state = state_at(&root);
+    state.mcp_configs.lock().unwrap().insert(
+        "local-fake".to_string(),
+        kilo_mcp::Config::Local {
+            command: vec!["nonexistent-binary".to_string()],
+            environment: None,
+            cwd: None,
+            enabled: Some(true),
+            timeout: Some(500),
+        },
+    );
+    let err = read_resource(&state, "local-fake", "mcp://local-fake/x")
+        .await
+        .err();
+    assert!(
+        matches!(err, Some(McpResourceError::NotConnected(_))),
+        "configured-but-no-child should surface NotConnected"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_resource_errors_when_server_disabled() {
+    use crate::agent::mcp_dispatch::{read_resource, McpResourceError};
+    let root = unique_root();
+    let state = state_at(&root);
+    state.mcp_configs.lock().unwrap().insert(
+        "off".to_string(),
+        kilo_mcp::Config::Local {
+            command: vec!["echo".to_string()],
+            environment: None,
+            cwd: None,
+            enabled: Some(false),
+            timeout: Some(500),
+        },
+    );
+    let err = read_resource(&state, "off", "mcp://off/x").await.err();
+    assert!(
+        matches!(err, Some(McpResourceError::Disabled(_))),
+        "disabled config must short-circuit before dialing"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_resource_calls_resources_read_method_on_server() {
+    // Drive the remote path against an in-process JSON-RPC fixture and
+    // assert (a) the request advertises `method: "resources/read"` with
+    // the URI in `params.uri`, and (b) the helper returns the
+    // `result.contents[]` array verbatim.
+    use crate::agent::mcp_dispatch::read_resource;
+    use crate::tests::common::{
+        mcp_add_remote_server, mcp_connect_test_server, mcp_json_response, mcp_remote_server,
+    };
+    use serde_json::json;
+
+    let root = unique_root();
+    let state = state_at(&root);
+
+    // Connect handshake (initialize → tools/list) followed by the
+    // resources/read response. The fixture echoes back a typed contents
+    // payload so we can assert on it in the caller.
+    let server = mcp_remote_server(vec![
+        mcp_json_response(json!({ "jsonrpc": "2.0", "id": 1, "result": {} })),
+        mcp_json_response(json!({
+            "jsonrpc": "2.0", "id": 2,
+            "result": { "tools": [] }
+        })),
+        mcp_json_response(json!({
+            "jsonrpc": "2.0", "id": 7,
+            "result": {
+                "contents": [
+                    { "uri": "mcp://docs/readme", "mimeType": "text/markdown", "text": "# hi" }
+                ]
+            }
+        })),
+    ])
+    .await;
+
+    mcp_add_remote_server(&state, "docs", &server.url, 1000).await;
+    mcp_connect_test_server(&state, "docs").await;
+
+    let contents = read_resource(&state, "docs", "mcp://docs/readme")
+        .await
+        .expect("read_resource should succeed");
+    assert_eq!(contents.len(), 1, "contents passthrough: {contents:?}");
+    assert_eq!(contents[0]["uri"], "mcp://docs/readme");
+    assert_eq!(contents[0]["mimeType"], "text/markdown");
+    assert_eq!(contents[0]["text"], "# hi");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn real_tools_does_not_advertise_mcp_when_tools_are_disabled() {
     let root = unique_root();

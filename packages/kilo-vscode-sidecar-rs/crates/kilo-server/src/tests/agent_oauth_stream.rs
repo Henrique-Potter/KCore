@@ -2204,7 +2204,10 @@ async fn compact_session_aborts_promptly_when_cancel_fires_during_summarize() {
 async fn proactive_compaction_provider(
     iter1_data: &'static str,
     iter2_data: &'static str,
-) -> (super::common::TestProvider, std::sync::Arc<std::sync::Mutex<u8>>) {
+) -> (
+    super::common::TestProvider,
+    std::sync::Arc<std::sync::Mutex<u8>>,
+) {
     use std::sync::Arc;
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -246,8 +246,8 @@ fn tool_completed_truncates_large_outputs_at_common_boundary() {
     );
 }
 
-#[test]
-fn real_messages_injects_plan_mode_file_contract_for_plan_agent() {
+#[tokio::test]
+async fn real_messages_injects_plan_mode_file_contract_for_plan_agent() {
     let root = unique_root();
     let state = state_at(&root);
     seed(&state.store);
@@ -269,7 +269,7 @@ fn real_messages_injects_plan_mode_file_contract_for_plan_agent() {
         )
         .unwrap();
 
-    let messages = real_messages(&state, &session.id, "draft the plan");
+    let messages = real_messages(&state, &session.id, "draft the plan").await;
     let content = &messages.last().unwrap().content;
 
     assert!(content.contains("Plan mode is active"));
@@ -456,8 +456,8 @@ async fn real_tool_parts_rejects_invalid_argument_repairs() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-#[test]
-fn real_messages_skips_unsettled_tool_parts() {
+#[tokio::test]
+async fn real_messages_skips_unsettled_tool_parts() {
     let root = unique_root();
     let state = state_at(&root);
     seed(&state.store);
@@ -503,7 +503,7 @@ fn real_messages_skips_unsettled_tool_parts() {
         )
         .unwrap();
 
-    let messages = real_messages(&state, &session.id, "continue");
+    let messages = real_messages(&state, &session.id, "continue").await;
     assert!(
         messages.iter().all(|message| message.responses.is_empty()),
         "unsettled running tool calls must not replay as bare function_call items: {messages:?}"
@@ -512,8 +512,8 @@ fn real_messages_skips_unsettled_tool_parts() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-#[test]
-fn real_messages_injects_editor_context_into_latest_user_message() {
+#[tokio::test]
+async fn real_messages_injects_editor_context_into_latest_user_message() {
     let root = unique_root();
     let state = state_at(&root);
     let session = state
@@ -538,7 +538,7 @@ fn real_messages_injects_editor_context_into_latest_user_message() {
         )
         .unwrap();
 
-    let messages = real_messages(&state, &session.id, "continue");
+    let messages = real_messages(&state, &session.id, "continue").await;
     let content = &messages.last().expect("last message").content;
     assert!(content.contains("<environment_details>"));
     assert!(content.contains("Active file: src/lib.rs"));
@@ -550,8 +550,8 @@ fn real_messages_injects_editor_context_into_latest_user_message() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-#[test]
-fn real_messages_preserves_data_url_file_attachments() {
+#[tokio::test]
+async fn real_messages_preserves_data_url_file_attachments() {
     let root = unique_root();
     let state = state_at(&root);
     let session = state
@@ -583,7 +583,7 @@ fn real_messages_preserves_data_url_file_attachments() {
         )
         .unwrap();
 
-    let messages = real_messages(&state, &session.id, "inspect image");
+    let messages = real_messages(&state, &session.id, "inspect image").await;
     let user = messages.last().expect("user message");
     assert_eq!(user.attachments.len(), 1);
     assert_eq!(user.attachments[0].mime, "image/png");

@@ -462,7 +462,7 @@ fn provider_implies_toolcall(model: Option<&Value>) -> bool {
     matches!(provider, Some("openai" | "kilo"))
 }
 
-pub(crate) fn real_messages(state: &AppState, id: &str, text: &str) -> Vec<ChatMessage> {
+pub(crate) async fn real_messages(state: &AppState, id: &str, text: &str) -> Vec<ChatMessage> {
     // Summary-anchor compaction (Bun parity, see
     // `agent::compaction::compact_session`): if any persisted message
     // has `info.summary == true`, drop everything BEFORE the latest
@@ -553,10 +553,12 @@ pub(crate) fn real_messages(state: &AppState, id: &str, text: &str) -> Vec<ChatM
         // already-stored data URL attachments.
         let (prefix, attachments) = if role == "user" {
             let resolved = resolve_user_multimodal(
+                state,
                 FsPath::new(&state.store.paths().directory),
                 &msg.parts,
                 &content,
-            );
+            )
+            .await;
             (resolved.prefix, resolved.attachments)
         } else {
             (String::new(), file_attachments(&msg.parts))
@@ -2552,8 +2554,12 @@ fn file_attachments(parts: &[Value]) -> Vec<ChatAttachment> {
 //   3. `@<path>` mentions in user text → if the token resolves to an
 //      existing file under the worktree, inline the file content as a
 //      synthetic text block before the user's text.
-// MCP `resource` parts are not handled here — `agent::mcp_dispatch` does
-// not yet expose a `read_resource` helper, so these are deferred (TODO).
+// MCP `resource` parts (`type: "resource"`, `uri: "mcp://<server>/..."`)
+// are resolved via `agent::mcp_dispatch::read_resource`, which issues a
+// `resources/read` JSON-RPC against the named server (Bun parity:
+// `packages/opencode/src/mcp/index.ts:747`). Text contents inline as
+// `<file uri="..." mimeType="...">…</file>` blocks; binary contents
+// surface as base64 data URL attachments.
 //
 // All path resolution flows through `crate::util::paths::resolve_under`
 // so we cannot read outside the worktree. Text reads use the BOM-aware
@@ -2575,7 +2581,12 @@ struct ResolvedMultimodal {
     attachments: Vec<ChatAttachment>,
 }
 
-fn resolve_user_multimodal(root: &FsPath, parts: &[Value], user_text: &str) -> ResolvedMultimodal {
+async fn resolve_user_multimodal(
+    state: &AppState,
+    root: &FsPath,
+    parts: &[Value],
+    user_text: &str,
+) -> ResolvedMultimodal {
     let mut prefix_blocks: Vec<String> = Vec::new();
     let mut attachments: Vec<ChatAttachment> = Vec::new();
 
@@ -2618,9 +2629,95 @@ fn resolve_user_multimodal(root: &FsPath, parts: &[Value], user_text: &str) -> R
         ingest_file_at(&abs, token, &mut prefix_blocks, &mut attachments);
     }
 
+    // (4) resolve MCP `resource` parts (Bun parity: `MCP.readResource`).
+    // Each part carries `{type: "resource", uri: "mcp://<server>/<path>"}`.
+    // We extract the server name from the URI authority, dial the live
+    // MCP client, and expand each returned content entry into either an
+    // inline text block (text contents) or a data URL attachment
+    // (base64 blob contents). On any failure we drop the part silently
+    // — there's no caller surface to bubble the error to from inside
+    // a sync prompt assembly path.
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) != Some("resource") {
+            continue;
+        }
+        let Some(uri) = part.get("uri").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(server) = mcp_resource_server(uri) else {
+            continue;
+        };
+        match crate::agent::mcp_dispatch::read_resource(state, server, uri).await {
+            Ok(contents) => {
+                ingest_mcp_contents(uri, &contents, &mut prefix_blocks, &mut attachments);
+            }
+            Err(_) => {
+                // Best-effort: leave a small marker so the model can see
+                // a placeholder in the prompt instead of silently dropping.
+                prefix_blocks.push(format!("<resource uri=\"{uri}\">[unavailable]</resource>"));
+            }
+        }
+    }
+
     ResolvedMultimodal {
         prefix: prefix_blocks.join("\n\n"),
         attachments,
+    }
+}
+
+/// Pull the server name from an `mcp://<server>/<path...>` URI. Returns
+/// `None` for non-`mcp://` schemes or empty authorities so callers can
+/// skip ill-formed parts.
+fn mcp_resource_server(uri: &str) -> Option<&str> {
+    let rest = uri.strip_prefix("mcp://")?;
+    let server = rest.split('/').next()?;
+    if server.is_empty() {
+        return None;
+    }
+    Some(server)
+}
+
+/// Expand the MCP `result.contents[]` array (each entry shape per spec:
+/// `{uri, mimeType, text?, blob?}`) into the prefix / attachment
+/// accumulators. Text entries inline as `<file uri="…" mimeType="…">…</file>`
+/// blocks; blob entries surface as base64 data URL attachments.
+fn ingest_mcp_contents(
+    fallback_uri: &str,
+    contents: &[Value],
+    prefix: &mut Vec<String>,
+    attachments: &mut Vec<ChatAttachment>,
+) {
+    for entry in contents {
+        let uri = entry
+            .get("uri")
+            .and_then(Value::as_str)
+            .unwrap_or(fallback_uri);
+        let mime = entry
+            .get("mimeType")
+            .or_else(|| entry.get("mime_type"))
+            .and_then(Value::as_str)
+            .unwrap_or("application/octet-stream");
+        if let Some(text) = entry.get("text").and_then(Value::as_str) {
+            prefix.push(format!(
+                "<file uri=\"{uri}\" mimeType=\"{mime}\">\n{text}\n</file>"
+            ));
+            continue;
+        }
+        if let Some(blob) = entry.get("blob").and_then(Value::as_str) {
+            // The blob is already base64-encoded per the MCP spec, so
+            // we splice it directly into the data URL without re-encoding.
+            let url = format!("data:{mime};base64,{blob}");
+            attachments.push(ChatAttachment {
+                mime: mime.to_string(),
+                url,
+                filename: None,
+            });
+            continue;
+        }
+        // Neither text nor blob: emit a stub so the model sees the URI.
+        prefix.push(format!(
+            "<file uri=\"{uri}\" mimeType=\"{mime}\">[empty]</file>"
+        ));
     }
 }
 
@@ -2931,18 +3028,60 @@ mod multimodal_tests {
         }
     }
 
-    #[test]
-    fn file_url_resolves_to_input_file_with_data_url() {
+    /// Bare-bones `AppState` for the multimodal resolver tests. We only
+    /// touch `state.mcp` / `state.mcp_configs` for the resource-resolution
+    /// paths; everything else is the cheapest valid default. Mirrors the
+    /// test-only `state_at_with` constructor in `tests/common.rs` without
+    /// the bus capacity tuning since these tests never publish events.
+    fn parts_test_state() -> std::sync::Arc<AppState> {
+        use std::net::SocketAddr;
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::{broadcast, Notify, RwLock};
+        let (bus, _) = broadcast::channel(16);
+        Arc::new(AppState {
+            username: "kilo".to_string(),
+            password: None,
+            store: kilo_store::Store::new(),
+            bus,
+            viewed: RwLock::default(),
+            runners: Mutex::default(),
+            runner_notify: Notify::new(),
+            prompt_queues: Mutex::default(),
+            prompt_queue_versions: Mutex::default(),
+            permissions: Mutex::default(),
+            approvals: Mutex::default(),
+            questions: Mutex::default(),
+            suggestions: Mutex::default(),
+            network: Mutex::default(),
+            mcp: Mutex::default(),
+            mcp_configs: Mutex::default(),
+            mcp_children: Mutex::default(),
+            pty: Mutex::default(),
+            plugin_tools: Mutex::default(),
+            session_agents: Mutex::default(),
+            session_hard_rules: Mutex::default(),
+            broken_turn_anchors: Mutex::default(),
+            oauth_pending: Mutex::default(),
+            oauth_listener: Mutex::default(),
+            oauth_listener_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            oauth_token_endpoint: String::new(),
+            sse_capacity: AppState::new_sse_capacity(),
+        })
+    }
+
+    #[tokio::test]
+    async fn file_url_resolves_to_input_file_with_data_url() {
         let root = unique_root();
         fs::create_dir_all(&root).unwrap();
         let path = root.join("doc.pdf");
         fs::write(&path, b"%PDF-1.4 fake pdf bytes").unwrap();
 
+        let state = parts_test_state();
         let parts = vec![json!({
             "type": "file",
             "url": file_url_for(&path),
         })];
-        let resolved = resolve_user_multimodal(&root, &parts, "");
+        let resolved = resolve_user_multimodal(&state, &root, &parts, "").await;
         assert!(
             resolved.prefix.is_empty(),
             "binary files must not produce inline text, got: {:?}",
@@ -2962,18 +3101,19 @@ mod multimodal_tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn file_url_text_resolves_to_input_text() {
+    #[tokio::test]
+    async fn file_url_text_resolves_to_input_text() {
         let root = unique_root();
         fs::create_dir_all(&root).unwrap();
         let path = root.join("note.md");
         fs::write(&path, "hello *world*").unwrap();
 
+        let state = parts_test_state();
         let parts = vec![json!({
             "type": "file",
             "url": file_url_for(&path),
         })];
-        let resolved = resolve_user_multimodal(&root, &parts, "");
+        let resolved = resolve_user_multimodal(&state, &root, &parts, "").await;
         assert!(resolved.attachments.is_empty());
         assert!(
             resolved.prefix.contains("hello *world*"),
@@ -2986,24 +3126,25 @@ mod multimodal_tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn file_url_outside_worktree_is_rejected() {
+    #[tokio::test]
+    async fn file_url_outside_worktree_is_rejected() {
         let root = unique_root();
         fs::create_dir_all(&root).unwrap();
         // Path with `..` in it must be refused by resolve_under.
+        let state = parts_test_state();
         let parts = vec![json!({
             "type": "file",
             "url": "file:///../etc/passwd",
         })];
-        let resolved = resolve_user_multimodal(&root, &parts, "");
+        let resolved = resolve_user_multimodal(&state, &root, &parts, "").await;
         assert!(resolved.prefix.is_empty());
         assert!(resolved.attachments.is_empty());
 
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn directory_expansion_walks_recursively_with_blocklist() {
+    #[tokio::test]
+    async fn directory_expansion_walks_recursively_with_blocklist() {
         let root = unique_root();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("node_modules").join("dep")).unwrap();
@@ -3015,11 +3156,12 @@ mod multimodal_tests {
         )
         .unwrap();
 
+        let state = parts_test_state();
         let parts = vec![json!({
             "type": "file",
             "url": file_url_for(&root.join("src")),
         })];
-        let resolved = resolve_user_multimodal(&root, &parts, "");
+        let resolved = resolve_user_multimodal(&state, &root, &parts, "").await;
         assert!(
             resolved.prefix.contains("alpha"),
             "expected alpha in prefix: {:?}",
@@ -3035,18 +3177,19 @@ mod multimodal_tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn directory_expansion_caps_at_size_limit() {
+    #[tokio::test]
+    async fn directory_expansion_caps_at_size_limit() {
         let root = unique_root();
         fs::create_dir_all(root.join("many")).unwrap();
         for i in 0..(MULTIMODAL_DIR_FILE_CAP + 5) {
             fs::write(root.join("many").join(format!("f{i:02}.txt")), "x").unwrap();
         }
+        let state = parts_test_state();
         let parts = vec![json!({
             "type": "file",
             "url": file_url_for(&root.join("many")),
         })];
-        let resolved = resolve_user_multimodal(&root, &parts, "");
+        let resolved = resolve_user_multimodal(&state, &root, &parts, "").await;
         let truncated = resolved
             .prefix
             .lines()
@@ -3061,14 +3204,16 @@ mod multimodal_tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn at_mention_in_user_text_inlines_existing_file() {
+    #[tokio::test]
+    async fn at_mention_in_user_text_inlines_existing_file() {
         let root = unique_root();
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("README.md"), "# header").unwrap();
 
+        let state = parts_test_state();
         let parts: Vec<Value> = vec![];
-        let resolved = resolve_user_multimodal(&root, &parts, "look at @README.md please");
+        let resolved =
+            resolve_user_multimodal(&state, &root, &parts, "look at @README.md please").await;
         assert!(
             resolved.prefix.contains("# header"),
             "missing inlined README contents: {:?}",
@@ -3078,13 +3223,15 @@ mod multimodal_tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn at_mention_with_nonexistent_path_stays_as_text() {
+    #[tokio::test]
+    async fn at_mention_with_nonexistent_path_stays_as_text() {
         let root = unique_root();
         fs::create_dir_all(&root).unwrap();
 
+        let state = parts_test_state();
         let parts: Vec<Value> = vec![];
-        let resolved = resolve_user_multimodal(&root, &parts, "see @does-not-exist for context");
+        let resolved =
+            resolve_user_multimodal(&state, &root, &parts, "see @does-not-exist for context").await;
         assert!(
             resolved.prefix.is_empty(),
             "non-resolving @-mention must not inject prefix content: {:?}",
@@ -3100,6 +3247,92 @@ mod multimodal_tests {
         // Email-ish substrings must not be picked up.
         let tokens = mention_tokens("contact me at foo@bar.com or @real");
         assert_eq!(tokens, vec!["real"]);
+    }
+
+    #[tokio::test]
+    async fn mcp_resource_uri_resolves_to_text_part() {
+        // Wave 4 P follow-up: `type: "resource"` parts with `mcp://`
+        // URIs hand off to `agent::mcp_dispatch::read_resource`. For
+        // unconfigured / unreachable servers we fall back to a placeholder
+        // marker so the model still sees a stub instead of a silent drop.
+        let root = unique_root();
+        fs::create_dir_all(&root).unwrap();
+
+        let state = parts_test_state();
+        let parts = vec![json!({
+            "type": "resource",
+            "uri": "mcp://ghost/docs/readme",
+        })];
+        let resolved = resolve_user_multimodal(&state, &root, &parts, "").await;
+        // No connected `ghost` server, so we expect the unavailable stub.
+        assert!(
+            resolved
+                .prefix
+                .contains("<resource uri=\"mcp://ghost/docs/readme\">[unavailable]</resource>"),
+            "expected unavailable stub for missing MCP server, got: {:?}",
+            resolved.prefix
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mcp_resource_server_extracts_authority() {
+        assert_eq!(
+            mcp_resource_server("mcp://docs/readme.md"),
+            Some("docs"),
+            "authority extraction broke"
+        );
+        assert_eq!(
+            mcp_resource_server("mcp://example.com/a/b"),
+            Some("example.com")
+        );
+        assert!(
+            mcp_resource_server("file:///tmp/x").is_none(),
+            "non-mcp scheme must not parse"
+        );
+        assert!(
+            mcp_resource_server("mcp:///empty").is_none(),
+            "empty authority must not parse"
+        );
+    }
+
+    #[test]
+    fn ingest_mcp_contents_inlines_text_and_attaches_blob() {
+        // Direct unit test for the contents fan-out: text → prefix block,
+        // blob → data URL attachment, and an empty entry stubs out so the
+        // model still sees the URI.
+        let mut prefix = Vec::new();
+        let mut attachments = Vec::new();
+        let contents = vec![
+            json!({
+                "uri": "mcp://docs/readme.md",
+                "mimeType": "text/markdown",
+                "text": "# Hello",
+            }),
+            json!({
+                "uri": "mcp://docs/cover.png",
+                "mimeType": "image/png",
+                "blob": "aW1n",
+            }),
+            json!({
+                "uri": "mcp://docs/empty",
+                "mimeType": "text/plain",
+            }),
+        ];
+        ingest_mcp_contents(
+            "mcp://docs/fallback",
+            &contents,
+            &mut prefix,
+            &mut attachments,
+        );
+        assert_eq!(prefix.len(), 2, "text + empty stub expected: {prefix:?}");
+        assert!(prefix[0].contains("mimeType=\"text/markdown\""));
+        assert!(prefix[0].contains("# Hello"));
+        assert!(prefix[1].contains("[empty]"));
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].mime, "image/png");
+        assert_eq!(attachments[0].url, "data:image/png;base64,aW1n");
     }
 }
 

@@ -625,13 +625,10 @@ async fn post(req: &ChatRequest) -> Result<ChatParsed, ProviderError> {
     let res = match &req.auth {
         ChatAuth::Oauth { access, account } if req.provider == "openai" => {
             let url = format!("{}/responses", req.base.trim_end_matches('/'));
-            let mut call = client.post(url).bearer_auth(access).json(&json!({
-                "model": req.model,
-                "instructions": req.instructions,
-                "input": responses_input(&req.messages),
-                "stream": false,
-                "store": false,
-            }));
+            let mut call = client
+                .post(url)
+                .bearer_auth(access)
+                .json(&responses_body(req, false));
             call = openai_oauth_headers(call, req.session_id.as_deref());
             if let Some(account) = account {
                 call = call.header("ChatGPT-Account-Id", account);
@@ -643,7 +640,22 @@ async fn post(req: &ChatRequest) -> Result<ChatParsed, ProviderError> {
                 provider: req.provider.clone(),
             })
         }
+        ChatAuth::Api { key } if req.provider == "openai" => {
+            // Bun parity: ALL OpenAI requests go through `/responses`,
+            // regardless of auth method. See `provider/provider.ts:253-260`
+            // (`openai` loader returns `sdk.responses(modelID)`).
+            // Reasoning models (gpt-5.1, o1) require this endpoint.
+            let url = format!("{}/responses", req.base.trim_end_matches('/'));
+            client
+                .post(url)
+                .bearer_auth(key)
+                .json(&responses_body(req, false))
+                .send()
+                .await
+        }
         ChatAuth::Api { key } => {
+            // Non-OpenAI providers using API-key auth still use the
+            // chat-completions shape — only OpenAI requires `/responses`.
             let url = format!("{}/chat/completions", req.base.trim_end_matches('/'));
             let mut body = json!({
                 "model": req.model,
@@ -651,7 +663,7 @@ async fn post(req: &ChatRequest) -> Result<ChatParsed, ProviderError> {
                 "stream": false,
             });
             if !req.tools.is_empty() {
-                body["tools"] = json!(openai_tools(&req.tools));
+                body["tools"] = json!(chat_completions_tools(&req.tools));
                 body["tool_choice"] = json!(tool_choice(&req.tools));
             }
             client.post(url).bearer_auth(key).json(&body).send().await
@@ -737,13 +749,10 @@ async fn post_cancel(req: &ChatRequest, cancel: &AtomicBool) -> Result<ChatParse
     let call = match &req.auth {
         ChatAuth::Oauth { access, account } if req.provider == "openai" => {
             let url = format!("{}/responses", req.base.trim_end_matches('/'));
-            let mut call = client.post(url).bearer_auth(access).json(&json!({
-                "model": req.model,
-                "instructions": req.instructions,
-                "input": responses_input(&req.messages),
-                "stream": false,
-                "store": false,
-            }));
+            let mut call = client
+                .post(url)
+                .bearer_auth(access)
+                .json(&responses_body(req, false));
             call = openai_oauth_headers(call, req.session_id.as_deref());
             if let Some(account) = account {
                 call = call.header("ChatGPT-Account-Id", account);
@@ -755,6 +764,14 @@ async fn post_cancel(req: &ChatRequest, cancel: &AtomicBool) -> Result<ChatParse
                 provider: req.provider.clone(),
             })
         }
+        ChatAuth::Api { key } if req.provider == "openai" => {
+            // Bun parity: ALL OpenAI traffic uses `/responses` (see [`post`]).
+            let url = format!("{}/responses", req.base.trim_end_matches('/'));
+            client
+                .post(url)
+                .bearer_auth(key)
+                .json(&responses_body(req, false))
+        }
         ChatAuth::Api { key } => {
             let url = format!("{}/chat/completions", req.base.trim_end_matches('/'));
             let mut body = json!({
@@ -763,7 +780,7 @@ async fn post_cancel(req: &ChatRequest, cancel: &AtomicBool) -> Result<ChatParse
                 "stream": false,
             });
             if !req.tools.is_empty() {
-                body["tools"] = json!(openai_tools(&req.tools));
+                body["tools"] = json!(chat_completions_tools(&req.tools));
                 body["tool_choice"] = json!(tool_choice(&req.tools));
             }
             client.post(url).bearer_auth(key).json(&body)
@@ -802,18 +819,10 @@ async fn post_stream(
         });
     };
     let url = format!("{}/responses", req.base.trim_end_matches('/'));
-    let mut body = json!({
-        "model": req.model,
-        "instructions": req.instructions,
-        "input": responses_input(&req.messages),
-        "stream": true,
-        "store": false,
-    });
-    if !req.tools.is_empty() {
-        body["tools"] = json!(responses_tools(&req.tools));
-        body["tool_choice"] = json!(tool_choice(&req.tools));
-    }
-    let mut call = client.post(url).bearer_auth(access).json(&body);
+    let mut call = client
+        .post(url)
+        .bearer_auth(access)
+        .json(&responses_body(req, true));
     call = openai_oauth_headers(call, req.session_id.as_deref());
     if let Some(account) = account {
         call = call.header("ChatGPT-Account-Id", account);
@@ -926,7 +935,10 @@ fn openai_oauth_headers(
     call
 }
 
-fn openai_tools(tools: &[ChatTool]) -> Vec<Value> {
+/// `/chat/completions`-shaped tools envelope (nested `function: {…}`),
+/// used only by non-OpenAI providers on the API-key path. OpenAI's
+/// `/responses` endpoint uses the flat shape — see [`responses_tools`].
+fn chat_completions_tools(tools: &[ChatTool]) -> Vec<Value> {
     tools
         .iter()
         .map(|tool| {
@@ -940,6 +952,26 @@ fn openai_tools(tools: &[ChatTool]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// Shared `/responses` body builder. OpenAI uses this on both the OAuth
+/// and API-key paths (Bun parity: `provider.ts:253-260` always returns
+/// `sdk.responses(modelID)` for the openai loader). `stream` toggles
+/// between the streaming and non-streaming variants — the rest of the
+/// envelope is identical.
+fn responses_body(req: &ChatRequest, stream: bool) -> Value {
+    let mut body = json!({
+        "model": req.model,
+        "instructions": req.instructions,
+        "input": responses_input(&req.messages),
+        "stream": stream,
+        "store": false,
+    });
+    if !req.tools.is_empty() {
+        body["tools"] = json!(responses_tools(&req.tools));
+        body["tool_choice"] = json!(tool_choice(&req.tools));
+    }
+    body
 }
 
 fn responses_tools(tools: &[ChatTool]) -> Vec<Value> {
@@ -2037,6 +2069,86 @@ mod tests {
             }
         );
         assert_eq!(req.messages[0].content, "hello");
+    }
+
+    #[tokio::test]
+    async fn api_key_openai_uses_responses_endpoint_with_flat_tools_envelope() {
+        // Bun parity: ALL OpenAI requests go through `/responses`, not
+        // `/chat/completions`, regardless of auth method. The Responses
+        // API uses the FLAT tools envelope (`{type, name, parameters,
+        // strict}`) — not the nested `{type, function: {…}}` shape used
+        // by `/chat/completions`. Reasoning models (gpt-5.1, o1) require
+        // the Responses endpoint.
+        let (url, handle) = header_server();
+        let req = ChatRequest {
+            provider: "openai".to_string(),
+            model: "gpt-5.1".to_string(),
+            base: url,
+            auth: ChatAuth::Api {
+                key: "sk-test".to_string(),
+            },
+            session_id: None,
+            instructions: Some("be concise".to_string()),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                responses: Vec::new(),
+                attachments: Vec::new(),
+            }],
+            tools: vec![ChatTool {
+                name: "read".to_string(),
+                description: "read a file".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "filePath": { "type": "string" } },
+                    "required": ["filePath"]
+                }),
+            }],
+        };
+
+        let out = post(&req).await.unwrap();
+        let raw = handle.join().unwrap();
+
+        assert_eq!(out.text, "ok");
+        // Endpoint: /responses, not /chat/completions.
+        assert!(
+            raw.contains("POST /responses"),
+            "expected POST to /responses, got:\n{raw}"
+        );
+        assert!(
+            !raw.contains("/chat/completions"),
+            "must not hit /chat/completions for OpenAI api-key auth"
+        );
+        // Bearer auth is the api key.
+        assert!(raw.contains("authorization: Bearer sk-test"));
+        // Body must be the Responses shape (instructions + input), not
+        // chat-completions (messages). Parse the JSON to avoid coupling
+        // to serde_json's alphabetical key ordering.
+        let body_start = raw.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+        let body = &raw[body_start..];
+        let parsed: Value = serde_json::from_str(body).expect("body is JSON");
+        assert_eq!(parsed["model"], "gpt-5.1");
+        assert_eq!(parsed["instructions"], "be concise");
+        assert_eq!(parsed["stream"], false);
+        assert_eq!(parsed["store"], false);
+        assert!(parsed["input"].is_array(), "expected Responses input[]");
+        assert!(
+            parsed.get("messages").is_none(),
+            "must not send chat-completions messages array"
+        );
+        // Flat tools envelope: a tool object whose siblings of `"type":
+        // "function"` include `"name"` and `"parameters"` directly — NOT
+        // nested under a `"function": {…}` key.
+        let tool = &parsed["tools"][0];
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["name"], "read");
+        assert_eq!(tool["description"], "read a file");
+        assert!(tool["parameters"].is_object());
+        assert!(
+            tool.get("function").is_none(),
+            "must not nest under `function:` (chat-completions shape)"
+        );
+        assert_eq!(parsed["tool_choice"], "auto");
     }
 
     #[tokio::test]
