@@ -15,17 +15,34 @@ use std::{
 
 use serde_json::{json, Value};
 
+use crate::agent::permission::{ask_external_directory, PermissionError};
 use crate::agent::tools::common::{title, tool_usize};
 use crate::agent::tools::diff::{diff_stats, text_diff};
 use crate::agent::tools::encoding::{self, Encoding};
 use crate::agent::tools::replacers::{replace as replace_chain, ReplaceError};
 use crate::routes::files::{is_binary, list_nodes, search_text_target_cancel};
-use crate::util::paths::{resolve_under, slash};
+use crate::util::paths::{resolve_relaxed, resolve_under, slash};
+use crate::AppState;
+use std::sync::Arc;
 
 pub(crate) const DEFAULT_READ_LIMIT: usize = 2000;
 pub(crate) const DEFAULT_GLOB_LIMIT: usize = 100;
 pub(crate) const DEFAULT_GREP_LIMIT: usize = 100;
 pub(crate) const MAX_GREP_LINE: usize = 2000;
+
+/// Internal resolver gate. When `allow_external` is true (the gated
+/// async path has already secured the user's approval), accept paths
+/// that resolve outside the worktree; otherwise fall through to the
+/// strict `resolve_under` rejection. Tools call this in place of a bare
+/// `resolve_under(root, path)`.
+fn resolve_path(root: &FsPath, raw: &str, allow_external: bool) -> Result<PathBuf, String> {
+    let outcome = if allow_external {
+        resolve_relaxed(root, raw).map_err(|_| format!("Unsafe path: {raw}"))?
+    } else {
+        resolve_under(root, raw).map_err(|_| format!("Unsafe path: {raw}"))?
+    };
+    Ok(outcome)
+}
 /// Cancel cadence for line-by-line read/grep loops. Checking the
 /// atomic on every line is wasteful; every 256 lines is plenty fast
 /// to abort a runaway scan without hot-loading the cancel atomic.
@@ -48,6 +65,15 @@ pub(crate) fn fake_read_cancel(
     input: &Value,
     cancel: Option<&AtomicBool>,
 ) -> Result<(String, String, Value), String> {
+    fake_read_inner(root, input, cancel, false)
+}
+
+fn fake_read_inner(
+    root: &FsPath,
+    input: &Value,
+    cancel: Option<&AtomicBool>,
+    allow_external: bool,
+) -> Result<(String, String, Value), String> {
     if cancel.is_some_and(crate::agent::is_canceled) {
         return Err("Tool call aborted".to_string());
     }
@@ -58,13 +84,41 @@ pub(crate) fn fake_read_cancel(
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "filePath is required".to_string())?;
-    let target = resolve_under(root, path).map_err(|_| format!("Unsafe path: {path}"))?;
+    let target = resolve_path(root, path, allow_external)?;
     let meta = fs::metadata(&target).map_err(|err| format!("Unable to read {path}: {err}"))?;
     if meta.is_dir() {
         return fake_read_dir(root, &target, input);
     }
 
     fake_read_file(root, &target, input, cancel)
+}
+
+/// Bun-parity gated entry. Pre-flight extracts `filePath`, classifies
+/// it via `resolve_with_external`, and (only when the path resolves
+/// outside the worktree) raises an `external_directory` permission ask.
+/// On approval — or when the path is already inside — falls through to
+/// the streaming sync impl with externals allowed.
+pub(crate) async fn fake_read_gated(
+    state: &Arc<AppState>,
+    sid: &str,
+    mid: &str,
+    pid: &str,
+    idx: usize,
+    root: &FsPath,
+    input: &Value,
+    cancel: Option<&AtomicBool>,
+) -> Result<(String, String, Value), String> {
+    let candidate = input
+        .get("filePath")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+    if !candidate.is_empty() {
+        ask_external_directory(state, sid, mid, pid, idx, root, &[candidate], "read")
+            .await
+            .map_err(|err: PermissionError| err.to_display())?;
+    }
+    fake_read_inner(root, input, cancel, true)
 }
 
 fn fake_read_dir(
@@ -347,6 +401,15 @@ pub(crate) fn fake_glob_cancel(
     input: &Value,
     cancel: Option<&AtomicBool>,
 ) -> Result<(String, String, Value), String> {
+    fake_glob_inner(root, input, cancel, false)
+}
+
+fn fake_glob_inner(
+    root: &FsPath,
+    input: &Value,
+    cancel: Option<&AtomicBool>,
+    allow_external: bool,
+) -> Result<(String, String, Value), String> {
     if cancel.is_some_and(crate::agent::is_canceled) {
         return Err("Tool call aborted".to_string());
     }
@@ -361,7 +424,7 @@ pub(crate) fn fake_glob_cancel(
         .map(|item| item.dir.as_str())
         .or_else(|| input.get("path").and_then(Value::as_str))
         .unwrap_or(".");
-    let search = resolve_under(root, base).map_err(|_| format!("Unsafe path: {base}"))?;
+    let search = resolve_path(root, base, allow_external)?;
     if search.exists() && !search.is_dir() {
         return Err(format!(
             "glob path must be a directory: {}",
@@ -410,6 +473,15 @@ pub(crate) fn fake_grep_cancel(
     input: &Value,
     cancel: Option<&AtomicBool>,
 ) -> Result<(String, String, Value), String> {
+    fake_grep_inner(root, input, cancel, false)
+}
+
+fn fake_grep_inner(
+    root: &FsPath,
+    input: &Value,
+    cancel: Option<&AtomicBool>,
+    allow_external: bool,
+) -> Result<(String, String, Value), String> {
     if cancel.is_some_and(crate::agent::is_canceled) {
         return Err("Tool call aborted".to_string());
     }
@@ -419,7 +491,7 @@ pub(crate) fn fake_grep_cancel(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "pattern is required".to_string())?;
     let path = input.get("path").and_then(Value::as_str).unwrap_or(".");
-    let target = resolve_under(root, path).map_err(|_| format!("Unsafe path: {path}"))?;
+    let target = resolve_path(root, path, allow_external)?;
     if !target.exists() {
         return Ok((
             pattern.to_string(),
@@ -677,6 +749,14 @@ fn expand_braces(pattern: &str) -> Vec<String> {
 }
 
 pub(crate) fn fake_write(root: &FsPath, input: &Value) -> Result<(String, String, Value), String> {
+    fake_write_inner(root, input, false)
+}
+
+fn fake_write_inner(
+    root: &FsPath,
+    input: &Value,
+    allow_external: bool,
+) -> Result<(String, String, Value), String> {
     let path = input
         .get("filePath")
         .and_then(Value::as_str)
@@ -686,7 +766,7 @@ pub(crate) fn fake_write(root: &FsPath, input: &Value) -> Result<(String, String
         .get("content")
         .and_then(Value::as_str)
         .ok_or_else(|| "content is required".to_string())?;
-    let target = resolve_under(root, path).map_err(|_| format!("Unsafe path: {path}"))?;
+    let target = resolve_path(root, path, allow_external)?;
     let exists = target.exists();
     let (before, prior_enc) = if exists {
         let bytes = fs::read(&target)
@@ -730,6 +810,14 @@ pub(crate) fn fake_write(root: &FsPath, input: &Value) -> Result<(String, String
 }
 
 pub(crate) fn fake_edit(root: &FsPath, input: &Value) -> Result<(String, String, Value), String> {
+    fake_edit_inner(root, input, false)
+}
+
+fn fake_edit_inner(
+    root: &FsPath,
+    input: &Value,
+    allow_external: bool,
+) -> Result<(String, String, Value), String> {
     let path = input
         .get("filePath")
         .and_then(Value::as_str)
@@ -747,7 +835,7 @@ pub(crate) fn fake_edit(root: &FsPath, input: &Value) -> Result<(String, String,
         return Err("oldString and newString must be different".to_string());
     }
 
-    let target = resolve_under(root, path).map_err(|_| format!("Unsafe path: {path}"))?;
+    let target = resolve_path(root, path, allow_external)?;
     let (before, prior_enc) = if old.is_empty() {
         match fs::read(&target) {
             Ok(bytes) => {
@@ -810,4 +898,111 @@ pub(crate) fn fake_edit(root: &FsPath, input: &Value) -> Result<(String, String,
         "Edit applied successfully.".to_string(),
         metadata,
     ))
+}
+
+/// Gated grep: kind = "read". Pre-flights `path` (defaults to `.`,
+/// always inside) and only raises an ask when an explicit absolute path
+/// outside the worktree is supplied.
+pub(crate) async fn fake_grep_gated(
+    state: &Arc<AppState>,
+    sid: &str,
+    mid: &str,
+    pid: &str,
+    idx: usize,
+    root: &FsPath,
+    input: &Value,
+    cancel: Option<&AtomicBool>,
+) -> Result<(String, String, Value), String> {
+    let candidate = input
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+    if !candidate.is_empty() {
+        ask_external_directory(state, sid, mid, pid, idx, root, &[candidate], "read")
+            .await
+            .map_err(|err: PermissionError| err.to_display())?;
+    }
+    fake_grep_inner(root, input, cancel, true)
+}
+
+/// Gated glob: kind = "read". Pre-flights both an absolute pattern's
+/// derived dir and the explicit `path` argument, raising a single ask
+/// for any externals.
+pub(crate) async fn fake_glob_gated(
+    state: &Arc<AppState>,
+    sid: &str,
+    mid: &str,
+    pid: &str,
+    idx: usize,
+    root: &FsPath,
+    input: &Value,
+    cancel: Option<&AtomicBool>,
+) -> Result<(String, String, Value), String> {
+    let pattern = input
+        .get("pattern")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(item) = split_absolute_glob(pattern) {
+        candidates.push(item.dir);
+    }
+    if let Some(path) = input.get("path").and_then(Value::as_str) {
+        if !path.is_empty() {
+            candidates.push(path.to_string());
+        }
+    }
+    if !candidates.is_empty() {
+        ask_external_directory(state, sid, mid, pid, idx, root, &candidates, "read")
+            .await
+            .map_err(|err: PermissionError| err.to_display())?;
+    }
+    fake_glob_inner(root, input, cancel, true)
+}
+
+/// Gated write: kind = "write". Bun parity for the per-call
+/// `external_directory` ask raised inside the write tool.
+pub(crate) async fn fake_write_gated(
+    state: &Arc<AppState>,
+    sid: &str,
+    mid: &str,
+    pid: &str,
+    idx: usize,
+    root: &FsPath,
+    input: &Value,
+) -> Result<(String, String, Value), String> {
+    let candidate = input
+        .get("filePath")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+    if !candidate.is_empty() {
+        ask_external_directory(state, sid, mid, pid, idx, root, &[candidate], "write")
+            .await
+            .map_err(|err: PermissionError| err.to_display())?;
+    }
+    fake_write_inner(root, input, true)
+}
+
+/// Gated edit: kind = "write".
+pub(crate) async fn fake_edit_gated(
+    state: &Arc<AppState>,
+    sid: &str,
+    mid: &str,
+    pid: &str,
+    idx: usize,
+    root: &FsPath,
+    input: &Value,
+) -> Result<(String, String, Value), String> {
+    let candidate = input
+        .get("filePath")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+    if !candidate.is_empty() {
+        ask_external_directory(state, sid, mid, pid, idx, root, &[candidate], "write")
+            .await
+            .map_err(|err: PermissionError| err.to_display())?;
+    }
+    fake_edit_inner(root, input, true)
 }

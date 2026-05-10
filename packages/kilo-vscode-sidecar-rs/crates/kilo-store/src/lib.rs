@@ -178,6 +178,13 @@ impl Store {
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn seed_for_test(&self) {
+        // kilo-server's in-process tests (and any other downstream consumer
+        // wiring up `seed_for_test`) predate the
+        // `KILO_EXPERIMENTAL_WORKSPACES` gate. Force the override on so the
+        // existing assertions over `event_sequence` rows / `seq` ordering
+        // stay valid. Production callers must NOT touch this — they read
+        // the env via `workspaces_enabled()`.
+        set_event_writes_enabled(Some(true));
         fs::create_dir_all(&self.paths.data).unwrap();
         let db = Connection::open(self.paths.data.join("kilo.db")).unwrap();
         db.execute_batch(
@@ -265,6 +272,10 @@ impl Store {
             worktree: self.worktree.clone(),
             directory: self.directory.clone(),
         }
+    }
+
+    pub fn data_dir(&self) -> PathBuf {
+        self.paths.data.clone()
     }
 
     pub fn config(&self) -> Config {
@@ -878,6 +889,125 @@ impl Store {
 
     pub fn message(&self, id: &str, mid: &str) -> Option<Message> {
         self.with_db(|db| read_message(db, id, mid)).unwrap_or(None)
+    }
+
+    pub fn assistant_cost_total(&self, id: &str) -> f64 {
+        self.with_db(|db| assistant_cost_total(db, id))
+            .unwrap_or(0.0)
+    }
+
+    pub fn add_message_cost_record(
+        &self,
+        id: &str,
+        mid: &str,
+        amount: f64,
+    ) -> rusqlite::Result<Vec<StoredEvent>> {
+        if !amount.is_finite() || amount <= 0.0 {
+            return Ok(Vec::new());
+        }
+        self.with_write(|db| {
+            let tx = db.transaction()?;
+            ensure_table(&tx, "session")?;
+            ensure_table(&tx, "message")?;
+            if read_session(&tx, id).is_none() {
+                tx.commit()?;
+                return Ok(Vec::new());
+            }
+            let Some(mut data) = read_message_data(&tx, id, mid)? else {
+                tx.commit()?;
+                return Ok(Vec::new());
+            };
+            if data.get("role").and_then(JsonValue::as_str) != Some("assistant") {
+                tx.commit()?;
+                return Ok(Vec::new());
+            }
+            let next = data.get("cost").and_then(JsonValue::as_f64).unwrap_or(0.0) + amount;
+            data.insert("cost".to_string(), json!(next));
+            let time = now_millis();
+            tx.execute(
+                "update message set data = ?1, time_updated = ?2 where session_id = ?3 and id = ?4",
+                params![json_value(&JsonValue::Object(data.clone()))?, time, id, mid],
+            )?;
+            tx.execute(
+                "update session set time_updated = ?1 where id = ?2",
+                params![time, id],
+            )?;
+            let mut info = data;
+            info.insert("id".to_string(), JsonValue::String(mid.to_string()));
+            info.insert("sessionID".to_string(), JsonValue::String(id.to_string()));
+            let event = write_event(
+                &tx,
+                id,
+                "message.updated.v1",
+                json!({ "sessionID": id, "info": JsonValue::Object(info) }),
+            )?;
+            tx.commit()?;
+            Ok(vec![event])
+        })
+    }
+
+    pub fn add_task_message_cost_record(
+        &self,
+        id: &str,
+        mid: &str,
+        task: &str,
+        total: f64,
+    ) -> rusqlite::Result<Vec<StoredEvent>> {
+        if !total.is_finite() || total <= 0.0 || task.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_write(|db| {
+            let tx = db.transaction()?;
+            ensure_table(&tx, "session")?;
+            ensure_table(&tx, "message")?;
+            if read_session(&tx, id).is_none() {
+                tx.commit()?;
+                return Ok(Vec::new());
+            }
+            let Some(mut data) = read_message_data(&tx, id, mid)? else {
+                tx.commit()?;
+                return Ok(Vec::new());
+            };
+            if data.get("role").and_then(JsonValue::as_str) != Some("assistant") {
+                tx.commit()?;
+                return Ok(Vec::new());
+            }
+            let mut costs = data
+                .get("taskCosts")
+                .and_then(JsonValue::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let prior = costs.get(task).and_then(JsonValue::as_f64).unwrap_or(0.0);
+            let delta = total - prior;
+            if !delta.is_finite() || delta <= f64::EPSILON {
+                tx.commit()?;
+                return Ok(Vec::new());
+            }
+            costs.insert(task.to_string(), json!(total));
+            data.insert("taskCosts".to_string(), JsonValue::Object(costs));
+            let next = data.get("cost").and_then(JsonValue::as_f64).unwrap_or(0.0) + delta;
+            data.insert("cost".to_string(), json!(next));
+            let time = now_millis();
+            tx.execute(
+                "update message set data = ?1, time_updated = ?2 where session_id = ?3 and id = ?4",
+                params![json_value(&JsonValue::Object(data.clone()))?, time, id, mid],
+            )?;
+            tx.execute(
+                "update session set time_updated = ?1 where id = ?2",
+                params![time, id],
+            )?;
+            let mut info = data;
+            info.insert("id".to_string(), JsonValue::String(mid.to_string()));
+            info.insert("sessionID".to_string(), JsonValue::String(id.to_string()));
+            let event = write_event(
+                &tx,
+                id,
+                "message.updated.v1",
+                json!({ "sessionID": id, "info": JsonValue::Object(info) }),
+            )?;
+            tx.commit()?;
+            Ok(vec![event])
+        })
     }
 
     pub fn append_message(
@@ -2010,6 +2140,45 @@ fn read_message(db: &Connection, id: &str, mid: &str) -> Option<Message> {
     }
 }
 
+fn read_message_data(
+    db: &Connection,
+    id: &str,
+    mid: &str,
+) -> rusqlite::Result<Option<Map<String, JsonValue>>> {
+    db.query_row(
+        "select data from message where session_id = ?1 and id = ?2",
+        params![id, mid],
+        |row| {
+            let data: String = row.get(0)?;
+            Ok(object(data))
+        },
+    )
+    .optional()
+}
+
+fn assistant_cost_total(db: &Connection, id: &str) -> f64 {
+    let mut stmt = match db.prepare("select data from message where session_id = ?1") {
+        Ok(stmt) => stmt,
+        Err(err) => {
+            log_db_err("assistant_cost_total.prepare", err);
+            return 0.0;
+        }
+    };
+    let rows = match stmt.query_map([id], |row| row.get::<_, String>(0)) {
+        Ok(rows) => rows,
+        Err(err) => {
+            log_db_err("assistant_cost_total.query", err);
+            return 0.0;
+        }
+    };
+    rows.filter_map(Result::ok)
+        .map(object)
+        .filter(|data| data.get("role").and_then(JsonValue::as_str) == Some("assistant"))
+        .filter_map(|data| data.get("cost").and_then(JsonValue::as_f64))
+        .filter(|cost| cost.is_finite() && *cost > 0.0)
+        .sum()
+}
+
 fn read_part(db: &Connection, id: &str, mid: &str, pid: &str) -> Option<JsonValue> {
     let mut stmt = match db.prepare(
         "select id, message_id, session_id, data from part where session_id = ?1 and message_id = ?2 and id = ?3",
@@ -2224,6 +2393,51 @@ fn write_part(
     Ok(part)
 }
 
+/// Mirrors Bun's `Flag.KILO_EXPERIMENTAL_WORKSPACES` (truthy `KILO_EXPERIMENTAL`
+/// or `KILO_EXPERIMENTAL_WORKSPACES`, see `opencode/src/flag/flag.ts:20,83`).
+/// When false, `event_sequence` / `event` rows must NOT be persisted —
+/// otherwise a Bun-compatible DB later opened with the flag on diverges on
+/// `seq`. The seq itself is still computed from the existing rows so the
+/// in-memory `StoredEvent` published over SSE has a real (>= 0) value, which
+/// matches Bun's behavior at `opencode/src/sync/index.ts:135-184` where the
+/// projector + bus publish always run; only the two `tx.insert(...)` calls
+/// are gated.
+fn workspaces_enabled() -> bool {
+    if let Some(v) = event_writes_override() {
+        return v;
+    }
+    truthy_env("KILO_EXPERIMENTAL") || truthy_env("KILO_EXPERIMENTAL_WORKSPACES")
+}
+
+fn truthy_env(key: &str) -> bool {
+    matches!(
+        env::var(key).ok().as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("True") | Some("TRUE") | Some("yes") | Some("YES"),
+    )
+}
+
+// Test-only override. `Some(true)` / `Some(false)` force the flag regardless
+// of env; `None` falls back to the env-var read. Stored thread-locally so
+// parallel test threads don't fight over the same cell — the kilo-store
+// internal test suite predates the gate (every test depends on
+// `event_sequence` rows landing), so each test thread sets its own
+// `Some(true)` via `seed()` / `seed_for_test()`. The two regression tests
+// for the OFF / ON contract flip the cell on their own thread; because the
+// override is per-thread, parallel `seed()` calls on other threads can't
+// clobber state mid-test. Production callers must NOT touch this.
+thread_local! {
+    static EVENT_WRITES_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn event_writes_override() -> Option<bool> {
+    EVENT_WRITES_OVERRIDE.with(|c| c.get())
+}
+
+#[doc(hidden)]
+pub fn set_event_writes_enabled(value: Option<bool>) {
+    EVENT_WRITES_OVERRIDE.with(|c| c.set(value));
+}
+
 fn write_event(
     db: &Connection,
     agg: &str,
@@ -2249,15 +2463,17 @@ fn write_event(
         .optional()?
         .map_or(0, |seq| seq + 1);
     let id = event_id(now_millis());
-    db.execute(
-        "insert into event_sequence (aggregate_id, seq) values (?1, ?2) \
-         on conflict(aggregate_id) do update set seq = excluded.seq",
-        params![agg, latest],
-    )?;
-    db.execute(
-        "insert into event (id, aggregate_id, seq, type, data) values (?1, ?2, ?3, ?4, ?5)",
-        params![&id, agg, latest, kind, json_value(&data)?],
-    )?;
+    if workspaces_enabled() {
+        db.execute(
+            "insert into event_sequence (aggregate_id, seq) values (?1, ?2) \
+             on conflict(aggregate_id) do update set seq = excluded.seq",
+            params![agg, latest],
+        )?;
+        db.execute(
+            "insert into event (id, aggregate_id, seq, type, data) values (?1, ?2, ?3, ?4, ?5)",
+            params![&id, agg, latest, kind, json_value(&data)?],
+        )?;
+    }
 
     Ok(StoredEvent {
         id,
@@ -2720,6 +2936,104 @@ mod tests {
     }
 
     #[test]
+    fn assistant_cost_total_and_add_message_cost_are_serialized() {
+        let root = unique_root();
+        let store = store(&root);
+        seed(&store);
+        let session = store
+            .create_session(SessionCreateInput::default())
+            .expect("create session");
+
+        store
+            .append_message(
+                &session.id,
+                MessageAppendInput {
+                    info: json!({
+                        "id": "msg_parent",
+                        "role": "assistant",
+                        "cost": 1.25
+                    }),
+                    parts: Vec::new(),
+                },
+            )
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
+                MessageAppendInput {
+                    info: json!({
+                        "id": "msg_child",
+                        "role": "assistant",
+                        "cost": 2.5
+                    }),
+                    parts: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(store.assistant_cost_total(&session.id), 3.75);
+        let events = store
+            .add_message_cost_record(&session.id, "msg_parent", 0.5)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let got = store.message(&session.id, "msg_parent").unwrap();
+        assert_eq!(got.info["cost"], json!(1.75));
+        assert_eq!(events[0].event_type, "message.updated.v1");
+        assert_eq!(events[0].data["info"]["cost"], json!(1.75));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn task_message_cost_record_adds_only_new_delta() {
+        let root = unique_root();
+        let store = store(&root);
+        seed(&store);
+        let session = store
+            .create_session(SessionCreateInput::default())
+            .expect("create session");
+
+        store
+            .append_message(
+                &session.id,
+                MessageAppendInput {
+                    info: json!({
+                        "id": "msg_parent",
+                        "role": "assistant",
+                        "cost": 1.0
+                    }),
+                    parts: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .add_task_message_cost_record(&session.id, "msg_parent", "ses_child", 2.5)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .add_task_message_cost_record(&session.id, "msg_parent", "ses_child", 2.5)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .add_task_message_cost_record(&session.id, "msg_parent", "ses_child", 3.25)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let got = store.message(&session.id, "msg_parent").unwrap();
+        assert_eq!(got.info["cost"], json!(4.25));
+        assert_eq!(got.info["taskCosts"]["ses_child"], json!(3.25));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn update_session_noop_returns_existing_session() {
         let root = unique_root();
         let store = store(&root);
@@ -2917,6 +3231,117 @@ mod tests {
         assert_eq!(rows[3].1, "message.part.updated.v1");
         assert_eq!(rows[3].2["part"]["id"], "prt_b");
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Bun gates `EventSequenceTable` / `EventTable` inserts behind
+    /// `Flag.KILO_EXPERIMENTAL_WORKSPACES`; see
+    /// `opencode/src/sync/index.ts:135-184`. With the flag unset, the
+    /// projector + bus publish still run but the SQLite rows are NOT
+    /// written. This test pins that exact contract: `events` returned to
+    /// callers carry valid (>= 0) seqs (so SSE publish works), the
+    /// `event_sequence` / `event` tables stay empty, and a Bun-readable DB
+    /// later opened with the flag on still gets a clean `seq=0` start.
+    #[test]
+    fn event_writes_skipped_when_flag_unset() {
+        let root = unique_root();
+        let store = store(&root);
+        seed(&store);
+        // `seed()` flips override on; flip it back off for this test.
+        set_event_writes_enabled(Some(false));
+
+        let session = store
+            .create_session(SessionCreateInput::default())
+            .expect("create session");
+        let record = store
+            .append_message_record(
+                &session.id,
+                MessageAppendInput {
+                    info: json!({ "id": "msg_off", "role": "user" }),
+                    parts: vec![json!({ "id": "prt_off", "type": "text", "text": "x" })],
+                },
+            )
+            .expect("append message");
+
+        // In-memory events still flow to the bus / SSE layer.
+        assert!(!record.events.is_empty());
+        assert!(
+            record.events.iter().all(|e| e.seq >= 0),
+            "publish layer drops seq < 0; flag-off path must still emit valid seqs ({:?})",
+            record.events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        );
+
+        // But the rows must NOT have landed.
+        let db = Connection::open(store.paths.data.join("kilo.db")).unwrap();
+        let event_count: i64 = db
+            .query_row("select count(*) from event", [], |row| row.get(0))
+            .unwrap();
+        let seq_count: i64 = db
+            .query_row("select count(*) from event_sequence", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            event_count, 0,
+            "event rows must not be written when flag is off"
+        );
+        assert_eq!(
+            seq_count, 0,
+            "event_sequence rows must not be written when flag is off"
+        );
+
+        set_event_writes_enabled(None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Counterpart to `event_writes_skipped_when_flag_unset`. With the flag
+    /// on, every store mutation persists an `event` row and bumps
+    /// `event_sequence.seq`, matching Bun's
+    /// `opencode/src/sync/index.ts:135-184` insert path.
+    #[test]
+    fn event_writes_emitted_when_flag_set() {
+        let root = unique_root();
+        let store = store(&root);
+        seed(&store);
+        set_event_writes_enabled(Some(true));
+
+        let session = store
+            .create_session(SessionCreateInput::default())
+            .expect("create session");
+        let record = store
+            .append_message_record(
+                &session.id,
+                MessageAppendInput {
+                    info: json!({ "id": "msg_on", "role": "user" }),
+                    parts: vec![json!({ "id": "prt_on", "type": "text", "text": "x" })],
+                },
+            )
+            .expect("append message");
+
+        assert!(!record.events.is_empty());
+        let db = Connection::open(store.paths.data.join("kilo.db")).unwrap();
+        let event_count: i64 = db
+            .query_row(
+                "select count(*) from event where aggregate_id = ?1",
+                [&session.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            event_count > 0,
+            "event rows must be written when flag is on (got {event_count})",
+        );
+        let seq: i64 = db
+            .query_row(
+                "select seq from event_sequence where aggregate_id = ?1",
+                [&session.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            seq >= 1,
+            "event_sequence.seq must advance with writes (got {seq})"
+        );
+
+        set_event_writes_enabled(None);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3175,6 +3600,13 @@ mod tests {
     }
 
     fn seed(store: &Store) {
+        // Existing kilo-store tests assert on `event_sequence` / `event` row
+        // contents and on specific `seq` values. They predate the
+        // KILO_EXPERIMENTAL_WORKSPACES gate, so the test seed forces the
+        // override on. The two regression tests below
+        // (`event_writes_skipped_when_flag_unset`,
+        // `event_writes_emitted_when_flag_set`) drive both states explicitly.
+        set_event_writes_enabled(Some(true));
         fs::create_dir_all(&store.paths.data).unwrap();
         let db = Connection::open(store.paths.data.join("kilo.db")).unwrap();
         db.execute_batch(
@@ -3244,6 +3676,7 @@ mod tests {
     }
 
     fn seed_without_events(store: &Store) {
+        set_event_writes_enabled(Some(true));
         fs::create_dir_all(&store.paths.data).unwrap();
         let db = Connection::open(store.paths.data.join("kilo.db")).unwrap();
         db.execute_batch(

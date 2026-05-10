@@ -9,7 +9,7 @@ use base64::{engine::general_purpose, Engine};
 use kilo_protocol::{GlobalEvent, Session, SessionTime};
 use kilo_store::MessageCursor;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc};
 use tower::ServiceExt;
 
 use crate::http::build_router as app;
@@ -193,6 +193,65 @@ async fn network_wait_routes_match_empty_rust_sidecar_state() {
 
     let res = app(st).oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn network_wait_routes_list_and_reply_pending_waits() {
+    let root = unique_root();
+    let st = state_at(&root);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let waiter = tokio::spawn({
+        let st = st.clone();
+        let cancel = cancel.clone();
+        async move {
+            crate::routes::network::ask_network_wait(
+                &st,
+                "ses_net",
+                "Connection refused".to_string(),
+                &cancel,
+            )
+            .await
+        }
+    });
+    let id = loop {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/network")
+            .body(Body::empty())
+            .unwrap();
+        let res = app(st.clone()).oneshot(req).await.unwrap();
+        let data: Value = serde_json::from_str(&response_to_string(res).await).unwrap();
+        if let Some(id) = data
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            break id;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/network/{id}/reply"))
+        .header(header::CONTENT_LENGTH, "0")
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app(st.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(waiter.await.unwrap().is_ok());
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/network")
+        .body(Body::empty())
+        .unwrap();
+    let res = app(st).oneshot(req).await.unwrap();
+    assert_eq!(response_to_string(res).await, "[]");
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -670,6 +729,62 @@ async fn remove_skill_deletes_parent_directory_and_returns_true() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// `POST /log` accepts both the Bun control-route shape
+/// (`{service, level, message, extra}`,
+/// `packages/opencode/src/server/routes/control/index.ts:111`) and the
+/// extension webview shape (`{level, scope, message, data}`). Either
+/// way the route returns `Json(true)`. The handler also tolerates an
+/// empty body so the lenient-JSON middleware path stays exercised.
+#[tokio::test]
+async fn log_route_accepts_payload_and_returns_true() {
+    let root = unique_root();
+    let st = state_at(&root);
+
+    // Bun control-route shape.
+    let body =
+        json!({ "service": "vcs", "level": "info", "message": "hello", "extra": { "k": 1 } })
+            .to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/log")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app(st.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let data: Value = serde_json::from_str(&response_to_string(res).await).unwrap();
+    assert_eq!(data, json!(true));
+
+    // Extension webview shape.
+    let body = json!({ "level": "warn", "scope": "webview", "message": "ping", "data": [1, 2] })
+        .to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/log")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app(st.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let data: Value = serde_json::from_str(&response_to_string(res).await).unwrap();
+    assert_eq!(data, json!(true));
+
+    // Empty body — lenient layer rewrites to `{}` and the handler still
+    // returns 200 / true.
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/log")
+        .header(header::CONTENT_LENGTH, "0")
+        .body(Body::empty())
+        .unwrap();
+    let res = app(st).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let data: Value = serde_json::from_str(&response_to_string(res).await).unwrap();
+    assert_eq!(data, json!(true));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// `POST /kilocode/agent/remove` deletes a custom-agent markdown file
 /// from any of the registry-scanned config directories and returns
 /// `Json(true)`. A name that matches no file returns 404.
@@ -710,6 +825,46 @@ async fn remove_agent_deletes_markdown_file_and_returns_true() {
         .unwrap();
     let res = app(st).oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// `GET /lsp` is an SDK-shape-parity stub: the real LSP integration is
+/// out of scope for the lean OpenAI-Pro target, but the route must exist
+/// so the SDK doesn't 404. Bun reference:
+/// `packages/opencode/src/server/routes/instance/index.ts:254`.
+#[tokio::test]
+async fn lsp_route_returns_empty_array() {
+    let root = unique_root();
+    let st = state_at(&root);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/lsp")
+        .body(Body::empty())
+        .unwrap();
+    let res = app(st).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(response_to_string(res).await, "[]");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// `GET /formatter` is an SDK-shape-parity stub. Bun reference:
+/// `packages/opencode/src/server/routes/instance/index.ts:277`.
+#[tokio::test]
+async fn formatter_route_returns_empty_array() {
+    let root = unique_root();
+    let st = state_at(&root);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/formatter")
+        .body(Body::empty())
+        .unwrap();
+    let res = app(st).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(response_to_string(res).await, "[]");
 
     let _ = std::fs::remove_dir_all(root);
 }

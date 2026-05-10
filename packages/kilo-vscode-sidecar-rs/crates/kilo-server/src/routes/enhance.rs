@@ -21,9 +21,9 @@ use axum::{
 };
 use kilo_provider::{chat_tools_with_auth_cancel, ChatMessage, ChatTool};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
 
-use crate::AppState;
+use crate::{oauth, AppState};
 
 #[derive(Deserialize)]
 pub(crate) struct EnhanceInput {
@@ -59,15 +59,16 @@ pub(crate) async fn enhance_prompt(
 }
 
 async fn enhance_via_llm(state: &Arc<AppState>, text: &str) -> Result<String, String> {
-    let auths = collect_auths(state);
     let cfg = state.store.config();
     let model = json!({ "providerID": "openai", "modelID": "gpt-5.1-codex" });
     let messages = vec![ChatMessage {
         role: "user".to_string(),
         content: text.to_string(),
         responses: Vec::new(),
+        attachments: Vec::new(),
     }];
     let cancel = AtomicBool::new(false);
+    let auths = oauth::tokens::fresh_auths(state, &cancel).await?;
     let call = chat_tools_with_auth_cancel(
         &cfg,
         &auths,
@@ -115,17 +116,5 @@ fn clean_output(raw: &str) -> String {
         out.chars().take(MAX_LEN).collect()
     } else {
         out.to_string()
-    }
-}
-
-/// Build the auth blob expected by `chat_tools_with_auth_cancel`. The
-/// helper looks up `auths.<providerID>` so we only need to surface the
-/// providers we care about. Returns `Value::Null` if there's no openai
-/// auth on disk — the provider call will then fail with `MissingKey`,
-/// which the caller maps into the fallback path.
-fn collect_auths(state: &AppState) -> Value {
-    match state.store.provider_auth("openai") {
-        Some(auth) => json!({ "openai": auth }),
-        None => Value::Null,
     }
 }

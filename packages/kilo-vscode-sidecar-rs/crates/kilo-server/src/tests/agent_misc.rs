@@ -7,18 +7,21 @@ use axum::{
     http::{header, Method, Request, StatusCode},
 };
 use http_body_util::BodyExt;
-use kilo_protocol::{MessageAppendInput, MessageAppendResult, PromptInput, SessionCreateInput};
+use kilo_protocol::{
+    MessageAppendInput, MessageAppendResult, PromptInput, SessionCreateInput, SessionUpdateInput,
+};
 use kilo_provider::{ChatOutput, ChatToolCall};
 use serde_json::{json, Value};
 use std::fs;
 use tower::ServiceExt;
 
 use crate::agent::openai_stream::{
-    prompt_instructions, prompt_instructions_with_root, should_inject_noop, OPENAI_OAUTH_CODEX_RAW,
-    OPENAI_OAUTH_SOUL_RAW,
+    clean_title, is_default_session_title, prompt_instructions, prompt_instructions_with_root,
+    should_generate_title, should_inject_noop, OPENAI_OAUTH_CODEX_RAW, OPENAI_OAUTH_SOUL_RAW,
 };
 use crate::agent::parts::{
-    assistant_completed_info, assistant_parts, real_messages, real_tool_parts, tool_running,
+    assistant_completed_info, assistant_parts, real_messages, real_tool_parts, task_child_tools,
+    tool_completed, tool_running,
 };
 use crate::agent::shape::repair_tool_name;
 use crate::agent::tools::defs::read_def;
@@ -221,6 +224,138 @@ fn assistant_parts_places_followup_text_after_tools() {
 }
 
 #[test]
+fn tool_completed_truncates_large_outputs_at_common_boundary() {
+    let part = tool_completed(
+        "msg",
+        "prt",
+        0,
+        "plugin",
+        "call",
+        &json!({}),
+        "plugin".to_string(),
+        "x".repeat(crate::limits::MAX_TOOL_OUTPUT_BYTES + 128),
+        json!({}),
+        1,
+    );
+    let output = part["state"]["output"].as_str().unwrap();
+
+    assert!(output.ends_with(crate::limits::TRUNCATION_SENTINEL));
+    assert!(
+        output.len()
+            <= crate::limits::MAX_TOOL_OUTPUT_BYTES + crate::limits::TRUNCATION_SENTINEL.len()
+    );
+}
+
+#[test]
+fn real_messages_injects_plan_mode_file_contract_for_plan_agent() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput {
+            title: Some("Plan me".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    state
+        .store
+        .append_message(
+            &session.id,
+            MessageAppendInput {
+                info: json!({ "id": "msg_plan_user", "role": "user", "agent": "plan" }),
+                parts: vec![json!({ "type": "text", "text": "draft the plan" })],
+            },
+        )
+        .unwrap();
+
+    let messages = real_messages(&state, &session.id, "draft the plan");
+    let content = &messages.last().unwrap().content;
+
+    assert!(content.contains("Plan mode is active"));
+    assert!(content.contains(".kilo"));
+    assert!(content.contains("plans"));
+    assert!(content.contains("plan_exit"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn title_generation_helpers_match_bun_gates() {
+    assert!(is_default_session_title(
+        "New session - 2026-05-09T16:03:04.123Z"
+    ));
+    assert!(is_default_session_title(
+        "Child session - 2026-05-09T16:03:04.123Z"
+    ));
+    assert!(!is_default_session_title("New session - not a date"));
+
+    assert_eq!(
+        clean_title("<think>draft</think>\n  Rust sidecar retry layer\nmore").as_deref(),
+        Some("Rust sidecar retry layer")
+    );
+    assert_eq!(clean_title("<think>unterminated\nfallback"), None);
+}
+
+#[test]
+fn should_generate_title_only_for_first_real_root_user_message() {
+    let st = state();
+    let session = st
+        .store
+        .create_session_record(SessionCreateInput {
+            title: None,
+            ..Default::default()
+        })
+        .unwrap()
+        .session;
+
+    assert!(!should_generate_title(&st, &session.id));
+
+    st.store
+        .append_message_record(
+            &session.id,
+            MessageAppendInput {
+                info: json!({ "role": "user" }),
+                parts: vec![json!({ "type": "text", "text": "debug auth refresh" })],
+            },
+        )
+        .unwrap();
+    assert!(should_generate_title(&st, &session.id));
+
+    st.store
+        .update_session(
+            &session.id,
+            SessionUpdateInput {
+                title: Some("Manual title".to_string()),
+                permission: None,
+                time: None,
+            },
+        )
+        .unwrap();
+    assert!(!should_generate_title(&st, &session.id));
+
+    let child = st
+        .store
+        .create_session_record(SessionCreateInput {
+            parent_id: Some(session.id.clone()),
+            title: None,
+            ..Default::default()
+        })
+        .unwrap()
+        .session;
+    st.store
+        .append_message_record(
+            &child.id,
+            MessageAppendInput {
+                info: json!({ "role": "user" }),
+                parts: vec![json!({ "type": "text", "text": "child task" })],
+            },
+        )
+        .unwrap();
+    assert!(!should_generate_title(&st, &child.id));
+}
+
+#[test]
 fn assistant_completed_info_uses_completion_time_not_start_time() {
     let start = MessageAppendResult {
         info: json!({
@@ -373,6 +508,86 @@ fn real_messages_skips_unsettled_tool_parts() {
         messages.iter().all(|message| message.responses.is_empty()),
         "unsettled running tool calls must not replay as bare function_call items: {messages:?}"
     );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn real_messages_injects_editor_context_into_latest_user_message() {
+    let root = unique_root();
+    let state = state_at(&root);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+    state
+        .store
+        .append_message_record(
+            &session.id,
+            MessageAppendInput {
+                info: json!({
+                    "role": "user",
+                    "editorContext": {
+                        "activeFile": "src/lib.rs",
+                        "visibleFiles": ["src/lib.rs", "Cargo.toml"],
+                        "openTabs": ["README.md"]
+                    }
+                }),
+                parts: vec![json!({ "type": "text", "text": "continue" })],
+            },
+        )
+        .unwrap();
+
+    let messages = real_messages(&state, &session.id, "continue");
+    let content = &messages.last().expect("last message").content;
+    assert!(content.contains("<environment_details>"));
+    assert!(content.contains("Active file: src/lib.rs"));
+    assert!(content.contains("Visible files:"));
+    assert!(content.contains("  Cargo.toml"));
+    assert!(content.contains("Open tabs:"));
+    assert!(content.contains("  README.md"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn real_messages_preserves_data_url_file_attachments() {
+    let root = unique_root();
+    let state = state_at(&root);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+    state
+        .store
+        .append_message_record(
+            &session.id,
+            MessageAppendInput {
+                info: json!({ "role": "user" }),
+                parts: vec![
+                    json!({ "type": "text", "text": "inspect image" }),
+                    json!({
+                        "type": "file",
+                        "mime": "image/png",
+                        "filename": "screen.png",
+                        "url": "data:image/png;base64,aW1n"
+                    }),
+                    json!({
+                        "type": "file",
+                        "mime": "text/plain",
+                        "filename": "note.txt",
+                        "url": "data:text/plain;base64,aGVsbG8="
+                    }),
+                ],
+            },
+        )
+        .unwrap();
+
+    let messages = real_messages(&state, &session.id, "inspect image");
+    let user = messages.last().expect("user message");
+    assert_eq!(user.attachments.len(), 1);
+    assert_eq!(user.attachments[0].mime, "image/png");
+    assert_eq!(user.attachments[0].filename.as_deref(), Some("screen.png"));
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -539,4 +754,152 @@ fn noop_condition_matches_litellm_copilot_tool_history_triple() {
         &msgs
     ));
     assert!(!should_inject_noop("github-copilot-chat", false, &[], &[]));
+}
+
+/// Helper: write `kilo.json` with the supplied agent block at the
+/// given test root. Mirrors `tests/agent_basics.rs:custom_agent_config`.
+fn write_agent_config(root: &std::path::Path, body: Value) {
+    let dir = root.join("config").join("kilo");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("kilo.json"), serde_json::to_string(&body).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn task_child_disables_task_tool_when_parent_agent_lacks_permission() {
+    // Parent agent has no `task` allow rule → child tool map sets
+    // `task: false` (Bun parity: `tool/task.ts:165`).
+    let root = unique_root();
+    write_agent_config(
+        &root,
+        json!({
+            "agent": {
+                "code": {
+                    "permission": [
+                        { "permission": "edit", "pattern": "*", "action": "allow" }
+                    ]
+                }
+            }
+        }),
+    );
+    let st = state_at(&root);
+    seed(&st.store);
+    let parent = st
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("create parent");
+    st.set_session_agent(&parent.id, Some("code"));
+
+    let tools = task_child_tools(&st, &parent);
+    assert_eq!(tools["task"], json!(false), "tools={tools}");
+    // Static default for `todowrite` stays disabled too in this case.
+    assert_eq!(tools["todowrite"], json!(false));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn task_child_disables_todowrite_when_parent_agent_lacks_permission() {
+    // Parent agent allows `task` but not `todowrite` → child gets
+    // `task: true`, `todowrite: false`.
+    let root = unique_root();
+    write_agent_config(
+        &root,
+        json!({
+            "agent": {
+                "code": {
+                    "permission": [
+                        { "permission": "task", "pattern": "*", "action": "allow" }
+                    ]
+                }
+            }
+        }),
+    );
+    let st = state_at(&root);
+    seed(&st.store);
+    let parent = st
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("create parent");
+    st.set_session_agent(&parent.id, Some("code"));
+
+    let tools = task_child_tools(&st, &parent);
+    assert_eq!(tools["task"], json!(true), "tools={tools}");
+    assert_eq!(tools["todowrite"], json!(false));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn task_child_disables_primary_tools_from_experimental_config() {
+    // Every tool in `experimental.primary_tools` is forced false in the
+    // child map (Bun parity: `tool/task.ts:166`).
+    let root = unique_root();
+    write_agent_config(
+        &root,
+        json!({
+            "agent": {
+                "code": {
+                    "permission": [
+                        { "permission": "task", "pattern": "*", "action": "allow" },
+                        { "permission": "todowrite", "pattern": "*", "action": "allow" }
+                    ]
+                }
+            },
+            "experimental": {
+                "primary_tools": ["bash", "edit"]
+            }
+        }),
+    );
+    let st = state_at(&root);
+    seed(&st.store);
+    let parent = st
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("create parent");
+    st.set_session_agent(&parent.id, Some("code"));
+
+    let tools = task_child_tools(&st, &parent);
+    assert_eq!(tools["bash"], json!(false), "tools={tools}");
+    assert_eq!(tools["edit"], json!(false));
+    // `task` and `todowrite` still re-enabled because parent has
+    // explicit allow rules and they are not in the primary_tools list.
+    assert_eq!(tools["task"], json!(true));
+    assert_eq!(tools["todowrite"], json!(true));
+    // Unrelated tools are unaffected.
+    assert_eq!(tools["read"], json!(true));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn task_child_keeps_task_when_parent_agent_explicitly_allows() {
+    // Parent agent explicitly grants `task` allow → child map flips the
+    // static default `task: false` back to `task: true`.
+    let root = unique_root();
+    write_agent_config(
+        &root,
+        json!({
+            "agent": {
+                "code": {
+                    "permission": [
+                        { "permission": "task", "pattern": "*", "action": "allow" },
+                        { "permission": "todowrite", "pattern": "*", "action": "allow" }
+                    ]
+                }
+            }
+        }),
+    );
+    let st = state_at(&root);
+    seed(&st.store);
+    let parent = st
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("create parent");
+    st.set_session_agent(&parent.id, Some("code"));
+
+    let tools = task_child_tools(&st, &parent);
+    assert_eq!(tools["task"], json!(true), "tools={tools}");
+    assert_eq!(tools["todowrite"], json!(true));
+
+    let _ = fs::remove_dir_all(&root);
 }

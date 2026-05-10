@@ -13,13 +13,16 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     process::{Child, ChildStdin},
-    sync::{atomic::AtomicBool, mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU8},
+        mpsc, Arc, Mutex,
+    },
     time::Instant,
 };
 
 use kilo_store::Store;
 use serde_json::Value;
-use tokio::sync::{broadcast, watch, RwLock, Semaphore};
+use tokio::sync::{broadcast, watch, Notify, RwLock, Semaphore};
 
 use crate::http::sse::BusEvent;
 use crate::limits::MAX_SSE_CLIENTS;
@@ -35,10 +38,14 @@ pub(crate) struct AppState {
     pub(crate) bus: broadcast::Sender<BusEvent>,
     pub(crate) viewed: RwLock<ViewedState>,
     pub(crate) runners: Mutex<BTreeMap<String, Runner>>,
+    pub(crate) runner_notify: Notify,
+    pub(crate) prompt_queues: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub(crate) prompt_queue_versions: Mutex<BTreeMap<String, u64>>,
     pub(crate) permissions: Mutex<BTreeMap<String, PendingPermission>>,
     pub(crate) approvals: Mutex<Vec<PermissionRule>>,
     pub(crate) questions: Mutex<BTreeMap<String, PendingQuestion>>,
     pub(crate) suggestions: Mutex<BTreeMap<String, PendingSuggestion>>,
+    pub(crate) network: Mutex<BTreeMap<String, PendingNetwork>>,
     pub(crate) mcp: Mutex<kilo_mcp::StatusMap>,
     pub(crate) mcp_configs: Mutex<BTreeMap<String, kilo_mcp::Config>>,
     pub(crate) mcp_children: Mutex<BTreeMap<String, McpChild>>,
@@ -60,6 +67,16 @@ pub(crate) struct AppState {
     /// Per-turn hard permission rules keyed by session id. Resolved once
     /// at turn start so every gated tool does not re-read agent config.
     pub(crate) session_hard_rules: Mutex<BTreeMap<String, Vec<PermissionRule>>>,
+    /// Pending re-anchor for the next queued follow-up prompt, keyed by
+    /// session id. Set when an active turn breaks via `follow_up_break`
+    /// (Bun parity: `KiloSessionPromptQueue.scope()` retargeting). The
+    /// next `prompt_turn` for the same session consumes this value once
+    /// and overrides the new user message's `parentID` so the queued
+    /// follow-up becomes a sibling of the broken turn's user message
+    /// instead of a child of the partial assistant. Empty string means
+    /// "session root" (no parent). Routes that bypass the runner cannot
+    /// observe a stale anchor — `take_broken_turn_anchor` consumes it.
+    pub(crate) broken_turn_anchors: Mutex<BTreeMap<String, String>>,
     /// Audit Fix 3: pending OAuth flows keyed by provider id. The Bun
     /// SDK's `oauth_callback` only echoes back `{ method, code, state }`
     /// — the verifier is server-side. We populate this map on
@@ -88,6 +105,39 @@ impl AppState {
 
     pub(crate) fn new_sse_capacity() -> Arc<Semaphore> {
         Arc::new(Semaphore::new(MAX_SSE_CLIENTS))
+    }
+
+    pub(crate) fn prompt_queue(&self, sid: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut queues = self.prompt_queues.lock().unwrap();
+        queues
+            .entry(sid.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    pub(crate) fn prompt_queue_version(&self, sid: &str) -> u64 {
+        self.prompt_queue_versions
+            .lock()
+            .unwrap()
+            .get(sid)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn prompt_queue_current(&self, sid: &str, version: u64) -> bool {
+        self.prompt_queue_version(sid) == version
+    }
+
+    pub(crate) fn cancel_prompt_queue(&self, sid: &str) {
+        let mut versions = self.prompt_queue_versions.lock().unwrap();
+        let next = versions.get(sid).copied().unwrap_or(0).saturating_add(1);
+        versions.insert(sid.to_string(), next);
+        self.runner_notify.notify_waiters();
+    }
+
+    pub(crate) fn remove_prompt_queue(&self, sid: &str) {
+        self.prompt_queues.lock().unwrap().remove(sid);
+        self.prompt_queue_versions.lock().unwrap().remove(sid);
     }
 
     /// Record (or clear) the agent name currently driving the given
@@ -126,6 +176,27 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// Record the parent message id the next queued follow-up should
+    /// re-anchor under. Called from the agent turn loop when a runner
+    /// breaks via `follow_up_break` and the partial assistant has been
+    /// finalized. The empty string is a valid anchor — it means "session
+    /// root" (the broken user message had no parent).
+    pub(crate) fn set_broken_turn_anchor(&self, sid: &str, parent_id: &str) {
+        self.broken_turn_anchors
+            .lock()
+            .unwrap()
+            .insert(sid.to_string(), parent_id.to_string());
+    }
+
+    /// Consume the pending re-anchor for the given session (returns
+    /// `Some(parent_id)` once and clears it, or `None` when no anchor
+    /// is pending). The take semantics ensure only the first follow-up
+    /// after a break inherits the broken turn's parentage; subsequent
+    /// turns use natural parentage.
+    pub(crate) fn take_broken_turn_anchor(&self, sid: &str) -> Option<String> {
+        self.broken_turn_anchors.lock().unwrap().remove(sid)
+    }
+
     pub(crate) fn agent_info(&self, agent: &str) -> Option<Value> {
         crate::agent::catalog::get(self, agent)
     }
@@ -149,6 +220,92 @@ impl AppState {
             return Vec::new();
         }
         self.agent_permission_rules(agent)
+    }
+
+    /// True when at least one pending network wait is registered for the
+    /// given session. The OpenAI streaming path consults this before
+    /// asking, so rapid successive transport failures within a single
+    /// turn don't fan out into a queue of duplicate `session.network.asked`
+    /// events for the webview. Mirrors Bun's `state.pending` lookup
+    /// inside `SessionNetwork.ask` (single in-flight per session in
+    /// practice; see `session/network.ts:179-226`).
+    pub(crate) fn has_network_wait_for_session(&self, sid: &str) -> bool {
+        let Ok(guard) = self.network.lock() else {
+            return false;
+        };
+        guard.values().any(|wait| {
+            wait.info
+                .get("sessionID")
+                .and_then(Value::as_str)
+                .map(|s| s == sid)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Direct add of a network-wait entry, bypassing the
+    /// `routes::network::ask_network_wait` flow. Returns the generated
+    /// id. The wait carries no resolver — callers using this entrypoint
+    /// own their own retry/resume logic and reclaim the entry via
+    /// [`AppState::take_network_wait`]. Existing `ask_network_wait`
+    /// callers retain the channel-based flow; this helper exists for
+    /// state-side machinery (and the unit test below).
+    #[cfg(test)]
+    pub(crate) fn add_network_wait(&self, sid: &str, reason: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let created = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let seq = SEQ.fetch_add(1, AtomicOrdering::SeqCst);
+        let id = format!("network_{created}_{seq}");
+        let info = serde_json::json!({
+            "id": id,
+            "sessionID": sid,
+            "message": reason,
+            "restored": false,
+            "time": { "created": created },
+        });
+        self.network
+            .lock()
+            .unwrap()
+            .insert(id.clone(), PendingNetwork { info, reply: None });
+        id
+    }
+
+    /// Remove and return a network-wait entry by id. Used to drain the
+    /// state when the agent loop confirms the wait has resolved (the
+    /// resolver path on `ask_network_wait` already removes from the map
+    /// — this is for [`AppState::add_network_wait`] users).
+    #[cfg(test)]
+    pub(crate) fn take_network_wait(&self, id: &str) -> Option<PendingNetwork> {
+        self.network.lock().unwrap().remove(id)
+    }
+
+    /// Drop every wait belonging to the given session. Called from
+    /// turn cleanup so an aborted/failed turn doesn't leave dangling
+    /// waits visible to `/network`. Returns the count cleared so the
+    /// caller can decide whether to publish a `restored`/`rejected`
+    /// event chain (the reply machinery handles its own events).
+    #[cfg(test)]
+    pub(crate) fn clear_network_waits_for_session(&self, sid: &str) -> usize {
+        let mut guard = self.network.lock().unwrap();
+        let drained: Vec<String> = guard
+            .iter()
+            .filter(|(_, wait)| {
+                wait.info
+                    .get("sessionID")
+                    .and_then(Value::as_str)
+                    .map(|s| s == sid)
+                    .unwrap_or(false)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &drained {
+            guard.remove(id);
+        }
+        drained.len()
     }
 }
 
@@ -211,7 +368,6 @@ pub(crate) struct PendingAuth {
     pub(crate) complete: watch::Sender<Option<Result<(), String>>>,
 }
 
-#[allow(dead_code)]
 pub(crate) struct McpChild {
     pub(crate) child: Child,
     pub(crate) stdin: ChildStdin,
@@ -221,6 +377,17 @@ pub(crate) struct McpChild {
 
 pub(crate) struct Runner {
     pub(crate) cancel: Arc<AtomicBool>,
+    /// Mid-loop follow-up break signal. When a same-session
+    /// `prompt_async` arrives while this runner is active, the route
+    /// trips both this flag and `cancel`. The agent loop observes
+    /// `cancel` and finalizes the partial assistant message; the
+    /// `dismiss_question_suggestion_waits` / `reject_pending` fan-out
+    /// is gated on this flag so the queued follow-up turn keeps the
+    /// session's pending UI waits intact (Bun parity:
+    /// `kilocode/session/prompt-queue.ts:hasFollowup`). Routes that
+    /// want a hard user abort (`abort_session`) leave this `false`
+    /// so the existing reject/cascade path runs.
+    pub(crate) follow_up_break: Arc<AtomicBool>,
     /// Parent runner for live delegated work. Store-backed children cover
     /// normal task sessions, but this active edge lets abort propagate even
     /// while a task is inside the non-Send child runtime.
@@ -231,6 +398,24 @@ pub(crate) struct Runner {
     /// plugin handler, etc.). The sync `prompt` path leaves this `None`
     /// — its future is owned by the calling task.
     pub(crate) abort: Mutex<Option<tokio::task::AbortHandle>>,
+    /// Plan-mode follow-up phase marker. Set by the plan-followup arm
+    /// of `prompt_turn` while the runner is suspended on the
+    /// "Continue with implementation?" question (Bun parity:
+    /// `kilocode/plan-followup.ts::ask`). Routes that fan out on cancel
+    /// (`reject_pending_for_sessions`, `abort_session`) can read this
+    /// to distinguish a runner blocked on a user prompt from one
+    /// actively producing tokens.
+    pub(crate) awaiting_plan_followup: Arc<AtomicBool>,
+    /// Mid-stream retry counter. Incremented when the OpenAI Responses
+    /// stream errors AFTER content (text deltas / reasoning / tool
+    /// calls) has streamed within a single iteration. Reset to 0 on a
+    /// successful turn completion, on a user-driven abort (without
+    /// `follow_up_break`), and after exhausting the cap so the next
+    /// turn starts fresh. Capped at
+    /// [`crate::agent::openai_stream::MID_STREAM_RETRY_CAP`]; beyond
+    /// that the partial assistant message is finalized with a terminal
+    /// error envelope.
+    pub(crate) mid_stream_retries: Arc<AtomicU8>,
 }
 
 pub(crate) struct RunnerGuard {
@@ -242,6 +427,7 @@ pub(crate) struct RunnerGuard {
 impl Drop for RunnerGuard {
     fn drop(&mut self) {
         self.state.runners.lock().unwrap().remove(&self.id);
+        self.state.runner_notify.notify_waiters();
     }
 }
 
@@ -272,6 +458,11 @@ pub(crate) enum QuestionReply {
 pub(crate) struct PendingSuggestion {
     pub(crate) info: Value,
     pub(crate) reply: tokio::sync::oneshot::Sender<SuggestionDecision>,
+}
+
+pub(crate) struct PendingNetwork {
+    pub(crate) info: Value,
+    pub(crate) reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -320,9 +511,87 @@ pub(crate) enum Repair {
     Invalid(String),
 }
 
+/// Set by `routes::sessions::set_viewed` from VS Code focus/open events.
+/// Production callers only write this state; the read side is reserved
+/// for the M11+ session-resume / mirror filtering pass and tests round
+/// it back through `viewed_snapshot`. Fields stay non-`#[cfg(test)]`
+/// because production constructs them every PATCH, but rustc reports
+/// them as never-read absent the test build.
 #[derive(Clone, Debug, Default)]
 #[allow(dead_code)]
 pub(crate) struct ViewedState {
     pub(crate) focused: BTreeSet<String>,
     pub(crate) open: BTreeSet<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oauth::OPENAI_ISSUER;
+    use std::net::SocketAddr;
+    use tokio::sync::broadcast;
+
+    fn fixture() -> Arc<AppState> {
+        let (bus, _) = broadcast::channel(16);
+        Arc::new(AppState {
+            username: "kilo".to_string(),
+            password: None,
+            store: kilo_store::Store::new(),
+            bus,
+            viewed: RwLock::default(),
+            runners: Mutex::default(),
+            runner_notify: Notify::new(),
+            prompt_queues: Mutex::default(),
+            prompt_queue_versions: Mutex::default(),
+            permissions: Mutex::default(),
+            approvals: Mutex::default(),
+            questions: Mutex::default(),
+            suggestions: Mutex::default(),
+            network: Mutex::default(),
+            mcp: Mutex::default(),
+            mcp_configs: Mutex::default(),
+            mcp_children: Mutex::default(),
+            pty: Mutex::default(),
+            plugin_tools: Mutex::default(),
+            session_agents: Mutex::default(),
+            session_hard_rules: Mutex::default(),
+            broken_turn_anchors: Mutex::default(),
+            oauth_pending: Mutex::default(),
+            oauth_listener: Mutex::default(),
+            oauth_listener_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            oauth_token_endpoint: format!("{OPENAI_ISSUER}/oauth/token"),
+            sse_capacity: AppState::new_sse_capacity(),
+        })
+    }
+
+    #[test]
+    fn network_wait_lifecycle_add_take_clear() {
+        let state = fixture();
+        assert!(!state.has_network_wait_for_session("sid_a"));
+
+        let id_a = state.add_network_wait("sid_a", "Connection refused");
+        assert!(state.has_network_wait_for_session("sid_a"));
+        assert!(!state.has_network_wait_for_session("sid_b"));
+
+        let id_b = state.add_network_wait("sid_b", "DNS lookup failed");
+        assert!(state.has_network_wait_for_session("sid_b"));
+
+        // `take` returns the entry once and clears it.
+        let taken = state.take_network_wait(&id_a).expect("entry present");
+        assert_eq!(
+            taken.info.get("sessionID").and_then(Value::as_str),
+            Some("sid_a"),
+        );
+        assert!(state.take_network_wait(&id_a).is_none());
+        assert!(!state.has_network_wait_for_session("sid_a"));
+
+        // `clear_*` drops every wait for the named session and reports
+        // how many it removed.
+        let _ = id_b;
+        let cleared = state.clear_network_waits_for_session("sid_b");
+        assert_eq!(cleared, 1);
+        assert!(!state.has_network_wait_for_session("sid_b"));
+        // Idempotent on an empty session.
+        assert_eq!(state.clear_network_waits_for_session("sid_b"), 0);
+    }
 }

@@ -7,6 +7,7 @@ use std::{
 
 use futures_util::StreamExt;
 use kilo_protocol::{Config, ConfigProvidersResult, ProviderResult};
+use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -66,12 +67,40 @@ pub struct ChatMessage {
     pub content: String,
     #[serde(default, skip_serializing)]
     pub responses: Vec<ChatResponseItem>,
+    #[serde(default, skip_serializing)]
+    pub attachments: Vec<ChatAttachment>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ReasoningItem {
+    pub id: String,
+    pub encrypted_content: String,
+    /// Summary lines captured from `response.reasoning_summary_text.delta`
+    /// events. Optional — Responses input still gets a cache hit on the
+    /// `id` + `encrypted_content` pair.
+    #[serde(default)]
+    pub summary: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ChatAttachment {
+    pub mime: String,
+    pub url: String,
+    pub filename: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum ChatResponseItem {
     FunctionCall(ChatToolCall),
-    FunctionOutput { id: String, output: String },
+    FunctionOutput {
+        id: String,
+        output: String,
+    },
+    /// OpenAI Responses encrypted reasoning item captured from
+    /// `response.output_item.done`. Replayed into the next request's
+    /// `input[]` as `{type: "reasoning", id, encrypted_content, summary}`
+    /// so multi-iteration turns get cache hits on reasoning models.
+    Reasoning(ReasoningItem),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -116,6 +145,15 @@ pub struct ChatParsed {
     pub finish: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApiStatusError {
+    pub status: u16,
+    pub message: String,
+    pub body: String,
+    pub retry_after_ms: Option<u64>,
+    pub retryable: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum StreamEvent {
     TextDelta(String),
@@ -128,6 +166,14 @@ pub enum StreamEvent {
     },
     ReasoningEnd {
         id: String,
+    },
+    /// `response.output_item.done` for a `type: "reasoning"` item — carries
+    /// the verbatim `encrypted_content` blob the agent loop must echo back
+    /// into the next request's `input[]` for cache continuity. Emitted
+    /// once per reasoning item, after its trailing `ReasoningEnd` events.
+    ReasoningItem {
+        id: String,
+        encrypted_content: String,
     },
     ToolDelta {
         id: String,
@@ -160,6 +206,7 @@ pub enum ProviderError {
     },
     Http(String),
     Api(String),
+    ApiStatus(ApiStatusError),
     Response(String),
     /// The cancel flag was tripped while a request was in-flight (during
     /// HTTP connect/headers or while awaiting a stream chunk). Surfaced by
@@ -182,6 +229,7 @@ impl fmt::Display for ProviderError {
             Self::MissingKey { provider } => write!(f, "missing apiKey for provider {provider}"),
             Self::Http(err) => write!(f, "provider HTTP error: {err}"),
             Self::Api(err) => write!(f, "provider API error: {err}"),
+            Self::ApiStatus(err) => write!(f, "provider API error: {}", err.message),
             Self::ContextWindow(err) => write!(f, "provider context window exceeded: {err}"),
             Self::Response(err) => write!(f, "provider response error: {err}"),
             Self::Aborted => write!(f, "provider request aborted"),
@@ -190,6 +238,37 @@ impl fmt::Display for ProviderError {
 }
 
 impl std::error::Error for ProviderError {}
+
+impl ProviderError {
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::ApiStatus(err) => err.retryable,
+            Self::Http(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn status_code(&self) -> Option<u16> {
+        match self {
+            Self::ApiStatus(err) => Some(err.status),
+            _ => None,
+        }
+    }
+
+    pub fn retry_after_ms(&self) -> Option<u64> {
+        match self {
+            Self::ApiStatus(err) => err.retry_after_ms,
+            _ => None,
+        }
+    }
+
+    pub fn response_body(&self) -> Option<&str> {
+        match self {
+            Self::ApiStatus(err) => Some(err.body.as_str()),
+            _ => None,
+        }
+    }
+}
 
 pub async fn chat(
     cfg: &Config,
@@ -580,6 +659,7 @@ async fn post(req: &ChatRequest) -> Result<ChatParsed, ProviderError> {
     }
     .map_err(|err| ProviderError::Http(err.to_string()))?;
     let status = res.status();
+    let headers = res.headers().clone();
     let raw = res
         .text()
         .await
@@ -588,11 +668,7 @@ async fn post(req: &ChatRequest) -> Result<ChatParsed, ProviderError> {
         .map_err(|err| ProviderError::Response(err.to_string()))?;
 
     if !status.is_success() {
-        let msg = api_status_message(status.as_u16(), &raw);
-        if api_is_context_window(status.as_u16(), &raw) {
-            return Err(ProviderError::ContextWindow(msg));
-        }
-        return Err(ProviderError::Api(msg));
+        return Err(api_status_error(status.as_u16(), &headers, &raw));
     }
 
     parse(&body)
@@ -698,6 +774,7 @@ async fn post_cancel(req: &ChatRequest, cancel: &AtomicBool) -> Result<ChatParse
         res = call.send() => res.map_err(|err| ProviderError::Http(err.to_string()))?,
     };
     let status = res.status();
+    let headers = res.headers().clone();
     let body = res.text();
     let raw = tokio::select! {
         _ = until_cancel(cancel) => return Err(ProviderError::Aborted),
@@ -707,11 +784,7 @@ async fn post_cancel(req: &ChatRequest, cancel: &AtomicBool) -> Result<ChatParse
         .map_err(|err| ProviderError::Response(err.to_string()))?;
 
     if !status.is_success() {
-        let msg = api_status_message(status.as_u16(), &raw);
-        if api_is_context_window(status.as_u16(), &raw) {
-            return Err(ProviderError::ContextWindow(msg));
-        }
-        return Err(ProviderError::Api(msg));
+        return Err(api_status_error(status.as_u16(), &headers, &raw));
     }
 
     parse(&body)
@@ -755,12 +828,9 @@ async fn post_stream(
     };
     let status = res.status();
     if !status.is_success() {
+        let headers = res.headers().clone();
         let raw = res.text().await.unwrap_or_default();
-        let msg = api_status_message(status.as_u16(), &raw);
-        if api_is_context_window(status.as_u16(), &raw) {
-            return Err(ProviderError::ContextWindow(msg));
-        }
-        return Err(ProviderError::Api(msg));
+        return Err(api_status_error(status.as_u16(), &headers, &raw));
     }
 
     let mut state = StreamState::default();
@@ -897,7 +967,8 @@ fn responses_input(messages: &[ChatMessage]) -> Vec<Value> {
     let outputs = response_outputs(messages);
     let cap = messages.iter().fold(0, |sum, msg| {
         sum + msg.responses.len()
-            + if !msg.content.is_empty() || msg.responses.is_empty() {
+            + if !msg.content.is_empty() || !msg.attachments.is_empty() || msg.responses.is_empty()
+            {
                 1
             } else {
                 0
@@ -905,13 +976,21 @@ fn responses_input(messages: &[ChatMessage]) -> Vec<Value> {
     });
     let mut out = Vec::with_capacity(cap);
     for msg in messages {
-        if !msg.content.is_empty() || msg.responses.is_empty() {
+        // Replay encrypted reasoning items at the head of the assistant
+        // turn (before any text/tool content) so the Responses API can
+        // attach cache continuity to the prior trace. Bun emits these as
+        // first-class `{type: "reasoning", id, encrypted_content}` input
+        // items in the same order the model produced them. Carried via
+        // `ChatResponseItem::Reasoning` entries on the assistant message.
+        for item in &msg.responses {
+            if let ChatResponseItem::Reasoning(reasoning) = item {
+                out.push(reasoning_input_item(reasoning));
+            }
+        }
+        if !msg.content.is_empty() || !msg.attachments.is_empty() || msg.responses.is_empty() {
             out.push(json!({
                 "role": msg.role,
-                "content": [{
-                    "type": if msg.role == "assistant" { "output_text" } else { "input_text" },
-                    "text": msg.content,
-                }]
+                "content": responses_content(msg),
             }));
         }
         for item in &msg.responses {
@@ -924,10 +1003,63 @@ fn responses_input(messages: &[ChatMessage]) -> Vec<Value> {
                     }
                 }
                 ChatResponseItem::FunctionOutput { .. } => {}
+                ChatResponseItem::Reasoning(_) => {}
             }
         }
     }
     out
+}
+
+fn reasoning_input_item(item: &ReasoningItem) -> Value {
+    let summary = item
+        .summary
+        .iter()
+        .filter(|text| !text.is_empty())
+        .map(|text| {
+            json!({
+                "type": "summary_text",
+                "text": text,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "type": "reasoning",
+        "id": item.id,
+        "encrypted_content": item.encrypted_content,
+        "summary": summary,
+    })
+}
+
+fn responses_content(msg: &ChatMessage) -> Vec<Value> {
+    let mut content = Vec::with_capacity(1 + msg.attachments.len());
+    if !msg.content.is_empty() || msg.attachments.is_empty() {
+        content.push(json!({
+            "type": if msg.role == "assistant" { "output_text" } else { "input_text" },
+            "text": msg.content,
+        }));
+    }
+    if msg.role != "user" {
+        return content;
+    }
+    for item in &msg.attachments {
+        if item.mime.starts_with("image/") {
+            content.push(json!({
+                "type": "input_image",
+                "image_url": item.url,
+            }));
+        } else if item.url.starts_with("data:") {
+            let filename = item
+                .filename
+                .clone()
+                .unwrap_or_else(|| "attachment".to_string());
+            content.push(json!({
+                "type": "input_file",
+                "filename": filename,
+                "file_data": item.url,
+            }));
+        }
+    }
+    content
 }
 
 fn response_outputs<'a>(messages: &'a [ChatMessage]) -> BTreeMap<&'a str, &'a str> {
@@ -951,6 +1083,7 @@ fn responses_item(item: &ChatResponseItem) -> Value {
             "arguments": serde_json::to_string(&call.input).unwrap_or_else(|_| "{}".to_string()),
         }),
         ChatResponseItem::FunctionOutput { id, output } => output_item(id, output),
+        ChatResponseItem::Reasoning(reasoning) => reasoning_input_item(reasoning),
     }
 }
 
@@ -1193,7 +1326,7 @@ fn stream_reasoning(value: &Value, state: &mut StreamState) -> Vec<StreamEvent> 
 
     if kind == "response.output_item.done" {
         let item = value.get("item").or_else(|| value.get("output"));
-        let Some(_) =
+        let Some(item) =
             item.filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
         else {
             return Vec::new();
@@ -1205,13 +1338,30 @@ fn stream_reasoning(value: &Value, state: &mut StreamState) -> Vec<StreamEvent> 
         if state.current_reasoning == Some(idx) {
             state.current_reasoning = None;
         }
-        return part
+        let mut out: Vec<StreamEvent> = part
             .summaries
             .into_iter()
             .map(|summary| StreamEvent::ReasoningEnd {
                 id: reasoning_id(&part.id, summary),
             })
             .collect();
+        // Encrypted reasoning round-trip: echo `{id, encrypted_content}`
+        // back into the next Responses request's `input[]` for cache
+        // hits. Only emit when both fields are present — non-reasoning
+        // models and partial frames must stay no-op.
+        let encrypted = item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty());
+        if let Some(encrypted) = encrypted {
+            if !part.id.is_empty() {
+                out.push(StreamEvent::ReasoningItem {
+                    id: part.id.clone(),
+                    encrypted_content: encrypted.to_string(),
+                });
+            }
+        }
+        return out;
     }
 
     Vec::new()
@@ -1601,6 +1751,70 @@ fn api_status_message(status: u16, raw: &str) -> String {
     format!("{msg} (status {status}; body: {snippet})")
 }
 
+fn api_status_error(status: u16, headers: &HeaderMap, raw: &str) -> ProviderError {
+    let msg = api_status_message(status, raw);
+    if api_is_context_window(status, raw) {
+        return ProviderError::ContextWindow(msg);
+    }
+    ProviderError::ApiStatus(ApiStatusError {
+        status,
+        message: msg,
+        body: raw.to_string(),
+        retry_after_ms: retry_after_ms(headers),
+        retryable: api_retryable(status, raw),
+    })
+}
+
+fn api_retryable(status: u16, raw: &str) -> bool {
+    if raw.contains("FreeUsageLimitError") {
+        return false;
+    }
+    if status >= 500 || matches!(status, 408 | 409 | 425 | 429) {
+        return true;
+    }
+    let lower = raw.to_ascii_lowercase();
+    lower.contains("rate increased too quickly")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("overloaded")
+}
+
+fn retry_after_ms(headers: &HeaderMap) -> Option<u64> {
+    let direct = headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_ms);
+    if direct.is_some() {
+        return direct;
+    }
+    let value = headers.get("retry-after")?.to_str().ok()?.trim();
+    parse_seconds_ms(value).or_else(|| parse_http_date_ms(value))
+}
+
+fn parse_ms(value: &str) -> Option<u64> {
+    let ms = value.trim().parse::<f64>().ok()?;
+    if !ms.is_finite() || ms < 0.0 {
+        return None;
+    }
+    Some(ms.ceil() as u64)
+}
+
+fn parse_seconds_ms(value: &str) -> Option<u64> {
+    let seconds = value.parse::<f64>().ok()?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    Some((seconds * 1000.0).ceil() as u64)
+}
+
+fn parse_http_date_ms(value: &str) -> Option<u64> {
+    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let now = chrono::Utc::now();
+    let ms = date.with_timezone(&chrono::Utc) - now;
+    (ms.num_milliseconds() > 0).then(|| ms.num_milliseconds() as u64)
+}
+
 fn first<const N: usize>(items: [Option<String>; N]) -> Option<String> {
     items
         .into_iter()
@@ -1678,6 +1892,7 @@ fn text<'a>(value: Option<&'a Value>, keys: &[&str]) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::HeaderValue;
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1807,6 +2022,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "hello".to_string(),
                 responses: Vec::new(),
+                attachments: Vec::new(),
             }],
         )
         .unwrap();
@@ -1944,6 +2160,31 @@ mod tests {
     }
 
     #[test]
+    fn api_status_error_marks_5xx_retryable_with_retry_after_ms() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after-ms", HeaderValue::from_static("1250"));
+        let err = api_status_error(503, &headers, r#"{"error":{"message":"Overloaded"}}"#);
+
+        let ProviderError::ApiStatus(err) = err else {
+            panic!("expected api status error");
+        };
+        assert_eq!(err.status, 503);
+        assert_eq!(err.retry_after_ms, Some(1250));
+        assert!(err.retryable);
+        assert!(err.message.contains("Overloaded"));
+    }
+
+    #[test]
+    fn api_status_error_does_not_retry_free_usage_limit() {
+        let err = api_status_error(429, &HeaderMap::new(), "FreeUsageLimitError");
+
+        let ProviderError::ApiStatus(err) = err else {
+            panic!("expected api status error");
+        };
+        assert!(!err.retryable);
+    }
+
+    #[test]
     fn parses_openai_responses_stream_events() {
         let events = parse_stream(
             r#"data: {"type":"response.output_text.delta","delta":"Hel"}
@@ -2032,6 +2273,125 @@ data: [DONE]
                 },
             ]
         );
+    }
+
+    #[test]
+    fn reasoning_item_with_encrypted_content_is_captured_in_stream_events() {
+        // `response.output_item.done` for a `type:"reasoning"` item that
+        // carries `encrypted_content` should emit a `ReasoningItem` event
+        // alongside the trailing `ReasoningEnd`s. Required for cache-hit
+        // round-trip in the next Responses request.
+        let events = parse_stream(
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_2","type":"reasoning"}}
+
+data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_2","summary_index":0,"delta":"thinking"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_2","type":"reasoning","encrypted_content":"BLOB"}}
+
+data: [DONE]
+
+"#,
+        )
+        .unwrap();
+
+        let captured = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ReasoningItem {
+                    id,
+                    encrypted_content,
+                } => Some((id.as_str(), encrypted_content.as_str())),
+                _ => None,
+            })
+            .expect("reasoning item event");
+        assert_eq!(captured, ("rs_2", "BLOB"));
+        // ReasoningEnd must still fire for the streamed summary so the
+        // UI knows the trace closed.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ReasoningEnd { id } if id == "rs_2:0"
+        )));
+    }
+
+    #[test]
+    fn reasoning_item_without_encrypted_content_emits_no_round_trip_event() {
+        // Non-reasoning models still flush an `output_item.done` for any
+        // streamed summary but do not carry `encrypted_content`. Make
+        // sure we don't synthesize a bogus replay item.
+        let events = parse_stream(
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_3","type":"reasoning"}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_3","type":"reasoning"}}
+
+data: [DONE]
+
+"#,
+        )
+        .unwrap();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ReasoningItem { .. })));
+    }
+
+    #[test]
+    fn responses_input_emits_reasoning_items_before_assistant_content() {
+        // Encrypted reasoning items on an assistant message should
+        // surface as standalone `{type:"reasoning"}` input items
+        // BEFORE the assistant content, matching Bun's converter at
+        // `provider/sdk/copilot/responses/convert-to-openai-responses-input.ts:185-244`.
+        let input = responses_input(&[
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "I'll inspect.".to_string(),
+                responses: vec![
+                    ChatResponseItem::Reasoning(ReasoningItem {
+                        id: "rs_42".to_string(),
+                        encrypted_content: "ENC".to_string(),
+                        summary: vec!["thinking hard".to_string()],
+                    }),
+                    ChatResponseItem::FunctionCall(ChatToolCall {
+                        id: "call_read".to_string(),
+                        name: "read".to_string(),
+                        input: json!({ "filePath": "x" }),
+                    }),
+                ],
+                attachments: Vec::new(),
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: String::new(),
+                responses: vec![ChatResponseItem::FunctionOutput {
+                    id: "call_read".to_string(),
+                    output: "ok".to_string(),
+                }],
+                attachments: Vec::new(),
+            },
+        ]);
+
+        // Order: reasoning -> assistant message -> function_call -> function_call_output.
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["id"], "rs_42");
+        assert_eq!(input[0]["encrypted_content"], "ENC");
+        assert_eq!(input[0]["summary"][0]["type"], "summary_text");
+        assert_eq!(input[0]["summary"][0]["text"], "thinking hard");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[3]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn responses_input_does_not_emit_reasoning_items_for_messages_without_them() {
+        // Non-reasoning models — pure user/assistant turn must not get
+        // a synthetic empty reasoning item.
+        let input = responses_input(&[ChatMessage {
+            role: "assistant".to_string(),
+            content: "hi".to_string(),
+            responses: Vec::new(),
+            attachments: Vec::new(),
+        }]);
+        assert!(input
+            .iter()
+            .all(|item| item.get("type").and_then(Value::as_str) != Some("reasoning")));
     }
 
     #[test]
@@ -2160,6 +2520,7 @@ data: [DONE]
                 role: "user".to_string(),
                 content: "Say KILO_SMOKE_OK and nothing sensitive.".to_string(),
                 responses: Vec::new(),
+                attachments: Vec::new(),
             }],
             Vec::new(),
             &cancel,
@@ -2375,6 +2736,7 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_read
                 role: "user".to_string(),
                 content: "inspect file".to_string(),
                 responses: Vec::new(),
+                attachments: Vec::new(),
             },
             ChatMessage {
                 role: "assistant".to_string(),
@@ -2384,6 +2746,7 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_read
                     name: "read".to_string(),
                     input: json!({ "filePath": "src/main.rs" }),
                 })],
+                attachments: Vec::new(),
             },
             ChatMessage {
                 role: "tool".to_string(),
@@ -2392,6 +2755,7 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_read
                     id: "call_read".to_string(),
                     output: "file contents".to_string(),
                 }],
+                attachments: Vec::new(),
             },
         ]);
 
@@ -2410,6 +2774,41 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_read
     }
 
     #[test]
+    fn responses_input_preserves_multimodal_attachments() {
+        let input = responses_input(&[ChatMessage {
+            role: "user".to_string(),
+            content: "inspect these".to_string(),
+            responses: Vec::new(),
+            attachments: vec![
+                ChatAttachment {
+                    mime: "image/png".to_string(),
+                    url: "data:image/png;base64,aW1n".to_string(),
+                    filename: Some("screen.png".to_string()),
+                },
+                ChatAttachment {
+                    mime: "application/pdf".to_string(),
+                    url: "data:application/pdf;base64,cGRm".to_string(),
+                    filename: Some("spec.pdf".to_string()),
+                },
+            ],
+        }]);
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[0]["content"][1]["type"], "input_image");
+        assert_eq!(
+            input[0]["content"][1]["image_url"],
+            "data:image/png;base64,aW1n"
+        );
+        assert_eq!(input[0]["content"][2]["type"], "input_file");
+        assert_eq!(input[0]["content"][2]["filename"], "spec.pdf");
+        assert_eq!(
+            input[0]["content"][2]["file_data"],
+            "data:application/pdf;base64,cGRm"
+        );
+    }
+
+    #[test]
     fn responses_input_synthesizes_missing_tool_output() {
         let input = responses_input(&[ChatMessage {
             role: "assistant".to_string(),
@@ -2419,6 +2818,7 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_read
                 name: "task".to_string(),
                 input: json!({ "description": "Map repo" }),
             })],
+            attachments: Vec::new(),
         }]);
 
         assert_eq!(input.len(), 2);
@@ -2438,6 +2838,7 @@ data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_read
                 id: "call_orphan".to_string(),
                 output: "late output".to_string(),
             }],
+            attachments: Vec::new(),
         }]);
 
         assert!(input.is_empty(), "orphan tool output must not be replayed");

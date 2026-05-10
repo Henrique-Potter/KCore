@@ -23,6 +23,8 @@ mod sessions;
 
 mod files;
 
+mod vcs;
+
 mod worktree;
 
 mod agent_basics;

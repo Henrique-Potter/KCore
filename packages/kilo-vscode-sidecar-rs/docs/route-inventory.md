@@ -147,10 +147,10 @@ query (or `x-kilo-directory` header).
 | POST | `/network/{requestID}/reply` | - | `boolean` | `kilo-provider/network.ts:36` |
 | POST | `/network/{requestID}/reject` | - | `boolean` | `services/cli-backend/connection-service.ts:54` |
 
-Rust currently does not pause turns on offline-network waits, so `GET /network`
-returns an empty list and reply/reject for unknown waits return `404`. This is
-still part of the VS Code contract because config save drains pending network
-waits before applying settings.
+Rust now registers pending offline-style transport waits during clean
+pre-response OpenAI failures. `GET /network` lists active waits and
+reply/reject completes the blocked turn. Unknown waits still return `404`.
+Automatic restored-network probing remains open.
 
 ### Suggestion
 
@@ -256,6 +256,7 @@ FIM, or skill/agent filesystem-removal behavior.
 | M | Path | Body | Resp | Call sites |
 |---|---|---|---|---|
 | POST | `/pty` | `{ ... }` | `Pty` | `agent-manager/terminal-manager.ts:77` |
+| GET | `/pty/{ptyID}/connect` | WebSocket upgrade with optional `cursor` query | text PTY frames + binary cursor metadata | `agent-manager/terminal-routing.ts:155`, `terminal/TerminalTab.tsx` |
 | PUT | `/pty/{ptyID}` | `{ title?, size? }` | `Pty` | `agent-manager/terminal-manager.ts:105` (SDK `Pty.update`, see `packages/sdk/js/src/v2/gen/sdk.gen.ts:1322`) |
 | DELETE | `/pty/{ptyID}` | - | `void` | `agent-manager/terminal-manager.ts:127,191` |
 

@@ -27,7 +27,8 @@ use kilo_protocol::{
     SessionCreateInput,
 };
 use kilo_provider::{
-    ChatMessage, ChatOutput, ChatResponseItem, ChatTool, ChatToolCall, ProviderError,
+    ChatAttachment, ChatMessage, ChatOutput, ChatResponseItem, ChatTool, ChatToolCall,
+    ProviderError, ReasoningItem,
 };
 use serde_json::{json, Map, Value};
 use tokio::sync::Semaphore;
@@ -41,11 +42,15 @@ use crate::agent::tools::defs::{
     apply_patch_def, bash_def, edit_def, glob_def, grep_def, lsp_def, plan_exit_def, question_def,
     read_def, skill_def, suggest_def, task_def, todowrite_def, webfetch_def, write_def,
 };
+#[cfg(test)]
+use crate::agent::tools::fs::{fake_edit, fake_write};
 use crate::agent::tools::fs::{
-    fake_edit, fake_glob_cancel, fake_grep, fake_grep_cancel, fake_read, fake_read_cancel,
-    fake_write,
+    fake_edit_gated, fake_glob_gated, fake_grep, fake_grep_gated, fake_read, fake_read_gated,
+    fake_write_gated,
 };
+#[cfg(test)]
 use crate::agent::tools::patch::fake_apply_patch;
+use crate::agent::tools::patch::fake_apply_patch_gated;
 use crate::{AppState, PermissionRule, Repair, KNOWN_TOOLS};
 
 const TASK_TOOL_CONCURRENCY: usize = 16;
@@ -473,6 +478,13 @@ pub(crate) fn real_messages(state: &AppState, id: &str, text: &str) -> Vec<ChatM
     let summary_anchor = raw
         .iter()
         .rposition(|msg| msg.info.get("summary").and_then(Value::as_bool) == Some(true));
+    let last_user = raw
+        .iter()
+        .enumerate()
+        .skip(summary_anchor.unwrap_or(0))
+        .filter(|(_, msg)| msg.info.get("role").and_then(Value::as_str) == Some("user"))
+        .map(|(idx, _)| idx)
+        .last();
     let mut msgs: Vec<ChatMessage> = Vec::new();
     let start = summary_anchor.unwrap_or(0);
     for (idx, msg) in raw.iter().enumerate().skip(start) {
@@ -482,8 +494,36 @@ pub(crate) fn real_messages(state: &AppState, id: &str, text: &str) -> Vec<ChatM
         if role == "system" {
             continue;
         }
-        let content = prompt_text(&msg.parts);
-        let calls = tool_part_calls(&msg.parts);
+        let mut content = prompt_text(&msg.parts);
+        if Some(idx) == last_user {
+            if let Some(block) = environment_details(msg.info.get("editorContext")) {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&block);
+            }
+            if msg.info.get("agent").and_then(Value::as_str) == Some("plan") {
+                if let Some(session) = state.store.session(id) {
+                    if !content.is_empty() {
+                        content.push_str("\n\n");
+                    }
+                    content.push_str(&plan_mode_prompt(&state.store.paths().directory, &session));
+                }
+            }
+        }
+        // Cross-turn encrypted reasoning replay (Wave 5 Group V): for
+        // assistant turns, prepend persisted `reasoning` parts that
+        // carry an `itemID` + `encryptedContent` so the next request's
+        // `input[]` gets a `{type:"reasoning", id, encrypted_content,
+        // summary}` item before any function_call / output items.
+        // `responses_input` already emits reasoning entries first when
+        // it walks `msg.responses`, so ordering is preserved.
+        let mut calls = if role == "assistant" {
+            reasoning_part_responses(&msg.parts)
+        } else {
+            Vec::new()
+        };
+        calls.extend(tool_part_calls(&msg.parts));
         let outs = msg
             .parts
             .iter()
@@ -501,15 +541,39 @@ pub(crate) fn real_messages(state: &AppState, id: &str, text: &str) -> Vec<ChatM
                         "[Compacted context summary — earlier history was elided to fit the model's context window.]\n{content}"
                     ),
                     responses: Vec::new(),
+                    attachments: Vec::new(),
                 });
             }
             continue;
         }
-        if !content.is_empty() || !calls.is_empty() {
+        // For user-role messages, run multimodal resolvers on the parts:
+        // turn `file://` URLs and directory references into inline text
+        // blocks + image/PDF attachments, and inline `@<path>` mentions
+        // from the user's text. Other roles (assistant/tool) only carry
+        // already-stored data URL attachments.
+        let (prefix, attachments) = if role == "user" {
+            let resolved = resolve_user_multimodal(
+                FsPath::new(&state.store.paths().directory),
+                &msg.parts,
+                &content,
+            );
+            (resolved.prefix, resolved.attachments)
+        } else {
+            (String::new(), file_attachments(&msg.parts))
+        };
+        let content = if prefix.is_empty() {
+            content
+        } else if content.is_empty() {
+            prefix
+        } else {
+            format!("{prefix}\n\n{content}")
+        };
+        if !content.is_empty() || !calls.is_empty() || !attachments.is_empty() {
             msgs.push(ChatMessage {
                 role: role.to_string(),
                 content,
                 responses: calls,
+                attachments,
             });
         }
         if !outs.is_empty() {
@@ -517,17 +581,20 @@ pub(crate) fn real_messages(state: &AppState, id: &str, text: &str) -> Vec<ChatM
                 role: "tool".to_string(),
                 content: String::new(),
                 responses: outs,
+                attachments: Vec::new(),
             });
         }
     }
-    let has_user = msgs
-        .iter()
-        .any(|msg| msg.role == "user" && msg.content == text);
+    let has_user = raw.iter().skip(start).any(|msg| {
+        msg.info.get("role").and_then(Value::as_str) == Some("user")
+            && prompt_text(&msg.parts) == text
+    });
     if !has_user {
         msgs.push(ChatMessage {
             role: "user".to_string(),
             content: text.to_string(),
             responses: Vec::new(),
+            attachments: Vec::new(),
         });
     }
     msgs
@@ -545,6 +612,55 @@ fn tool_part_calls(parts: &[Value]) -> Vec<ChatResponseItem> {
                 input: part.get("state")?.get("input")?.clone(),
             }))
         })
+        .collect()
+}
+
+/// Rebuild encrypted reasoning items from persisted assistant parts so
+/// follow-up turns get cache hits on the prior reasoning trace. Each
+/// streamed reasoning item lands on disk as one or more parts keyed by
+/// `<itemID>:<summary_index>` (see
+/// [`agent::openai_stream::reasoning_part_with`]); we group those parts
+/// by their bare `itemID`, take the first non-empty `encryptedContent`
+/// blob, and concat the per-summary `text` fields in arrival order
+/// into the `summary` list. Parts without an `encryptedContent` blob
+/// are skipped — those are stale/legacy reasoning records that can't
+/// be replayed. Bun parity: `convert-to-openai-responses-input.ts:185-244`.
+fn reasoning_part_responses(parts: &[Value]) -> Vec<ChatResponseItem> {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, ReasoningItem> =
+        std::collections::HashMap::new();
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) != Some("reasoning") {
+            continue;
+        }
+        let item_id = match part.get("itemID").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => continue,
+        };
+        let encrypted = match part.get("encryptedContent").and_then(Value::as_str) {
+            Some(blob) if !blob.is_empty() => blob.to_string(),
+            _ => continue,
+        };
+        let text = part
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+        let entry = groups.entry(item_id.clone()).or_insert_with(|| {
+            order.push(item_id.clone());
+            ReasoningItem {
+                id: item_id.clone(),
+                encrypted_content: encrypted,
+                summary: Vec::new(),
+            }
+        });
+        if let Some(text) = text {
+            entry.summary.push(text);
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|id| groups.remove(&id).map(ChatResponseItem::Reasoning))
         .collect()
 }
 
@@ -732,51 +848,60 @@ pub(crate) async fn real_tool_part(
         return aborted_tool_part(mid, pid, idx, &canonical, call, time);
     }
     match canonical.as_str() {
-        "read" => match fake_read_cancel(root, &call.input, Some(&cancel)) {
-            Ok((title, output, metadata)) => tool_completed(
-                mid,
-                pid,
-                idx,
-                &canonical,
-                &call.id,
-                &call.input,
-                title,
-                output,
-                metadata,
-                time,
-            ),
-            Err(err) => tool_error(mid, pid, idx, &canonical, &call.id, &call.input, err, time),
-        },
-        "glob" => match fake_glob_cancel(root, &call.input, Some(&cancel)) {
-            Ok((title, output, metadata)) => tool_completed(
-                mid,
-                pid,
-                idx,
-                &canonical,
-                &call.id,
-                &call.input,
-                title,
-                output,
-                metadata,
-                time,
-            ),
-            Err(err) => tool_error(mid, pid, idx, &canonical, &call.id, &call.input, err, time),
-        },
-        "grep" => match fake_grep_cancel(root, &call.input, Some(&cancel)) {
-            Ok((title, output, metadata)) => tool_completed(
-                mid,
-                pid,
-                idx,
-                &canonical,
-                &call.id,
-                &call.input,
-                title,
-                output,
-                metadata,
-                time,
-            ),
-            Err(err) => tool_error(mid, pid, idx, &canonical, &call.id, &call.input, err, time),
-        },
+        "read" => {
+            match fake_read_gated(state, sid, mid, pid, idx, root, &call.input, Some(&cancel)).await
+            {
+                Ok((title, output, metadata)) => tool_completed(
+                    mid,
+                    pid,
+                    idx,
+                    &canonical,
+                    &call.id,
+                    &call.input,
+                    title,
+                    output,
+                    metadata,
+                    time,
+                ),
+                Err(err) => tool_error(mid, pid, idx, &canonical, &call.id, &call.input, err, time),
+            }
+        }
+        "glob" => {
+            match fake_glob_gated(state, sid, mid, pid, idx, root, &call.input, Some(&cancel)).await
+            {
+                Ok((title, output, metadata)) => tool_completed(
+                    mid,
+                    pid,
+                    idx,
+                    &canonical,
+                    &call.id,
+                    &call.input,
+                    title,
+                    output,
+                    metadata,
+                    time,
+                ),
+                Err(err) => tool_error(mid, pid, idx, &canonical, &call.id, &call.input, err, time),
+            }
+        }
+        "grep" => {
+            match fake_grep_gated(state, sid, mid, pid, idx, root, &call.input, Some(&cancel)).await
+            {
+                Ok((title, output, metadata)) => tool_completed(
+                    mid,
+                    pid,
+                    idx,
+                    &canonical,
+                    &call.id,
+                    &call.input,
+                    title,
+                    output,
+                    metadata,
+                    time,
+                ),
+                Err(err) => tool_error(mid, pid, idx, &canonical, &call.id, &call.input, err, time),
+            }
+        }
         "webfetch" => {
             match ask_permission(state, sid, mid, pid, idx, &canonical, &call.id, &call.input).await
             {
@@ -901,9 +1026,10 @@ pub(crate) async fn real_tool_part(
                     if is_tool_canceled(&cancel) {
                         aborted_tool_part(mid, pid, idx, &canonical, call, time)
                     } else {
-                        real_mutating_tool_part(
-                            root, mid, pid, idx, &canonical, call, time, &cancel,
+                        real_mutating_tool_part_gated(
+                            state, sid, root, mid, pid, idx, &canonical, call, time, &cancel,
                         )
+                        .await
                     }
                 }
                 Err(err) => tool_error(mid, pid, idx, &canonical, &call.id, &call.input, err, time),
@@ -924,18 +1050,28 @@ pub(crate) async fn real_tool_part(
             }
         }
         "question" => question_tool_part(state, sid, mid, pid, idx, call, time).await,
-        "plan_exit" => tool_completed(
-            mid,
-            pid,
-            idx,
-            "plan_exit",
-            &call.id,
-            &call.input,
-            "Planning complete".to_string(),
-            "Plan is ready. Ending planning turn.".to_string(),
-            json!({}),
-            time,
-        ),
+        "plan_exit" => {
+            let plan = state
+                .store
+                .session(sid)
+                .map(|session| plan_path(root, &session).to_string_lossy().to_string());
+            let output = plan
+                .as_ref()
+                .map(|plan| format!("Plan is ready at {plan}. Ending planning turn."))
+                .unwrap_or_else(|| "Plan is ready. Ending planning turn.".to_string());
+            tool_completed(
+                mid,
+                pid,
+                idx,
+                "plan_exit",
+                &call.id,
+                &call.input,
+                "Planning complete".to_string(),
+                output,
+                json!({ "plan": plan }),
+                time,
+            )
+        }
         _ => tool_error(
             mid,
             pid,
@@ -1045,6 +1181,20 @@ fn tool_position(input: &Value, key: &str) -> Result<usize, String> {
         return Err(format!("{key} must be greater than or equal to 1"));
     }
     Ok(value as usize)
+}
+
+fn plan_mode_prompt(root: &str, session: &Session) -> String {
+    let plan = plan_path(FsPath::new(root), session);
+    format!(
+        "Plan mode is active. Do not execute the implementation yet. You may read files, inspect the codebase, ask clarifying questions, and write or edit only this plan file: {}.\nAt the end of planning, call plan_exit.",
+        plan.to_string_lossy()
+    )
+}
+
+fn plan_path(root: &FsPath, session: &Session) -> PathBuf {
+    root.join(".kilo")
+        .join("plans")
+        .join(format!("{}-{}.md", session.time.created, session.slug))
 }
 
 async fn suggest_tool_part(
@@ -1565,8 +1715,8 @@ fn is_mcp_tool_permission(permission: &str) -> bool {
     permission.ends_with("_*") || permission.contains('_')
 }
 
-fn task_child_tools() -> Value {
-    json!({
+pub(crate) fn task_child_tools(state: &AppState, parent: &Session) -> Value {
+    let mut out = json!({
         "read": true,
         "glob": true,
         "grep": true,
@@ -1584,7 +1734,70 @@ fn task_child_tools() -> Value {
         "plan_exit": false,
         "mcp": true,
         "plugin": true,
-    })
+    });
+    apply_task_child_disable_map(
+        state,
+        parent,
+        out.as_object_mut().expect("static literal is an object"),
+    );
+    out
+}
+
+/// Compute the tools-disable map for a task subagent and merge it into
+/// `out`. Mirrors Bun's `tool/task.ts:163-167` policy:
+/// - Disable `task` when the parent agent has no
+///   `{permission: "task", action: "allow"}` rule (recursion guard).
+/// - Disable `todowrite` when the parent agent has no
+///   `{permission: "todowrite", action: "allow"}` rule.
+/// - Disable every entry in `cfg.experimental.primary_tools`.
+///
+/// `task` and `todowrite` are already statically disabled in
+/// `task_child_tools()`; the parent-allow checks above can re-enable
+/// them for parents that explicitly granted the permission. The
+/// `primary_tools` list always takes effect as a deny.
+fn apply_task_child_disable_map(state: &AppState, parent: &Session, out: &mut Map<String, Value>) {
+    let parent_rules = state
+        .session_agent(&parent.id)
+        .map(|name| state.agent_permission_rules(&name))
+        .unwrap_or_default();
+    if parent_allows(&parent_rules, "task") {
+        out.insert("task".to_string(), Value::Bool(true));
+    } else {
+        out.insert("task".to_string(), Value::Bool(false));
+    }
+    if parent_allows(&parent_rules, "todowrite") {
+        out.insert("todowrite".to_string(), Value::Bool(true));
+    } else {
+        out.insert("todowrite".to_string(), Value::Bool(false));
+    }
+    for tool in primary_tools_list(state) {
+        out.insert(tool, Value::Bool(false));
+    }
+}
+
+fn parent_allows(rules: &[PermissionRule], permission: &str) -> bool {
+    rules
+        .iter()
+        .any(|rule| rule.permission == permission && rule.action == "allow")
+}
+
+fn primary_tools_list(state: &AppState) -> Vec<String> {
+    state
+        .store
+        .config()
+        .data
+        .get("experimental")
+        .and_then(Value::as_object)
+        .and_then(|exp| exp.get("primary_tools"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn task_child_model(state: &AppState, agent: &str, parent: Option<Value>) -> Value {
@@ -1700,6 +1913,10 @@ async fn execute_task_tool(
     publish_task_child(state, sid, mid, pid, idx, call, time, &child.id);
     let model = task_child_model(state, &agent, model);
     let variant = task_child_variant(input, &model);
+    // Compute the tools-disable map up front so the parent-context lookups
+    // (`session_agent`, config) happen on the parent thread; the spawned
+    // blocking task only carries the resolved JSON value.
+    let child_tools = task_child_tools(state, &parent);
     let _slot = TASK_TOOL_SLOTS
         .clone()
         .acquire_owned()
@@ -1716,6 +1933,7 @@ async fn execute_task_tool(
     let child_agent = agent.clone();
     let child_model = model.clone();
     let child_variant = variant.clone();
+    let child_tools_value = child_tools;
     let result = tokio::task::spawn_blocking(move || {
         block_on_task_runtime(async move {
             let guard = crate::agent::turn::start_runner_with_parent(
@@ -1744,7 +1962,7 @@ async fn execute_task_tool(
                         parts: vec![json!({ "type": "text", "text": child_prompt })],
                         agent: Some(child_agent),
                         model: Some(child_model),
-                        tools: Some(task_child_tools()),
+                        tools: Some(child_tools_value),
                         variant: child_variant,
                         provider,
                         ..Default::default()
@@ -1768,6 +1986,25 @@ async fn execute_task_tool(
     })
     .await
     .map_err(|err| format!("Task runtime failed: {err}"))???;
+    let child_cost = state.store.assistant_cost_total(&child.id);
+    if child_cost > 0.0 {
+        match state
+            .store
+            .add_task_message_cost_record(sid, mid, &child.id, child_cost)
+        {
+            Ok(events) => {
+                if !events.is_empty() {
+                    crate::publish_events(
+                        state,
+                        state.store.paths().directory,
+                        parent.project_id,
+                        events,
+                    );
+                }
+            }
+            Err(err) => eprintln!("[kilo-server] task cost propagation failed: {err}"),
+        }
+    }
     if let Some(err) = result.info.get("error") {
         return Err(format!("Task failed: {err}"));
     }
@@ -1855,6 +2092,15 @@ fn invalid_tool_part(mid: &str, pid: &str, idx: usize, call: &ChatToolCall, time
     tool_error(mid, pid, idx, "invalid", &call.id, &call.input, err, time)
 }
 
+/// Sync, path-strict mutating-tool dispatch.
+///
+/// Retained for direct test access (`tests::permissions::*`) — the
+/// production live-stream path goes through `real_mutating_tool_part_gated`
+/// so that out-of-worktree paths surface a single
+/// `external_directory` permission ask instead of being rejected
+/// outright. Tests that need to assert the strict path-rejection shape
+/// keep calling this helper.
+#[cfg(test)]
 pub(crate) fn real_mutating_tool_part(
     root: &FsPath,
     mid: &str,
@@ -1872,6 +2118,59 @@ pub(crate) fn real_mutating_tool_part(
         "bash" => crate::agent::tools::bash::fake_bash_with_cancel(root, &call.input, Some(cancel)),
         _ => Err(format!("Unsupported tool: {tool}")),
     };
+    finalize_mutating_tool_part(mid, pid, idx, tool, call, time, res)
+}
+
+/// Async sibling of `real_mutating_tool_part` used by the live OpenAI
+/// streaming dispatch. Routes each mutating tool through its
+/// `*_gated` wrapper so an out-of-worktree path raises a single
+/// `external_directory` permission ask before the write side-effect
+/// runs. Path-strict behavior for the legacy direct callers (tests)
+/// stays in `real_mutating_tool_part`.
+#[allow(clippy::too_many_arguments)]
+async fn real_mutating_tool_part_gated(
+    state: &Arc<AppState>,
+    sid: &str,
+    root: &FsPath,
+    mid: &str,
+    pid: &str,
+    idx: usize,
+    tool: &str,
+    call: &ChatToolCall,
+    time: i64,
+    cancel: &AtomicBool,
+) -> Value {
+    let res = match tool {
+        "write" => fake_write_gated(state, sid, mid, pid, idx, root, &call.input).await,
+        "edit" => fake_edit_gated(state, sid, mid, pid, idx, root, &call.input).await,
+        "apply_patch" => fake_apply_patch_gated(state, sid, mid, pid, idx, root, &call.input).await,
+        "bash" => {
+            crate::agent::tools::bash::fake_bash_gated(
+                state,
+                sid,
+                mid,
+                pid,
+                idx,
+                root,
+                &call.input,
+                Some(cancel),
+            )
+            .await
+        }
+        _ => Err(format!("Unsupported tool: {tool}")),
+    };
+    finalize_mutating_tool_part(mid, pid, idx, tool, call, time, res)
+}
+
+fn finalize_mutating_tool_part(
+    mid: &str,
+    pid: &str,
+    idx: usize,
+    tool: &str,
+    call: &ChatToolCall,
+    time: i64,
+    res: Result<(String, String, Value), String>,
+) -> Value {
     match res {
         Ok((title, output, metadata)) => tool_completed(
             mid,
@@ -2007,14 +2306,21 @@ pub(crate) fn api_error() -> Value {
 }
 
 pub(crate) fn provider_error(err: ProviderError) -> Value {
-    json!({
-        "name": "APIError",
-        "data": {
-            "message": err.to_string(),
-            "isRetryable": false,
-            "metadata": { "source": "rust-provider" }
-        }
-    })
+    let mut data = json!({
+        "message": err.to_string(),
+        "isRetryable": err.is_retryable(),
+        "metadata": { "source": "rust-provider" }
+    });
+    if let Some(status) = err.status_code() {
+        data["statusCode"] = json!(status);
+    }
+    if let Some(body) = err.response_body() {
+        data["responseBody"] = json!(body);
+    }
+    if let Some(ms) = err.retry_after_ms() {
+        data["responseHeaders"] = json!({ "retry-after-ms": ms.to_string() });
+    }
+    json!({ "name": "APIError", "data": data })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2031,6 +2337,14 @@ pub(crate) fn tool_completed(
     time: i64,
 ) -> Value {
     let metadata = tool_metadata(tool, input, metadata);
+    // Bun parity: post-process the output through the truncation service
+    // before persisting (`tool/tool.ts:91-130`). Tools that already set
+    // `metadata.truncated` themselves (e.g. `bash`, which has its own
+    // 64 KiB local cap) are skipped. The 1 MiB ceiling below stays as a
+    // defense-in-depth safety net for the rare case where truncation
+    // can't write to disk.
+    let (output, metadata) = apply_truncate(output, metadata);
+    let output = crate::limits::truncate_tool_output(output);
     json!({
         "id": format!("{pid}_{idx}_{tool}"),
         "type": "tool",
@@ -2046,6 +2360,43 @@ pub(crate) fn tool_completed(
             "time": { "start": time, "end": time }
         },
     })
+}
+
+/// Run the tool-output truncate post-processor and merge its findings
+/// into the metadata payload. Returns `(possibly_previewed_output,
+/// updated_metadata)`. Skipped if the caller already populated
+/// `metadata.truncated`.
+fn apply_truncate(output: String, mut metadata: Value) -> (String, Value) {
+    let already_handled = metadata
+        .as_object()
+        .and_then(|map| map.get("truncated"))
+        .is_some();
+    if already_handled {
+        return (output, metadata);
+    }
+    let state_dir = kilo_store::Store::resolve_state_dir();
+    let result = crate::agent::tools::truncate::truncate_for_tool(&state_dir, &output);
+    if !result.truncated {
+        return (output, metadata);
+    }
+    if let Some(map) = metadata.as_object_mut() {
+        map.insert("truncated".to_string(), Value::Bool(true));
+        map.insert(
+            "originalBytes".to_string(),
+            Value::Number(result.original_bytes.into()),
+        );
+        map.insert(
+            "originalLines".to_string(),
+            Value::Number(result.original_lines.into()),
+        );
+        if let Some(path) = result.output_path.as_ref() {
+            map.insert(
+                "outputPath".to_string(),
+                Value::String(path.display().to_string()),
+            );
+        }
+    }
+    (result.preview, metadata)
 }
 
 pub(crate) fn tool_running(
@@ -2163,6 +2514,360 @@ pub(crate) fn prompt_text(parts: &[Value]) -> String {
     text
 }
 
+fn file_attachments(parts: &[Value]) -> Vec<ChatAttachment> {
+    parts
+        .iter()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("file"))
+        .filter_map(|part| {
+            let mime = part.get("mime").and_then(Value::as_str)?;
+            if mime == "text/plain" {
+                return None;
+            }
+            let url = part.get("url").and_then(Value::as_str)?;
+            if !url.starts_with("data:") {
+                return None;
+            }
+            Some(ChatAttachment {
+                mime: mime.to_string(),
+                url: url.to_string(),
+                filename: part
+                    .get("filename")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+// ---------- multimodal user-input resolvers ----------
+//
+// Bun's `session/prompt.ts` resolves three multimodal seams on the user
+// message before forwarding to the provider:
+//   1. `file://` URLs in `file` parts → read disk bytes, emit either
+//      inline text (text MIMEs) or base64 data URL attachments
+//      (image/PDF/octet-stream).
+//   2. Directory paths in `file` parts → recursive walk, emit one
+//      synthetic text block per source file (wrapped in `<file path=…>`),
+//      one attachment per image, capped to keep prompts bounded.
+//   3. `@<path>` mentions in user text → if the token resolves to an
+//      existing file under the worktree, inline the file content as a
+//      synthetic text block before the user's text.
+// MCP `resource` parts are not handled here — `agent::mcp_dispatch` does
+// not yet expose a `read_resource` helper, so these are deferred (TODO).
+//
+// All path resolution flows through `crate::util::paths::resolve_under`
+// so we cannot read outside the worktree. Text reads use the BOM-aware
+// `agent::tools::encoding::read_to_string` helper.
+
+const MULTIMODAL_FILE_BYTES_CAP: u64 = 1024 * 1024; // 1 MiB
+const MULTIMODAL_DIR_DEPTH_CAP: usize = 3;
+const MULTIMODAL_DIR_FILE_CAP: usize = 50;
+const MULTIMODAL_DIR_BYTES_CAP: u64 = 5 * 1024 * 1024; // 5 MiB
+
+struct ResolvedMultimodal {
+    /// Synthetic text blocks (each one a `<file path="...">…</file>`
+    /// envelope, joined by blank lines) that should be prepended BEFORE
+    /// the user's own text in the final ChatMessage content.
+    prefix: String,
+    /// Image/PDF/octet-stream attachments to forward alongside the
+    /// message — pre-existing data URL attachments from the stored
+    /// part list are preserved untouched.
+    attachments: Vec<ChatAttachment>,
+}
+
+fn resolve_user_multimodal(root: &FsPath, parts: &[Value], user_text: &str) -> ResolvedMultimodal {
+    let mut prefix_blocks: Vec<String> = Vec::new();
+    let mut attachments: Vec<ChatAttachment> = Vec::new();
+
+    // (1) preserve already-resolved data URL attachments from the part list.
+    attachments.extend(file_attachments(parts));
+
+    // (2) resolve `file://` URLs and directory references.
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) != Some("file") {
+            continue;
+        }
+        let Some(url) = part.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        if !url.starts_with("file://") {
+            // data: URLs are already covered by `file_attachments`;
+            // anything else (https://, etc.) is intentionally ignored.
+            continue;
+        }
+        let Some(rel) = parse_file_url(url) else {
+            continue;
+        };
+        let Ok(abs) = crate::util::paths::resolve_under(root, &rel) else {
+            // Path escaped the worktree — silently drop, never include.
+            continue;
+        };
+        ingest_path(&abs, &mut prefix_blocks, &mut attachments, 0);
+    }
+
+    // (3) resolve `@<path>` mentions in the user text.
+    for token in mention_tokens(user_text) {
+        let Ok(abs) = crate::util::paths::resolve_under(root, token) else {
+            continue;
+        };
+        if !abs.is_file() {
+            continue;
+        }
+        // @-mentions only inline files (never recursively expand a dir
+        // referenced by `@`), and we keep the same per-file caps.
+        ingest_file_at(&abs, token, &mut prefix_blocks, &mut attachments);
+    }
+
+    ResolvedMultimodal {
+        prefix: prefix_blocks.join("\n\n"),
+        attachments,
+    }
+}
+
+/// Strip the `file://` scheme from a URL and return a plain path string.
+/// Accepts both `file:///abs/path` and `file://relative/path` forms.
+fn parse_file_url(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("file://")?;
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    let decoded = percent_decode_simple(rest);
+    Some(decoded)
+}
+
+/// Minimal percent-decoder for path segments — only `%XX` triplets where
+/// XX is two hex digits. Anything else passes through verbatim.
+fn percent_decode_simple(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = hex_digit(bytes[i + 1]);
+            let lo = hex_digit(bytes[i + 2]);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(10 + (b - b'a')),
+        b'A'..=b'F' => Some(10 + (b - b'A')),
+        _ => None,
+    }
+}
+
+/// Ingest one path — file or directory — into the prefix/attachments
+/// accumulators. Directories recurse with bounded depth and file/byte
+/// caps; once a cap is hit we emit a single truncation marker.
+fn ingest_path(
+    abs: &FsPath,
+    prefix: &mut Vec<String>,
+    attachments: &mut Vec<ChatAttachment>,
+    depth: usize,
+) {
+    if abs.is_dir() {
+        ingest_dir(abs, abs, prefix, attachments, depth);
+        return;
+    }
+    if abs.is_file() {
+        // Use the path-relative-to-itself for the `<file path=…>` label
+        // when ingesting a top-level file; mention/dir paths re-key
+        // appropriately via their callers.
+        let label = abs.to_string_lossy().into_owned();
+        ingest_file_at(abs, &label, prefix, attachments);
+    }
+}
+
+/// Walk a directory recursively (depth-capped, blocklist-filtered), and
+/// emit one prefix block per text file or one attachment per image.
+/// After hitting either the file-count or total-byte cap, emits a
+/// single `[directory contents truncated]` text block and returns.
+fn ingest_dir(
+    base: &FsPath,
+    current: &FsPath,
+    prefix: &mut Vec<String>,
+    attachments: &mut Vec<ChatAttachment>,
+    depth: usize,
+) {
+    if depth > MULTIMODAL_DIR_DEPTH_CAP {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(current) else {
+        return;
+    };
+    let mut sorted: Vec<_> = entries.flatten().collect();
+    sorted.sort_by_key(|e| e.file_name());
+    for entry in sorted {
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(base)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        if crate::util::git::generated_like(&rel) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
+            ingest_dir(base, &path, prefix, attachments, depth + 1);
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        // Cap check: emit truncation marker once and stop.
+        let used_bytes: u64 = prefix.iter().map(|b| b.len() as u64).sum::<u64>()
+            + attachments.iter().map(|a| a.url.len() as u64).sum::<u64>();
+        if prefix.len() + attachments.len() >= MULTIMODAL_DIR_FILE_CAP
+            || used_bytes >= MULTIMODAL_DIR_BYTES_CAP
+        {
+            prefix.push("[directory contents truncated]".to_string());
+            return;
+        }
+        ingest_file_at(&path, &rel, prefix, attachments);
+    }
+}
+
+/// Read a single file under the worktree, classify by extension, and
+/// dispatch into either the prefix accumulator (text MIMEs) or the
+/// attachment list (image/PDF/octet-stream). Reads beyond the 1 MiB
+/// file cap are skipped entirely.
+fn ingest_file_at(
+    abs: &FsPath,
+    label: &str,
+    prefix: &mut Vec<String>,
+    attachments: &mut Vec<ChatAttachment>,
+) {
+    let Ok(meta) = std::fs::metadata(abs) else {
+        return;
+    };
+    if !meta.is_file() {
+        return;
+    }
+    if meta.len() > MULTIMODAL_FILE_BYTES_CAP {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(abs) else {
+        return;
+    };
+    let mime = mime_for_extension(abs);
+    if mime.starts_with("text/") || mime == "application/json" {
+        let (text, _) = crate::agent::tools::encoding::read_to_string(&bytes);
+        prefix.push(format!("<file path=\"{label}\">\n{text}\n</file>"));
+        return;
+    }
+    // Binary-ish: emit as a base64 data URL attachment.
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let url = format!("data:{};base64,{}", mime, STANDARD.encode(&bytes));
+    let filename = abs
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    attachments.push(ChatAttachment {
+        mime: mime.to_string(),
+        url,
+        filename,
+    });
+}
+
+/// Lean ext→MIME table for the multimodal resolver. Anything not listed
+/// falls back to `application/octet-stream` (treated as a binary file
+/// attachment downstream).
+fn mime_for_extension(path: &FsPath) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("pdf") => "application/pdf",
+        Some("txt") => "text/plain",
+        Some("md" | "markdown") => "text/markdown",
+        Some("json") => "application/json",
+        Some("html" | "htm") => "text/html",
+        Some("css") => "text/css",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Iterate `@\S+` tokens in user text, returning each token's path
+/// portion (without the leading `@`). No regex dependency — we scan
+/// byte-by-byte and harvest runs of non-whitespace after each `@`.
+fn mention_tokens(text: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'@' {
+            i += 1;
+            continue;
+        }
+        // `@` must follow whitespace or be the very first character so
+        // we don't pick up email-ish substrings (`foo@bar` etc).
+        if i > 0 {
+            let prev = bytes[i - 1];
+            if !prev.is_ascii_whitespace() {
+                i += 1;
+                continue;
+            }
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
+            end += 1;
+        }
+        if end > start {
+            out.push(&text[start..end]);
+        }
+        i = end;
+    }
+    out
+}
+
+fn environment_details(ctx: Option<&Value>) -> Option<String> {
+    let ctx = ctx?;
+    let mut lines = vec![
+        "<environment_details>".to_string(),
+        format!(
+            "Current time: {}",
+            chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z")
+        ),
+    ];
+    if let Some(value) = ctx.get("activeFile").and_then(Value::as_str) {
+        lines.push(format!("Active file: {value}"));
+    }
+    if let Some(files) = ctx.get("visibleFiles").and_then(Value::as_array) {
+        if !files.is_empty() {
+            lines.push("Visible files:".to_string());
+            for file in files.iter().filter_map(Value::as_str) {
+                lines.push(format!("  {file}"));
+            }
+        }
+    }
+    if let Some(tabs) = ctx.get("openTabs").and_then(Value::as_array) {
+        if !tabs.is_empty() {
+            lines.push("Open tabs:".to_string());
+            for tab in tabs.iter().filter_map(Value::as_str) {
+                lines.push(format!("  {tab}"));
+            }
+        }
+    }
+    lines.push("</environment_details>".to_string());
+    Some(lines.join("\n"))
+}
+
 pub(crate) fn user_info(paths: &KiloPath, input: &PromptInput) -> Value {
     let mut info = json!({
         "role": "user",
@@ -2193,4 +2898,368 @@ pub(crate) fn user_info(paths: &KiloPath, input: &PromptInput) -> Value {
         info["editorContext"] = value.clone();
     }
     info
+}
+
+#[cfg(test)]
+mod multimodal_tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn unique_root() -> PathBuf {
+        static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!(
+            "kilo-parts-multimodal-{}-{}-{seq}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+            std::process::id()
+        );
+        std::env::temp_dir().join(name)
+    }
+
+    fn file_url_for(abs: &FsPath) -> String {
+        // Use a `file:///` form regardless of platform; resolve_under
+        // strips the leading slash and then re-anchors to the worktree.
+        let s = abs.to_string_lossy().replace('\\', "/");
+        if s.starts_with('/') {
+            format!("file://{s}")
+        } else {
+            format!("file:///{s}")
+        }
+    }
+
+    #[test]
+    fn file_url_resolves_to_input_file_with_data_url() {
+        let root = unique_root();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("doc.pdf");
+        fs::write(&path, b"%PDF-1.4 fake pdf bytes").unwrap();
+
+        let parts = vec![json!({
+            "type": "file",
+            "url": file_url_for(&path),
+        })];
+        let resolved = resolve_user_multimodal(&root, &parts, "");
+        assert!(
+            resolved.prefix.is_empty(),
+            "binary files must not produce inline text, got: {:?}",
+            resolved.prefix
+        );
+        assert_eq!(resolved.attachments.len(), 1);
+        assert_eq!(resolved.attachments[0].mime, "application/pdf");
+        assert!(
+            resolved.attachments[0]
+                .url
+                .starts_with("data:application/pdf;base64,"),
+            "expected data URL, got {}",
+            resolved.attachments[0].url
+        );
+        assert_eq!(resolved.attachments[0].filename.as_deref(), Some("doc.pdf"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_url_text_resolves_to_input_text() {
+        let root = unique_root();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        fs::write(&path, "hello *world*").unwrap();
+
+        let parts = vec![json!({
+            "type": "file",
+            "url": file_url_for(&path),
+        })];
+        let resolved = resolve_user_multimodal(&root, &parts, "");
+        assert!(resolved.attachments.is_empty());
+        assert!(
+            resolved.prefix.contains("hello *world*"),
+            "missing inlined text body: {:?}",
+            resolved.prefix
+        );
+        assert!(resolved.prefix.starts_with("<file path=\""));
+        assert!(resolved.prefix.contains("</file>"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_url_outside_worktree_is_rejected() {
+        let root = unique_root();
+        fs::create_dir_all(&root).unwrap();
+        // Path with `..` in it must be refused by resolve_under.
+        let parts = vec![json!({
+            "type": "file",
+            "url": "file:///../etc/passwd",
+        })];
+        let resolved = resolve_user_multimodal(&root, &parts, "");
+        assert!(resolved.prefix.is_empty());
+        assert!(resolved.attachments.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn directory_expansion_walks_recursively_with_blocklist() {
+        let root = unique_root();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("node_modules").join("dep")).unwrap();
+        fs::write(root.join("src").join("a.txt"), "alpha").unwrap();
+        fs::write(root.join("src").join("b.md"), "beta").unwrap();
+        fs::write(
+            root.join("node_modules").join("dep").join("ignored.txt"),
+            "should not appear",
+        )
+        .unwrap();
+
+        let parts = vec![json!({
+            "type": "file",
+            "url": file_url_for(&root.join("src")),
+        })];
+        let resolved = resolve_user_multimodal(&root, &parts, "");
+        assert!(
+            resolved.prefix.contains("alpha"),
+            "expected alpha in prefix: {:?}",
+            resolved.prefix
+        );
+        assert!(resolved.prefix.contains("beta"));
+        assert!(
+            !resolved.prefix.contains("should not appear"),
+            "node_modules content leaked into prefix: {:?}",
+            resolved.prefix
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn directory_expansion_caps_at_size_limit() {
+        let root = unique_root();
+        fs::create_dir_all(root.join("many")).unwrap();
+        for i in 0..(MULTIMODAL_DIR_FILE_CAP + 5) {
+            fs::write(root.join("many").join(format!("f{i:02}.txt")), "x").unwrap();
+        }
+        let parts = vec![json!({
+            "type": "file",
+            "url": file_url_for(&root.join("many")),
+        })];
+        let resolved = resolve_user_multimodal(&root, &parts, "");
+        let truncated = resolved
+            .prefix
+            .lines()
+            .any(|line| line.contains("[directory contents truncated]"));
+        assert!(
+            truncated,
+            "expected truncation marker after {} files; prefix len = {}",
+            MULTIMODAL_DIR_FILE_CAP,
+            resolved.prefix.len()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn at_mention_in_user_text_inlines_existing_file() {
+        let root = unique_root();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("README.md"), "# header").unwrap();
+
+        let parts: Vec<Value> = vec![];
+        let resolved = resolve_user_multimodal(&root, &parts, "look at @README.md please");
+        assert!(
+            resolved.prefix.contains("# header"),
+            "missing inlined README contents: {:?}",
+            resolved.prefix
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn at_mention_with_nonexistent_path_stays_as_text() {
+        let root = unique_root();
+        fs::create_dir_all(&root).unwrap();
+
+        let parts: Vec<Value> = vec![];
+        let resolved = resolve_user_multimodal(&root, &parts, "see @does-not-exist for context");
+        assert!(
+            resolved.prefix.is_empty(),
+            "non-resolving @-mention must not inject prefix content: {:?}",
+            resolved.prefix
+        );
+        assert!(resolved.attachments.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mention_tokens_only_after_whitespace_or_start() {
+        // Email-ish substrings must not be picked up.
+        let tokens = mention_tokens("contact me at foo@bar.com or @real");
+        assert_eq!(tokens, vec!["real"]);
+    }
+}
+
+#[cfg(test)]
+mod reasoning_replay_tests {
+    //! Cross-turn encrypted reasoning round-trip: persisted assistant
+    //! `reasoning` parts must rebuild as `ChatResponseItem::Reasoning`
+    //! entries on the assistant turn so the next request's `input[]`
+    //! gets a `{type: "reasoning", id, encrypted_content, summary}`
+    //! cache-hit anchor. Tests build the persisted-part shape directly
+    //! and exercise the `reasoning_part_responses` projection that
+    //! `real_messages` uses for the assistant role.
+
+    use super::*;
+
+    fn reasoning_part(item_id: &str, encrypted: &str, text: &str) -> Value {
+        let mut part = json!({
+            "type": "reasoning",
+            "text": text,
+            "time": { "start": 0 },
+        });
+        if !item_id.is_empty() {
+            part["itemID"] = json!(item_id);
+        }
+        if !encrypted.is_empty() {
+            part["encryptedContent"] = json!(encrypted);
+        }
+        part
+    }
+
+    fn function_call_part(call_id: &str, tool: &str, input: Value) -> Value {
+        json!({
+            "type": "tool",
+            "tool": tool,
+            "callID": call_id,
+            "state": {
+                "status": "completed",
+                "input": input,
+                "output": "ok",
+            },
+        })
+    }
+
+    #[test]
+    fn real_messages_emits_reasoning_response_items_for_persisted_parts() {
+        let parts = vec![
+            reasoning_part("rs_1", "enc-blob-1", "thinking step one"),
+            reasoning_part("rs_1", "enc-blob-1", "thinking step two"),
+            reasoning_part("rs_2", "enc-blob-2", "second item summary"),
+            json!({ "type": "text", "text": "final answer" }),
+        ];
+        let items = reasoning_part_responses(&parts);
+        assert_eq!(items.len(), 2, "one ChatResponseItem per distinct itemID");
+        match &items[0] {
+            ChatResponseItem::Reasoning(item) => {
+                assert_eq!(item.id, "rs_1");
+                assert_eq!(item.encrypted_content, "enc-blob-1");
+                assert_eq!(
+                    item.summary,
+                    vec![
+                        "thinking step one".to_string(),
+                        "thinking step two".to_string()
+                    ],
+                    "summary deltas under the same itemID concat in arrival order"
+                );
+            }
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
+        match &items[1] {
+            ChatResponseItem::Reasoning(item) => {
+                assert_eq!(item.id, "rs_2");
+                assert_eq!(item.encrypted_content, "enc-blob-2");
+                assert_eq!(item.summary, vec!["second item summary".to_string()]);
+            }
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_messages_skips_reasoning_parts_without_encrypted_content() {
+        let parts = vec![
+            // Missing encryptedContent — legacy/stale, must be dropped.
+            json!({
+                "type": "reasoning",
+                "text": "stale summary",
+                "itemID": "rs_legacy",
+                "time": { "start": 0 },
+            }),
+            // Empty string encryptedContent — also drop.
+            reasoning_part("rs_empty", "", "empty blob"),
+            // Missing itemID — can't anchor cache, drop.
+            json!({
+                "type": "reasoning",
+                "text": "no anchor",
+                "encryptedContent": "blob",
+                "time": { "start": 0 },
+            }),
+            // Valid one to confirm filter is correct.
+            reasoning_part("rs_ok", "enc-ok", "ok summary"),
+        ];
+        let items = reasoning_part_responses(&parts);
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            ChatResponseItem::Reasoning(item) => {
+                assert_eq!(item.id, "rs_ok");
+                assert_eq!(item.encrypted_content, "enc-ok");
+            }
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_messages_orders_reasoning_before_assistant_text() {
+        // Mixed assistant-turn parts: reasoning interleaved with tool
+        // parts. The projection must yield reasoning entries first
+        // (their position in the `responses` vec is what `responses_input`
+        // walks for the head-of-turn replay).
+        let parts = vec![
+            reasoning_part("rs_a", "enc-a", "before tool"),
+            function_call_part("call_1", "read", json!({"path": "x"})),
+            reasoning_part("rs_b", "enc-b", "after tool"),
+            json!({ "type": "text", "text": "answer" }),
+        ];
+        let mut combined = reasoning_part_responses(&parts);
+        combined.extend(tool_part_calls(&parts));
+        // Reasoning items first, in persisted order.
+        assert!(matches!(combined[0], ChatResponseItem::Reasoning(_)));
+        assert!(matches!(combined[1], ChatResponseItem::Reasoning(_)));
+        // Tool call follows.
+        match &combined[2] {
+            ChatResponseItem::FunctionCall(call) => {
+                assert_eq!(call.id, "call_1");
+                assert_eq!(call.name, "read");
+            }
+            other => panic!("expected FunctionCall after reasoning, got {other:?}"),
+        }
+        // Sanity: reasoning ids in order.
+        match (&combined[0], &combined[1]) {
+            (ChatResponseItem::Reasoning(a), ChatResponseItem::Reasoning(b)) => {
+                assert_eq!(a.id, "rs_a");
+                assert_eq!(b.id, "rs_b");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn real_messages_handles_assistant_with_no_reasoning_parts() {
+        // Regression: non-reasoning models / pre-Wave-5-U sessions emit
+        // turns with zero reasoning parts. The projection must produce
+        // an empty Vec so the assembled `ChatMessage.responses` only
+        // carries the existing tool_call / function_output entries.
+        let parts = vec![
+            json!({ "type": "text", "text": "plain answer" }),
+            function_call_part("call_x", "grep", json!({"pattern": "foo"})),
+        ];
+        let items = reasoning_part_responses(&parts);
+        assert!(
+            items.is_empty(),
+            "no reasoning parts should yield no Reasoning items, got {items:?}"
+        );
+    }
 }

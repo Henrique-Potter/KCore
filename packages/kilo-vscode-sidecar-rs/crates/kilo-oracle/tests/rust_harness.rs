@@ -3,6 +3,13 @@
 //! These helpers intentionally live under integration tests so the main
 //! `kilo-oracle` library keeps its Bun-oracle boundary and does not depend on
 //! `kilo-server` in normal builds.
+//!
+//! This module is `#[path]`-included from multiple oracle integration test
+//! binaries; each binary uses a different subset of the helpers, so rustc's
+//! per-binary unused-fn detection always reports a long false-positive list.
+//! Suppress the noise here once instead of decorating every helper.
+
+#![allow(dead_code)]
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

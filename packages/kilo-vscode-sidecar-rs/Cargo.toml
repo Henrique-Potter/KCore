@@ -20,7 +20,7 @@ version = "0.0.0-preview.0"
 
 [workspace.dependencies]
 async-stream = "0.3"
-axum = { version = "0.8", features = ["http1", "tokio"] }
+axum = { version = "0.8", features = ["http1", "tokio", "ws"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive"] }

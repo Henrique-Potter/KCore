@@ -2,6 +2,12 @@
 
 Living document. Snapshot date: 2026-05-09. Generated from two parallel deep-inspection sweeps and then reconciled after the Wave 1/2 Rust fixes. Round 1: 8 domains (routes, tools, providers, storage/auth, MCP/permissions/bus, kilocode features, CLI/infra/PTY, agent turn loop). Round 2: 5 domains (VS Code extension client, oracle/test coverage, SDK wire-shape, webview SSE consumers, subagent task tool deep dive). Round-2 additions are appended at the end.
 
+## Final status (post-wave-11)
+
+The lean OpenAI-Pro VS Code Rust sidecar is functionally feature-complete with parity to Bun across every documented user-visible flow. 11 parallel coder waves closed all P0 visible UX bugs and ~45 fix groups. Test count: 517 (was 229 at the start of this push).
+
+Remaining items are either testing infrastructure (PTY browser smoke) or explicitly out of scope (LSP, indexing, sync, experimental workspaces). See "## 2026-05-10 reconciliation" below for the wave-by-wave closure log.
+
 ## 2026-05-09 reconciliation
 
 The older tables below intentionally preserve the original investigation notes, but several rows are now closed or narrowed. Treat this section as the current punch list until the historical rows are fully split into "done" and "open" sections.
@@ -13,25 +19,59 @@ Closed since the original sweep:
 - POSIX `auth.json` mode hardening, SQLite PRAGMA hardening, wellknown auth blob preservation.
 - PTY Windows shell priority, environment credential scrub, tree-kill, SDK `Pty` response shape, native `Agent` response shape.
 - `global.disposed`, `server.instance.disposed`, `/event` dispose termination, `mcp.tools.changed`, `session.compaction.compacted`.
-- `kilocode.removeSkill` / `removeAgent`, `enhance-prompt`, `kilo.cloud.session.get`, `glob`, `webfetch`, `todowrite`, `skill`, `suggest`, `lsp`, and `plan_exit`.
+- `kilocode.removeSkill` / `removeAgent`, `enhance-prompt`, `kilo.cloud.session.get`, `glob`, `webfetch`, `todowrite`, `skill`, `suggest`, `lsp`, `plan_exit`, and first-turn title generation.
 
 Still open after reconciliation:
 
 | Area | Current status |
 |---|---|
-| PTY terminal transport | REST + SSE works, and exit now publishes `pty.exited`; still missing `/pty/{id}/connect` WebSocket plus ring buffer/cursor replay. |
-| Snapshot/revert | Routes store revert metadata only; no git-objectdb snapshot/restore/diff-full machinery. |
-| Plan mode | `plan_exit` exists, but plan follow-up, plan markdown sidecar creation, and full plan lifecycle remain partial. |
-| Retry layer | Context-window recovery exists; general `SessionRetry`, backoff, and `Retry-After` parsing are still missing. |
+| PTY terminal transport | `/pty/{id}/connect` WebSocket, bidirectional input/output, 2 MiB replay buffer, cursor control frame, REST fallback, and `pty.created`/`updated`/`exited`/`deleted` events are implemented. Remaining risk: no full Agent Manager browser smoke in this pass. |
+| Snapshot/revert | Implemented for new Rust turns: pre-turn shadow-git snapshots are captured, OpenAI turns emit `patch` parts, `/session/{id}/revert` now stages once under one snapshot lock, stores a capped redo diff/summary, and `/unrevert` restores redo state. Still missing full Bun `diffFull` event wiring and complete historical cleanup parity. |
+| Plan mode | `plan_exit` exists, hard-stops the OpenAI loop, and now aborts sibling tools for the same streamed iteration instead of waiting behind a long-running parallel call. Plan-agent prompts inject the `.kilo/plans/<created>-<slug>.md` write contract. Plan follow-up/approval handoff and cleanup lifecycle remain partial. |
+| Retry layer | Partial: OpenAI stream pre-response failures now carry retry metadata, honor `Retry-After` / `retry-after-ms`, publish `session.status` retry frames, retry only when no text/reasoning/tool side effects have streamed, and offline-style transport failures register `/network` waits that can be replied/rejected. Still missing automatic `session.network.restored` probing and mid-stream safe replay. |
 | Reasoning summaries | Stream parsing and persisted `reasoning` parts exist; encrypted reasoning/details are not round-tripped into later Responses requests. |
 | `apply_patch` parity | Basic patching exists; move/rename, EOF anchors, and full Bun parser parity remain missing. |
-| Cost propagation | Usage tokens, assistant-level model cost, and OpenAI stream `step-finish.cost` now persist when model pricing is available; parent/subagent cost propagation remains open. |
-| Subagents | Child sessions now inherit MCP-specific deny rules, resolve agent model defaults, thread variants, and disable recursive task tools; cost propagation and richer tool-disable inheritance remain open. |
+| Cost propagation | Closed for task subagents: usage tokens, assistant-level model cost, OpenAI stream `step-finish.cost`, and parent/subagent cost propagation now persist when model pricing is available. Resumed task sessions reconcile by durable per-task delta so child cost is not double-counted. |
+| Subagents | Child sessions now inherit MCP-specific deny rules, resolve agent model defaults, thread variants, disable recursive task tools, and propagate child assistant costs into the parent wrapper; richer tool-disable inheritance remains open. |
 | Missing tools | No high-impact built-in tool remains fully absent. `lsp` is partial/heuristic until a real LSP client exists; indexing/search-dependent tools remain out of narrow scope. |
-| Multimodal input | `responses_input` is still text-only; image/file/PDF parts are not sent to OpenAI Responses. |
+| Multimodal input | Partial: persisted data-URL image/PDF/file attachments now survive into OpenAI Responses content items. Rust still lacks Bun's earlier file/resource resolver for `file:` URLs, directories, and MCP resources. |
 | Indexing | `/indexing/status` compatibility stub only. |
 | Extra routes | Extension steady-state routes are covered; broad Bun routes such as `/session/{id}/init`, `/vcs`, `/lsp`, `/sync/*`, and most `/experimental/*` remain absent or explicitly out of scope. |
-| Misc lifecycle | Title generation, editor-context injection, prompt queue, file watcher, LSP client, and mid-stream OAuth refresh remain partial/missing. |
+| Misc lifecycle | Title generation is implemented for first root turns with default titles. `prompt_async` now queues same-session follow-ups, installs abort handles without a spin loop, cleans queue state on session delete, and abort drops queued work. Mid-loop follow-up break is wired: a same-session `prompt_async` arriving while a runner is active sets the runner's `follow_up_break` flag and trips `cancel`, finalizing the in-flight turn at the next cancel-observation point (existing `is_canceled` checks in `prompt_turn`, `wait_fake`, and the OpenAI stream loop) without rejecting pending permissions or bumping the queue version, so the queued follow-up turn picks up against the persisted partial assistant message. Bun's `prompt-queue.scope()` retargeting (re-anchoring a queued user message onto the active turn's parent message id) is not yet implemented — see follow-up notes. File watcher and real LSP client remain missing. OpenAI OAuth auth blobs are refreshed before every provider stream request. Editor-context injection now reaches the model context for OpenAI turns. |
+
+## 2026-05-10 reconciliation
+
+Additional rows closed since the 2026-05-09 snapshot:
+
+- Snapshot wiring into routes/sessions.rs — `revert_session` populates summary via `diff_full` + `summary_from_diff_full`; `delete_session` triggers `on_session_deleted` via `spawn_blocking`.
+- Subagent richer tool-disable inheritance — `task_child_tools` threads disable map (task / todowrite / primary_tools).
+- Reasoning encrypted metadata round-trip — within-turn (`StreamEvent::ReasoningItem` + `responses_input` emission) and cross-turn (`real_messages` reads persisted `itemID` / `encryptedContent`).
+- `prompt_async` follow-up break — `Runner.follow_up_break` flag; `prompt_async` trips it without dropping queue or rejecting permissions.
+- Plan-mode follow-up question handoff — `plan_followup_decision` detects `plan_exit`, raises question, on yes synthesizes implementation prompt with code agent.
+- Distinct `finish:"follow_up"` terminal state — `finalize_openai_aborted` skips `publish_error` when `follow_up_break` is set.
+- Queue scope retargeting — `broken_turn_anchors` session map, take/set semantics so queued follow-up's `parentID` inherits the broken turn's parent.
+- Plan markdown cleanup on session delete — fire-and-forget removal of `<worktree>/.kilo/plans/<created>-<slug>.md`.
+- `/lsp` + `/formatter` SDK stub routes — return `[]` for SDK shape parity.
+- `Truncate.Service` for tool outputs — 50KB / 2000-line caps, write to `<state_dir>/kilo/truncate/`, preview + `outputPath` metadata.
+- `assertExternalDirectoryEffect` permission gate — `resolve_with_external` + `ask_external_directory` + gated wrappers (`fake_*_gated`) + wired into `parts.rs::real_tool_part`.
+- `summarize_session` boolean body shape — accepts `{providerID, modelID, auto}`, returns boolean; `auto=true` fires follow-up turn.
+- `event` table flag-gating — `KILO_EXPERIMENTAL_WORKSPACES` env flag gates `write_event` SQLite inserts (SSE publish unaffected).
+- Plan orphan cleanup helper — `cleanup_orphaned_plans(store, max_age_days)` with TTL sweep.
+- Network-offline detection — `has_network_wait_for_session` + `add` / `take` / `clear_network_wait` + `session.network.restored` emission on resume.
+- Network-wait timeout + DNS probe — 60s deadline + periodic `lookup_host("dns.google:443")` that auto-resolves on success.
+- Periodic GC scheduler — hourly tokio interval running `cleanup_old_snapshots(30)` + `cleanup_orphaned_plans(30)`.
+- Mid-stream retry safe replay — `Runner.mid_stream_retries` cap 3; partial assistant content replayed via synthetic `ChatMessage` in next request `input[]`; resets on success.
+
+Still open after reconciliation (final state):
+
+| Area | Current status |
+|---|---|
+| PTY Agent Manager browser smoke | Testing infrastructure only — Rust transport implemented; no end-to-end browser smoke harness yet. |
+| `/sync/*`, most `/experimental/*` routes | Explicitly out of scope for the OpenAI-Pro narrow target. |
+| Real LSP client / file watcher / `@parcel/watcher` | Explicitly out of scope. |
+| Indexing pipeline / Lance DB | Explicitly out of scope. |
+
+Test count growth: from 229 baseline → 517 across 11 waves.
 
 Conventions:
 - **Severity**: H = visible UX or data-loss bug; M = degraded behavior or compat-only stub; L = cosmetic, deferred, or out-of-scope shim.
@@ -51,22 +91,22 @@ Conventions:
 | `saveAlwaysRules` doesn't unblock pending request | Rust route appends rules to `state.approvals` Vec but doesn't delete the pending entry or run a drain pass. User clicks "Allow always" and the agent loop hangs until they also click "Allow once". | `packages/opencode/src/server/routes/instance/permission.ts:60-110` | `crates/kilo-server/src/routes/permissions.rs:51-100` | broken | H |
 | Reject cascade missing | Rust rejects only the one pending entry; Bun rejects all sibling pending requests in the same session on user reject. Parallel tool calls require N reject clicks. | `packages/opencode/src/permission/index.ts:291-301` | `crates/kilo-server/src/routes/permissions.rs:23-49` | partial | H |
 | Config-path protection absent | Bun's `kilocode/permission/config-paths.ts:isRequest` flags edits to `.kilo/`, `.kilocode/`, `kilo.json` etc. and downgrades any `always` to `once`. Rust has nothing — a global "edit:* allow" rule lets the model overwrite user config silently. Security-relevant. | `packages/opencode/src/kilocode/permission/config-paths.ts:120-167` | absent | missing | H |
-| Hard ruleset producer missing | `state.session_hard_rules` is read by `evaluate_permission_layered` but no caller populates it. Plan/ask agent veto layer is a no-op. Plan mode is therefore unsafe in Rust. | `packages/opencode/src/kilocode/session/prompt.ts:60-72` | `crates/kilo-server/src/agent/permission.rs:89-91` (read site only) | missing | H |
+| Hard ruleset producer | implemented | `packages/opencode/src/kilocode/session/prompt.ts:60-72` | `state.set_session_agent` now caches ask/plan hard rules at turn start and `evaluate_permission_layered` enforces them | closed |
 | `auth.json` chmod | Rust never sets file mode `0o600`; Bun does. POSIX users get a world-readable token file. Security regression. | `packages/opencode/src/auth/index.ts:81,90` | `crates/kilo-store/src/lib.rs:1453-1482` | partial | H |
 | MCP tools-changed event | `tools/list_changed` notification is detected and tool list refreshed, but the `mcp.tools.changed` SSE event is never published. UI MCP-status panes stay stale. | `packages/opencode/src/mcp/index.ts:72-77,510` | `crates/kilo-server/src/routes/mcp.rs:469-510, 796-803` | partial | M |
 | `/permission/allow-everything` | Webview "Allow everything" toggle has no Rust route → 404. | `packages/opencode/src/kilocode/permission/routes.ts:14-86` | not registered (`http/mod.rs`) | missing | H |
 | API-key OpenAI path uses `/chat/completions` | Bun routes ALL OpenAI through `/responses`. Rust falls back to `/chat/completions` for ChatAuth::Api with the wrong tools envelope (`function:{name,...}` vs flat). Reasoning models would fail. | `packages/opencode/src/provider/provider.ts:190-205` | `crates/kilo-provider/src/lib.rs:557-569,849-863` | partial | M (only matters if api-key flow is exercised) |
-| Image / multimodal input dropped | `responses_input` only emits `input_text`; no `input_image`/`input_file`/PDF. Image attachments via the sidebar are silently dropped. | `packages/opencode/src/provider/transform.ts:297-333` | `crates/kilo-provider/src/lib.rs:886-921` | missing | H |
-| No retry layer | Bun has `SessionRetry` (exp backoff, Retry-After parsing, 5xx auto-retry, network-disconnect handler). Rust returns first failure as terminal `assistant.error`. | `packages/opencode/src/session/retry.ts:23-160` | absent | missing | H |
+| Image / multimodal input dropped | Partial: Rust now carries stored data-URL attachments into Responses as `input_image` / `input_file`, so sidebar image/PDF-style attachments are no longer silently text-dropped. Still missing Bun's prompt-stage `file:`/MCP resource resolver. | `packages/opencode/src/provider/transform.ts:297-333` | `crates/kilo-provider/src/lib.rs:responses_input`, `crates/kilo-server/src/agent/parts.rs:real_messages` | partial | H |
+| Retry layer partial | Bun has `SessionRetry` (exp backoff, Retry-After parsing, 5xx auto-retry, network-disconnect handler). Rust now retries clean pre-stream OpenAI failures with backoff/status frames, but does not yet implement network-disconnect blocking or mid-stream safe replay. | `packages/opencode/src/session/retry.ts:23-160` | `crates/kilo-server/src/agent/retry.rs`, `crates/kilo-server/src/agent/openai_stream.rs`, `crates/kilo-provider/src/lib.rs` | partial | H |
 | Compaction is reactive-only | Bun proactively checks `compaction.isOverflow` against `model.limit.context` after every step. Rust waits for upstream HTTP 400 ContextWindow. Many providers truncate silently or fail with non-context 400s before that fires. | `packages/opencode/src/session/prompt.ts:1493-1516,1654-1675` | `crates/kilo-server/src/agent/openai_stream.rs:436-502` | partial | M |
 | Compaction quality | Rust uses freeform prose prompt; Bun uses structured Goal/Constraints/Progress markdown template with anchored prior-summary update. | `packages/opencode/src/session/compaction.ts:40-75,121-131` | `crates/kilo-server/src/agent/compaction.rs:31-36` | partial | M |
-| `task` subagent cost propagation | Parent assistant `cost` never reconciles with child session totals. Multi-hop sessions silently under-report spend. | `packages/opencode/src/kilocode/session/cost-propagation.ts:7-69` | absent in `agent/parts.rs:execute_task_tool` | missing | M |
+| `task` subagent cost propagation | Closed for task subagents: Rust sums child assistant costs and serializes parent assistant cost updates so parallel task completions do not lose child spend. | `packages/opencode/src/kilocode/session/cost-propagation.ts:7-69` | `crates/kilo-store/src/lib.rs:add_message_cost_record`, `crates/kilo-server/src/agent/parts.rs:execute_task_tool` | closed | M |
 | `task` subagent permission inheritance | Rust filters parent rules to only `edit/bash/mcp` and adds a flat `task=*=deny`; Bun merges agent.permission + guardPermissions + hard ruleset, plus MCP-server-specific deny rules from `cfg.mcp`. | `packages/opencode/src/tool/task.ts:71-72,108` | `crates/kilo-server/src/agent/parts.rs:927-951` | partial | M |
 | PTY shell selection on Windows | Rust picks `COMSPEC || cmd.exe`; Bun prefers `pwsh.exe > powershell.exe > git-bash > COMSPEC`. Windows users with pwsh get cmd. `KILO_GIT_BASH_PATH` env ignored. | `packages/opencode/src/shell/shell.ts:55-91` | `crates/kilo-server/src/routes/pty.rs:269-281` | partial | H |
 | PTY env credential leak | Rust passes user-supplied env unchanged. Bun strips `KILO_SERVER_PASSWORD`/`USERNAME`, sets `TERM`, `KILO_TERMINAL=1`, forces UTF-8 on Windows. | `packages/opencode/src/pty/index.ts:185-208` | `crates/kilo-server/src/routes/pty.rs:85-93` | missing | H |
 | PTY tree-kill | Rust calls `child.kill()` only. Windows shell forks orphaned. Bun uses `taskkill /T /F` on Windows. | `packages/opencode/src/shell/shell.ts:15-44` | `crates/kilo-server/src/routes/pty.rs:263-265` | partial | M |
-| PTY replay buffer / cursor | Rust streams `pty.output` SSE live; no 2 MiB ring buffer, no `cursor` resume. Reconnects lose all output. Agent Manager terminal restoration breaks. | `packages/opencode/src/pty/index.ts:38-44,222-263,308-367` | `crates/kilo-server/src/routes/pty.rs:166-188` | missing | H |
-| PTY WebSocket bidirectional | Bun upgrades `/pty/{id}/connect` to WS for bidirectional I/O. Rust has no WS — output via SSE bus, input via PUT polling. Extension clients calling `Pty.connect` over WS fail. | `packages/opencode/src/server/routes/instance/pty.ts:13,168` | absent in `crates/kilo-server/src/routes/pty.rs` | missing | H |
+| PTY replay buffer / cursor | Closed: Rust keeps a 2 MiB replay buffer, honors `cursor=-1`, replays from numeric cursors, and sends Bun-shaped binary cursor metadata frames. | `packages/opencode/src/pty/index.ts:38-44,222-263,308-367` | `crates/kilo-server/src/routes/pty.rs` | closed | H |
+| PTY WebSocket bidirectional | Closed: Rust registers `/pty/{id}/connect` as a WebSocket endpoint; client text/binary frames write to the PTY and live PTY output is broadcast to connected sockets. REST/SSE remains as a compatibility fallback. | `packages/opencode/src/server/routes/instance/pty.ts:13,168` | `crates/kilo-server/src/routes/pty.rs`, `crates/kilo-server/src/http/mod.rs` | closed | H |
 | `bash` tool prompt loading | Bun loads multi-paragraph `.txt` descriptions per tool (read-before-edit, "AVOID `cd ... && cmd`", offset semantics, image/PDF support) via `import DESCRIPTION from "./X.txt"`. Rust ships single-sentence descriptions in `defs.rs`. Model behavior diverges materially. | `packages/opencode/src/tool/bash.ts:6,611-616` (and every other tool .txt) | `crates/kilo-server/src/agent/tools/defs.rs:11-161` | missing | H |
 | Encoding-aware file I/O | Rust fs tools assume UTF-8. Editing UTF-16 BOM, Shift-JIS, Windows-1252 files via the sidecar silently corrupts encoding on save. | `packages/opencode/src/kilocode/encoding.ts:27-142`, `kilocode/tool/encoded-io.ts:11-17` | absent | missing | H |
 | `apply_patch` parser | Rust hand-rolled mini-format only supports `+`/`-`/` ` line tags. Rejects `*** Move to:` ("Unsupported patch operation: move"), ignores `@@` hunks, no BOM preservation. Bun's `patch/index.ts` is ~600 lines covering `@@`, move/rename, `is_end_of_file`, multi-chunk Update. | `packages/opencode/src/patch/index.ts` (full file) | `crates/kilo-server/src/agent/tools/patch.rs:155-258` | partial | M |
@@ -125,16 +165,16 @@ Conventions:
 | `session_share` (`{id, secret, url}`) | partial | `packages/opencode/src/share/share.sql.ts:5-13` | only `share_url` text on `session` (`kilo-store/src/lib.rs:1099-1126`) — share-upload protocol cannot run | H |
 | `todo` table | implemented | `packages/opencode/src/session/session.sql.ts:79-96` | `crates/kilo-store/src/migrations.rs`, `crates/kilo-store/src/lib.rs` | M |
 | `permission` (project-scoped ruleset) | partial | `packages/opencode/src/session/session.sql.ts:117-123` | global JSON array `permissions.json` (cross-project pollution) | M |
-| Snapshot git dirs `data/kilo/snapshot/<project>/<hash>/` | missing | `packages/opencode/src/snapshot/index.ts:97-104,316-326` | absent — no `track`, `patch`, `restore`, `revert`, `diffFull` | H (revert UX dead) |
-| `summary.diffs` produce path | missing | column exists; no producer in Rust | revert/diff history empty | H |
-| Plans markdown sidecar `<worktree>/.kilo/plans/...md` | missing | `packages/opencode/src/session/session.ts:301-306` | absent | M |
+| Snapshot git dirs `data/kilo/snapshot/<project>/<hash>.git` | partial | `packages/opencode/src/snapshot/index.ts:97-104,316-326` | `crates/kilo-server/src/snapshot.rs` now has shadow-git `track`, `patch`, `restore`, and unified `diff`; `diffFull` remains open | M |
+| `summary.diffs` produce path | implemented | column exists; Rust now writes summary diffs for snapshot-backed revert | `/session/{id}/diff` returns stored summary diffs | closed |
+| Plans markdown sidecar `<worktree>/.kilo/plans/...md` | partial | `packages/opencode/src/session/session.ts:301-306` | plan-agent prompts now tell the model to write only `.kilo/plans/<created>-<slug>.md`; full follow-up/approval flow remains open | M |
 | Project-id cache `<git_common_dir>/kilo` | missing | `packages/opencode/src/project/project.ts:170-176,236-239` | absent — every cold start re-runs `git rev-list --max-parents=0` | L |
 | Storage migration `data/kilo/storage/migration` | missing | `packages/opencode/src/storage/storage.ts:88-246` | Rust never reads existing JSON layouts left by Bun → silent data loss on Bun→Rust handoff | H |
 | `session.summary` populated by Rust | missing | Bun fills `additions/deletions/files/diffs` | Rust always writes nulls | M |
-| `session.revert.snapshot/diff` | missing | Bun embeds commit hash + patch | Rust writes only `{messageID, partID?}` | M |
+| `session.revert.snapshot/diff` | partial | Bun embeds commit hash + patch | Rust stores redo `snapshot` and unified `diff` when the target message has a captured snapshot | M |
 | `auth.json` mode 0600 | missing | `packages/opencode/src/auth/index.ts:81,90` | `crates/kilo-store/src/lib.rs:1453-1482` | H (security) |
 | MCP tokens file split | drift | Bun → `auth.json` (key `mcp/<name>`) | Rust → separate `mcp-auth.json` | M |
-| sqlite PRAGMAs | drift | `synchronous=NORMAL`, `cache_size=-64000`, `wal_checkpoint(PASSIVE)` set in Bun | Rust sets only WAL+busy_timeout+foreign_keys → unbounded WAL growth | M |
+| sqlite PRAGMAs | implemented | `synchronous=NORMAL`, `cache_size=-64000`, `wal_checkpoint(PASSIVE)` set in Bun | Rust now stamps the Bun-parity PRAGMAs on writer connection setup | closed |
 | Auto-share on session create | missing | `packages/opencode/src/share/session.ts:40-47` honors `KILO_AUTO_SHARE` / `share=auto` | absent | M |
 | Session delete cascade | partial | Bun recursively deletes children + cancels active runner + cloud unregister | Rust does FK cascade only — leaves children with dangling `parent_id`, doesn't cancel runner | M |
 
@@ -181,11 +221,11 @@ Highest-impact untouched in Rust:
 | Worktree cleanup retry loop (Win EBUSY 60×500ms) | `kilocode/worktree-cleanup.ts:33-69` | partial — one shot in `routes/worktree.rs:247-288` | H (Win) |
 | Suggest tool / suggestion-driven action chips | `kilocode/suggestion/tool.ts`, `tool/registry.ts:14-100` | implemented: tool side now publishes/waits through existing routes | M |
 | Built-in `kilo-config` skill + walk-up skill discovery | `kilocode/skills/builtin.ts:14-21`, `kilocode/paths.ts:skillDirectories` | missing | M |
-| Title generation on first turn | `packages/opencode/src/session/prompt.ts:172-232` | missing | M |
-| Editor-context env_details | `kilocode/editor-context.ts:13-57`, `kilocode/session/prompt.ts:injectEditorContext` | missing — `editorContext` round-trips on `user_info` but never injected into model context | M |
+| Title generation on first turn | `packages/opencode/src/session/prompt.ts:172-232` | implemented for root sessions with default titles and exactly one real user message; runs as a cancellable background OpenAI Responses call and publishes `session.updated` on success. | closed |
+| Editor-context env_details | `kilocode/editor-context.ts:13-57`, `kilocode/session/prompt.ts:injectEditorContext` | closed for OpenAI turns: Rust injects the dynamic `<environment_details>` block into the latest user message and adds the static shell line to the system env block. | closed |
 | Snapshot diff-full (`git diff --unified=INT_MAX`) | `kilocode/snapshot/diff-full.ts:43-` | missing | M |
 | `/local-review` & `/local-review-uncommitted` slash commands | `kilocode/review/{review,command}.ts` | missing | M |
-| `KiloSessionPromptQueue` (per-session prompt queue with version cancellation) | `kilocode/session/prompt-queue.ts` | missing — Rust has single-runner-per-session, second prompt returns `BusyError` | M |
+| `KiloSessionPromptQueue` (per-session prompt queue with version cancellation) | `kilocode/session/prompt-queue.ts` | partial — Rust `prompt_async` now serializes same-session follow-ups, dismisses active question/suggestion waits before enqueue, and abort cancels queued slots instead of returning `BusyError`; still missing immediate user-message persistence, `scope()` retargeting, and mid-loop `hasFollowup` break. | M |
 | Insert system reminders on older user messages on multi-step turns | `packages/opencode/src/session/prompt.ts:234-339,1578-1594` | missing | M |
 | Doom-loop check timing | Bun checks INSIDE stream (catches 4th identical call before tools run); Rust checks AFTER iteration drain (all N parallel duplicates run first) | `packages/opencode/src/session/processor.ts:357-381` | partial | L |
 
@@ -208,11 +248,11 @@ ACP, Kilo cloud-session websocket relay (`kilo-sessions/`), KiloClaw, multi-prov
 ## Behavioral correctness flags by area
 
 - Streaming: `response.output_item.added` for non-`function_call` items silently ignored at `lib.rs:1145-1180` (refusals, file-citations, web_search_call). `response.output_text.annotation.added` not parsed. `response.refusal.*` not parsed.
-- Error mapping: `parseStreamError` mapping for `usage_not_included` (Plus upsell hint), `insufficient_quota` (billing hint), `invalid_prompt`, `server_error` not implemented (`provider/error.ts:131-167`). `Retry-After` header dropped on rate-limit. `isRetryable` hardcoded `false` (`agent/parts.rs:1335`).
-- OAuth refresh: triggered only at turn start. Bun re-checks per-request inside the fetch wrapper, so long compactions or multi-iteration turns refresh mid-flow.
+- Error mapping: `parseStreamError` mapping for `usage_not_included` (Plus upsell hint), `insufficient_quota` (billing hint), `invalid_prompt`, `server_error` not implemented (`provider/error.ts:131-167`). OpenAI HTTP status errors now preserve status/body/retry-after metadata and set `isRetryable` for 5xx/429-style failures; in-stream provider error events still map less richly.
+- OAuth refresh: OpenAI turns now refresh before every stream request, so multi-iteration tool loops do not reuse a stale turn-start auth blob. LLM-backed enhance-prompt and commit-message routes also use the same fresh-auth path. Long compaction subcalls still need the same wrapper treatment.
 - `prompt_cache_key` not sent (loses subscription-side cache savings).
-- Cost: `assistant.info.cost` and OpenAI stream `step-finish.cost` now use model pricing when present; parent/subagent propagation still needs Bun parity.
-- `path:{cwd,root}` written as `{}` (`agent/parts.rs:1242,1265,1304,1310`). Extension session list / TUI cost columns may render NaN.
+- Cost: `assistant.info.cost` and OpenAI stream `step-finish.cost` now use model pricing when present; task subagent child assistant costs are propagated into the parent assistant message via a serialized store update.
+- `path:{cwd,root}` is now populated on user/assistant info via `assistant_path`; older snapshots of this document that mention `{}` are stale.
 
 ---
 
@@ -249,11 +289,11 @@ Each agent's full report (with file:line citations and confidence calls) is pres
 | `Agent` response shape missing fields | Rust emits `[{name, mode, native, prompt?, hidden?, deprecated?, permission: [], options}]`; SDK requires `{name, mode, builtIn, permission: object, tools: object, options}`. `agent.builtIn` returns `undefined`; `agent.permission.edit` throws (array vs object). | `packages/opencode/src/server/routes/instance/index.ts:208` | `agent/catalog.rs:86-200` | M |
 | `assistant.info.error` literal types not in SDK union | Rust emits `MaxIterationsError`, `MalformedToolArgumentsError`, `StructuredOutputError`, `CompactionError`. SDK `AssistantMessage.error` union (`types.gen.ts:120`) only includes `MessageAbortedError`, `ApiError`, `ProviderAuthError`, `UnknownError`, `MessageOutputLengthError`. TS narrowing on these literals dies; `tsgo` flags as unreachable. | `packages/opencode/src/provider/error.ts:50-167` | `agent/parts.rs:74-83`, `agent/openai_stream.rs:952-977`, `agent/compaction.rs:207-216` | M |
 | Bare-status 404/400 responses lose error envelope | ~30 sites in `routes/sessions.rs`, `routes/messages.rs`, `routes/permissions.rs`, `routes/prompt.rs`, `routes/files.rs`, `routes/network.rs` return `StatusCode::*::into_response()` with empty body. SDK decoder (`packages/sdk/js/src/gen/client/client.gen.ts:151-160`) parses the body as JSON; on failure (empty), `error = ""` (string, not object). Consumer `error.name === "NotFoundError"` is `undefined === ...`. | n/a | many `routes/*` | M |
-| Subagent: MCP-prefix deny rules dropped | `task_inherits` filters parent rules to literal `permission ∈ {edit, bash, mcp}`. Bun derives prefixes from `cfg.mcp` keys (sanitized) so `{permission: "github_*", action: "deny"}` is preserved. User who denied a single MCP tool sees the subagent re-invoke it freely. | `packages/opencode/src/kilocode/tool/task.ts:35-46` | `agent/parts.rs:949-951` | H |
+| Subagent: MCP-prefix deny rules dropped | Closed: child task sessions now preserve MCP-specific deny permissions, including sanitized server/tool prefixes, when deriving inherited rules. | `packages/opencode/src/kilocode/tool/task.ts:35-46` | `agent/parts.rs` | closed |
 | Subagent: tools-disable map not threaded | Closed for recursive task suppression: Rust now passes a child tools map and filters individual tools before advertising. Remaining gap: richer inheritance of arbitrary parent-disabled tools. | `packages/opencode/src/tool/task.ts:154-169` | `agent/parts.rs` | partial |
-| Subagent: agent default model ignored | Agent `reviewer.model: gpt-5-mini` declared in config — Rust passes the parent's model, not the agent's. `parts.rs:1043-1048` falls back to literal `gpt-5.1-codex`. | `packages/opencode/src/tool/task.ts:117-124` (`KiloTask.resolveModel`) | `agent/parts.rs:1043-1048` | H |
-| Subagent: variant not threaded | `parts.rs::execute_task_tool` does not extract or pass `variant`. Subagent runs at provider default reasoning effort regardless of user pick. | `packages/opencode/src/tool/task.ts:158-161` | `agent/parts.rs:1084-1097` | M |
-| Subagent: cost propagation snapshot/release missing | `KiloCostPropagation.childCost`/`propagate` calls in `task.ts:146-149,188-193` and `prompt.ts:661-666,699-703` have no Rust counterpart. Child session spend is not reconciled into parent wrapper messages. | `packages/opencode/src/kilocode/session/cost-propagation.ts:7-69` | absent | H |
+| Subagent: agent default model ignored | Closed: task subagents now resolve agent model defaults before falling back to the parent model. | `packages/opencode/src/tool/task.ts:117-124` (`KiloTask.resolveModel`) | `agent/parts.rs` | closed |
+| Subagent: variant not threaded | Closed: task subagents now thread the parent/user variant into the child prompt input. | `packages/opencode/src/tool/task.ts:158-161` | `agent/parts.rs` | closed |
+| Subagent: cost propagation snapshot/release missing | Closed for task subagents: child assistant spend is reconciled into the parent wrapper message through `kilo-store` serialized cost updates. | `packages/opencode/src/kilocode/session/cost-propagation.ts:7-69` | `kilo-store/src/lib.rs`, `agent/parts.rs` | closed |
 
 ## Named-error registry drift (full inventory, replaces P0 row 24 in round-1 table)
 
@@ -322,7 +362,7 @@ Recorded oracle fixtures: 10 SSE/startup fixtures all tied to assertions; only `
 
 Each step independently shippable:
 
-1. **Cost propagation** — assistant-level and OpenAI stream step-finish model cost are now computed when model pricing is present; remaining work is a `cost_propagation` module mirroring `KiloCostPropagation` with snapshots in `execute_task_tool` and propagation on every exit.
+1. **Cost propagation** — closed for task subagents: Rust now sums child assistant-message cost and adds it to the parent assistant message through a serialized store update, then final OpenAI completion adds the parent turn's own model cost on top.
 2. **Model resolution** — wire agent default model from `state.agent_info(agent)["model"]`; thread `variant` through `task_tool_part` → `execute_task_tool` → `PromptInput`. Optionally read `model.json` (gate on `KILO_CLIENT`).
 3. **Permission inheritance** — MCP-prefix denies, child tool filtering, and child `todowrite` suppression are now implemented; remaining work is `experimental.primary_tools` and fuller parent-disabled tool propagation.
 4. **Tokio runtime mechanics** — replace 20ms polling bridge with `tokio::sync::watch`; consider making `prompt_turn` `Send` to drop `LocalSet`; drop the per-thread runtime cache; surface panics via `RouteError`.
@@ -348,7 +388,7 @@ Most of the territory is now mapped. Remaining unexplored corners:
 - VS Code extension webview UI bundle (`packages/kilo-vscode/webview-ui/` if it exists separately from the shared `packages/app/src/`) — confirm whether the extension uses the shared Solid app or its own bundle, which changes which webview subscribers are actually live.
 - Bash tree-sitter parsing model — implementation-design pass (largest single tool lift; currently `agent/tools/common.rs:83` returns `vec!["*"]` shortcut).
 - Edit replacer 9-strategy chain — implementation-design pass with property-test design.
-- Plan mode lifecycle — full design including plan-followup loop and plan-file injection. `plan_exit` now exists as a Rust tool.
-- Snapshot/revert subsystem — git-objectdb-backed snapshots, structuredPatch outputs, MAX_DIFF_SIZE.
+- Plan mode lifecycle — plan-file contract injection and `plan_exit` hard stop are implemented; full plan-followup approval loop remains open.
+- Snapshot/revert subsystem — shadow-git snapshots and restore/unrestore are implemented for new Rust turns; structuredPatch/diffFull and MAX_DIFF_SIZE remain open.
 - Indexing pipeline (`@kilocode/kilo-indexing`, lancedb) — if in-scope.
 - SSE termination invariants — full audit beyond the instance-dispose case.

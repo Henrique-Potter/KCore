@@ -160,6 +160,8 @@ const STDOUT_RING_CAPACITY_BYTES: usize = 64 * 1024;
 pub struct SidecarHandle {
     pub ready: ReadyLine,
     pub password: String,
+    /// Operating-system process id for external resource sampling.
+    pub pid: u32,
     /// The cwd the process is running in. Tests use this to point
     /// fixture-storing utilities at the right `.kilo` directory.
     pub cwd: PathBuf,
@@ -210,6 +212,9 @@ impl SidecarHandle {
                 e
             ))
         })?;
+        let pid = child
+            .id()
+            .ok_or_else(|| OracleError::other("spawned sidecar did not expose a process id"))?;
 
         let stdout = child
             .stdout
@@ -317,6 +322,7 @@ impl SidecarHandle {
         Ok(Self {
             ready: parsed,
             password,
+            pid,
             cwd,
             child: Some(child),
             _temp,

@@ -12,7 +12,7 @@ use axum::{
 };
 use kilo_protocol::{PromptInput, SessionCreateInput};
 use serde_json::json;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1631,6 +1631,228 @@ async fn prompt_openai_stream_abort_does_not_wait_for_running_tool() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Wave 5 V follow-up: when a same-session `prompt_async` arrives mid-turn,
+/// the route trips both `cancel` and `follow_up_break` on the active runner.
+/// The OAuth stream's finalize path observes `follow_up_break` and stamps
+/// `info.finish = "follow_up"` instead of the canonical `MessageAbortedError`
+/// envelope. The webview consumer no longer fires an "aborted" error toast
+/// for the intentional break — `publish_error` is skipped, only `publish_idle`
+/// and `publish_turn_close(_, "follow_up")` reach the bus.
+#[tokio::test]
+async fn follow_up_break_finalizes_with_follow_up_finish_and_no_error_publish() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    std::fs::create_dir_all(root.join("repo")).unwrap();
+    let server = stream_provider_stalling_server(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+    )
+    .await;
+    state
+        .store
+        .set_provider_auth("openai", oauth_auth())
+        .unwrap();
+    write_openai_config(&root, &server.url);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+
+    // Pre-register a runner for the session and pre-arm `follow_up_break`
+    // so the route's mid-turn-followup path is reproduced without spinning
+    // up a second `prompt_async`. `prompt_turn` doesn't claim a runner
+    // slot itself (that's `prompt_guarded`'s job), so this manual insert
+    // is the moral equivalent of the prompt-route's pre-flight signal.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let follow_up_break = Arc::new(AtomicBool::new(false));
+    state.runners.lock().unwrap().insert(
+        session.id.clone(),
+        crate::Runner {
+            cancel: cancel.clone(),
+            follow_up_break: follow_up_break.clone(),
+            parent: None,
+            abort: std::sync::Mutex::new(None),
+            awaiting_plan_followup: Arc::new(AtomicBool::new(false)),
+            mid_stream_retries: Arc::new(AtomicU8::new(0)),
+        },
+    );
+
+    let mut rx = state.bus.subscribe();
+    let cancel_handle = cancel.clone();
+    let follow_up_handle = follow_up_break.clone();
+    let state_for_task = state.clone();
+    let sid = session.id.clone();
+    let task = tokio::spawn(async move {
+        prompt_turn(
+            &state_for_task,
+            &sid,
+            PromptInput {
+                parts: vec![json!({ "type": "text", "text": "long" })],
+                model: Some(json!({ "providerID": "openai", "modelID": "gpt-5.1-codex" })),
+                ..Default::default()
+            },
+            cancel_handle,
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Mirror the route: trip both flags. The order matches
+    // `routes/prompt.rs:90-94` — follow_up_break first, then cancel.
+    follow_up_handle.store(true, Ordering::SeqCst);
+    cancel.store(true, Ordering::SeqCst);
+
+    let out = tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .expect("turn must unblock on cancel")
+        .expect("task join")
+        .expect("prompt turn");
+
+    // Assistant finalizes with `finish: "follow_up"` and NO error envelope.
+    assert_eq!(
+        out.info["finish"], "follow_up",
+        "follow-up break must stamp finish: 'follow_up'"
+    );
+    assert!(
+        out.info.get("error").map(|v| v.is_null()).unwrap_or(true),
+        "follow-up break must omit error envelope, got: {:?}",
+        out.info.get("error")
+    );
+
+    // Storage parity: the persisted assistant message also lacks the
+    // MessageAbortedError envelope.
+    let page = state.store.messages(&session.id, None, None).unwrap();
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items[1].info["finish"], "follow_up");
+    assert!(
+        page.items[1]
+            .info
+            .get("error")
+            .map(|v| v.is_null())
+            .unwrap_or(true),
+        "persisted assistant info must not carry an error envelope"
+    );
+
+    // Bus parity: the turn closes with reason `follow_up`, no `session.error`
+    // event fires, and `session.idle` still lands.
+    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|event| event.as_global())
+        .collect();
+    let kinds: Vec<&str> = events.iter().map(|e| e.payload.kind.as_str()).collect();
+    assert!(
+        !kinds.contains(&"session.error"),
+        "follow-up break must NOT publish session.error, got kinds: {kinds:?}"
+    );
+    let close = events
+        .iter()
+        .find(|e| e.payload.kind == "session.turn.close")
+        .expect("session.turn.close must fire");
+    assert_eq!(close.payload.properties["reason"], "follow_up");
+    assert!(
+        events.iter().any(|e| e.payload.kind == "session.idle"),
+        "session.idle must still fire on follow-up break"
+    );
+
+    // Cleanup the manually inserted runner.
+    state.runners.lock().unwrap().remove(&session.id);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Regression: a user-driven abort (cancel set, follow_up_break clear) must
+/// continue to surface the canonical `MessageAbortedError` envelope and
+/// publish `session.error` + `session.turn.close` with reason `interrupted`.
+/// Mirrors the existing mid-stream-abort coverage but registers a Runner so
+/// the new finalize branch is exercised on its `false` arm rather than the
+/// `runners.get(id) == None` fallback.
+#[tokio::test]
+async fn regular_abort_still_publishes_error() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    std::fs::create_dir_all(root.join("repo")).unwrap();
+    let server = stream_provider_stalling_server(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+    )
+    .await;
+    state
+        .store
+        .set_provider_auth("openai", oauth_auth())
+        .unwrap();
+    write_openai_config(&root, &server.url);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let follow_up_break = Arc::new(AtomicBool::new(false));
+    state.runners.lock().unwrap().insert(
+        session.id.clone(),
+        crate::Runner {
+            cancel: cancel.clone(),
+            follow_up_break: follow_up_break.clone(),
+            parent: None,
+            abort: std::sync::Mutex::new(None),
+            awaiting_plan_followup: Arc::new(AtomicBool::new(false)),
+            mid_stream_retries: Arc::new(AtomicU8::new(0)),
+        },
+    );
+
+    let mut rx = state.bus.subscribe();
+    let cancel_handle = cancel.clone();
+    let state_for_task = state.clone();
+    let sid = session.id.clone();
+    let task = tokio::spawn(async move {
+        prompt_turn(
+            &state_for_task,
+            &sid,
+            PromptInput {
+                parts: vec![json!({ "type": "text", "text": "abort me" })],
+                model: Some(json!({ "providerID": "openai", "modelID": "gpt-5.1-codex" })),
+                ..Default::default()
+            },
+            cancel_handle,
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Cancel only — leave follow_up_break clear (user-driven abort).
+    cancel.store(true, Ordering::SeqCst);
+
+    let out = tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .expect("turn must unblock on cancel")
+        .expect("task join")
+        .expect("prompt turn");
+
+    assert_eq!(
+        out.info["error"]["name"], "MessageAbortedError",
+        "user-driven abort must still surface MessageAbortedError"
+    );
+    assert_eq!(out.info["finish"], "aborted");
+
+    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|event| event.as_global())
+        .collect();
+    let error_event = events
+        .iter()
+        .find(|e| e.payload.kind == "session.error")
+        .expect("session.error must fire on user-driven abort");
+    assert_eq!(
+        error_event.payload.properties["error"]["name"],
+        "MessageAbortedError"
+    );
+    let close = events
+        .iter()
+        .find(|e| e.payload.kind == "session.turn.close")
+        .expect("session.turn.close must fire");
+    assert_eq!(close.payload.properties["reason"], "interrupted");
+
+    state.runners.lock().unwrap().remove(&session.id);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn prompt_turn_openai_oauth_structured_output_captures_tool_payload_into_info() {
     let root = unique_root();
@@ -1969,5 +2191,433 @@ async fn compact_session_aborts_promptly_when_cancel_fires_during_summarize() {
         "expected CompactionError::Cancelled, got: {err:?}"
     );
 
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn reasoning_item_round_trips_to_next_responses_request() {
+    // P0 reasoning round-trip: when iteration 1 surfaces a reasoning
+    // `output_item.done` with `encrypted_content`, iteration 2's
+    // Responses request must echo the item back as
+    // `{type:"reasoning", id, encrypted_content}` so the upstream
+    // cache can attach to the prior trace. Mirrors Bun's converter
+    // at `provider/sdk/copilot/responses/convert-to-openai-responses-input.ts:185-244`.
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    std::fs::create_dir_all(root.join("repo").join("repo")).unwrap();
+    std::fs::write(
+        root.join("repo").join("repo").join("note.txt"),
+        "fixture ok",
+    )
+    .unwrap();
+    let server = stream_provider_sequence(vec![
+            // Iter 1: reasoning item with encrypted_content + a function_call
+            // so the loop continues into iter 2. The reasoning summary is
+            // optional from a cache-hit standpoint but exercises the
+            // `summary_text` round-trip too.
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs_round\",\"type\":\"reasoning\"}}\n\n\
+data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_round\",\"summary_index\":0,\"delta\":\"plan read\"}\n\n\
+data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_round\",\"type\":\"reasoning\",\"encrypted_content\":\"ENC_BLOB\"}}\n\n\
+data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"call_id\":\"call_read\",\"name\":\"read\",\"delta\":\"{\\\"filePath\\\":\"}\n\n\
+data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"\\\"repo/note.txt\\\"}\"}\n\n\
+data: {\"type\":\"response.function_call_arguments.done\",\"output_index\":1,\"call_id\":\"call_read\",\"name\":\"read\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n\
+data: [DONE]\n\n".to_string(),
+            // Iter 2: terminal text answer. We assert on the request body
+            // captured for THIS request — it must carry the reasoning item.
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n\
+data: [DONE]\n\n".to_string(),
+        ])
+        .await;
+    state
+        .store
+        .set_provider_auth("openai", oauth_auth())
+        .unwrap();
+    write_openai_config(&root, &server.url);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+
+    let out = prompt_turn(
+        &state,
+        &session.id,
+        PromptInput {
+            parts: vec![json!({ "type": "text", "text": "read note" })],
+            model: Some(json!({
+                "providerID": "openai",
+                "modelID": "gpt-5.1-codex",
+                "capabilities": { "toolcall": true }
+            })),
+            tools: Some(json!(true)),
+            ..Default::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .expect("prompt turn");
+
+    // Sanity: tool ran and the reasoning summary was persisted alongside
+    // the encrypted_content (so a future persistence reload can rebuild
+    // it for cross-turn replay).
+    let reasoning = out
+        .parts
+        .iter()
+        .find(|part| part.get("type").and_then(|value| value.as_str()) == Some("reasoning"))
+        .expect("reasoning part persisted");
+    assert_eq!(reasoning["text"], "plan read");
+    assert_eq!(reasoning["itemID"], "rs_round");
+    assert_eq!(reasoning["encryptedContent"], "ENC_BLOB");
+
+    let bodies = server.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2);
+    let body = &bodies[1];
+    // Iter 2 request must echo the reasoning item back.
+    assert!(
+        body.contains("\"type\":\"reasoning\""),
+        "iter-2 body missing reasoning input item: {body}"
+    );
+    assert!(
+        body.contains("\"id\":\"rs_round\""),
+        "iter-2 body missing reasoning id: {body}"
+    );
+    assert!(
+        body.contains("\"encrypted_content\":\"ENC_BLOB\""),
+        "iter-2 body missing encrypted_content: {body}"
+    );
+    // Sibling tool round-trip still has to be intact.
+    assert!(
+        body.contains("\"type\":\"function_call\""),
+        "iter-2 body missing function_call: {body}"
+    );
+    assert!(
+        body.contains("\"call_id\":\"call_read\""),
+        "iter-2 body missing function_call_output: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+// ---------------------------------------------------------------------------
+// Mid-stream retry coverage. When the OpenAI Responses stream errors AFTER
+// content has streamed (text deltas / reasoning / tool calls), the agent
+// loop replays the iteration with the partial assistant content appended
+// to the next request's `input[]` so the model continues coherently.
+// Capped at `MID_STREAM_RETRY_CAP` (3) per turn; reset on a clean stream.
+// ---------------------------------------------------------------------------
+
+/// Register a Runner for the session so the mid-stream retry path
+/// (which gates on `state.runners`) can read and bump the retry
+/// counter. Returns the cancel handle for the test driver. Mirrors
+/// the pre-existing follow-up-break manual setup at test lines
+/// 1668 / 1788 — kept inline rather than promoted to `common.rs`
+/// because no other module needs it yet.
+fn install_runner(state: &Arc<crate::AppState>, sid: &str) -> Arc<AtomicBool> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    state.runners.lock().unwrap().insert(
+        sid.to_string(),
+        crate::Runner {
+            cancel: cancel.clone(),
+            follow_up_break: Arc::new(AtomicBool::new(false)),
+            parent: None,
+            abort: std::sync::Mutex::new(None),
+            awaiting_plan_followup: Arc::new(AtomicBool::new(false)),
+            mid_stream_retries: Arc::new(AtomicU8::new(0)),
+        },
+    );
+    cancel
+}
+
+#[tokio::test]
+async fn mid_stream_retry_recovers_after_partial_text() {
+    // Drop the default 1s back-off so the test body finishes in well
+    // under a second. Production users still see the full delay.
+    std::env::set_var("KILO_MID_STREAM_RETRY_MS", "10");
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    std::fs::create_dir_all(root.join("repo")).unwrap();
+    let server = stream_provider_sequence(vec![
+        // Stream 1: partial text then a mid-stream error. The agent
+        // loop must NOT terminate the turn — it should replay with
+        // the partial assistant content as additional context.
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello \"}\n\n\
+data: {\"type\":\"error\",\"error\":{\"message\":\"upstream connection reset\"}}\n\n\
+data: [DONE]\n\n"
+            .to_string(),
+        // Stream 2: continuation. The model "picks up" where the
+        // first cut off; the closing text + completion lands as
+        // appended deltas on the same assistant message.
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"world\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n\
+data: [DONE]\n\n"
+            .to_string(),
+    ])
+    .await;
+    state
+        .store
+        .set_provider_auth("openai", oauth_auth())
+        .unwrap();
+    write_openai_config(&root, &server.url);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+    let cancel = install_runner(&state, &session.id);
+
+    let out = prompt_turn(
+        &state,
+        &session.id,
+        PromptInput {
+            parts: vec![json!({ "type": "text", "text": "say hi" })],
+            model: Some(json!({ "providerID": "openai", "modelID": "gpt-5.1-codex" })),
+            ..Default::default()
+        },
+        cancel,
+    )
+    .await
+    .expect("prompt turn must succeed via mid-stream retry");
+
+    // Final assistant message holds both halves of the streamed text.
+    let text_part = out
+        .parts
+        .iter()
+        .find(|part| part.get("type").and_then(|v| v.as_str()) == Some("text"))
+        .expect("text part");
+    assert_eq!(text_part["text"], "Hello world");
+    assert!(
+        out.info.get("error").is_none(),
+        "no terminal error envelope"
+    );
+
+    // The retry round must echo the partial assistant content into the
+    // request `input[]` so the model continues from the cutoff (option
+    // 2: no `previous_response_id` needed).
+    let bodies = server.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2, "expected exactly two upstream requests");
+    let retry_body = &bodies[1];
+    assert!(
+        retry_body.contains("\"role\":\"assistant\""),
+        "retry body missing partial assistant context: {retry_body}",
+    );
+    assert!(
+        retry_body.contains("Hello "),
+        "retry body missing partial text: {retry_body}",
+    );
+
+    // Counter resets to 0 once the retry stream completes cleanly.
+    let counter_after = state
+        .runners
+        .lock()
+        .unwrap()
+        .get(&session.id)
+        .map(|runner| runner.mid_stream_retries.load(Ordering::SeqCst));
+    assert_eq!(counter_after, Some(0), "counter must reset on clean turn");
+
+    state.runners.lock().unwrap().remove(&session.id);
+    std::env::remove_var("KILO_MID_STREAM_RETRY_MS");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn mid_stream_retry_caps_at_three_attempts() {
+    std::env::set_var("KILO_MID_STREAM_RETRY_MS", "10");
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    std::fs::create_dir_all(root.join("repo")).unwrap();
+    // 4 errored streams: original + 3 retries. After the cap is hit,
+    // the loop must finalize with a terminal error envelope rather
+    // than open a 5th upstream connection.
+    let errored = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"frag\"}\n\n\
+data: {\"type\":\"error\",\"error\":{\"message\":\"upstream blew up\"}}\n\n\
+data: [DONE]\n\n";
+    let server = stream_provider_sequence(vec![
+        errored.to_string(),
+        errored.to_string(),
+        errored.to_string(),
+        errored.to_string(),
+    ])
+    .await;
+    state
+        .store
+        .set_provider_auth("openai", oauth_auth())
+        .unwrap();
+    write_openai_config(&root, &server.url);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+    let cancel = install_runner(&state, &session.id);
+
+    let out = prompt_turn(
+        &state,
+        &session.id,
+        PromptInput {
+            parts: vec![json!({ "type": "text", "text": "stress me" })],
+            model: Some(json!({ "providerID": "openai", "modelID": "gpt-5.1-codex" })),
+            ..Default::default()
+        },
+        cancel,
+    )
+    .await
+    .expect("prompt turn returns a final assistant record");
+
+    // Terminal error envelope after exhausting the cap.
+    assert!(
+        out.info.get("error").is_some(),
+        "expected terminal error envelope, got: {:?}",
+        out.info
+    );
+    // Exactly four upstream requests: 1 initial + 3 retries.
+    let bodies = server.bodies.lock().unwrap().clone();
+    assert_eq!(
+        bodies.len(),
+        4,
+        "expected exactly 1 + MID_STREAM_RETRY_CAP requests, got {}",
+        bodies.len(),
+    );
+
+    state.runners.lock().unwrap().remove(&session.id);
+    std::env::remove_var("KILO_MID_STREAM_RETRY_MS");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn mid_stream_retry_resets_counter_on_success() {
+    std::env::set_var("KILO_MID_STREAM_RETRY_MS", "10");
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    std::fs::create_dir_all(root.join("repo")).unwrap();
+    // First turn: error mid-stream then recover. Counter goes 0 → 1
+    // and (by spec) back to 0 once the retry stream completes.
+    let server = stream_provider_sequence(vec![
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"par\"}\n\n\
+data: {\"type\":\"error\",\"error\":{\"message\":\"transient\"}}\n\n\
+data: [DONE]\n\n"
+            .to_string(),
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"tial\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n\
+data: [DONE]\n\n"
+            .to_string(),
+    ])
+    .await;
+    state
+        .store
+        .set_provider_auth("openai", oauth_auth())
+        .unwrap();
+    write_openai_config(&root, &server.url);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+    let cancel = install_runner(&state, &session.id);
+
+    let _ = prompt_turn(
+        &state,
+        &session.id,
+        PromptInput {
+            parts: vec![json!({ "type": "text", "text": "first" })],
+            model: Some(json!({ "providerID": "openai", "modelID": "gpt-5.1-codex" })),
+            ..Default::default()
+        },
+        cancel,
+    )
+    .await
+    .expect("first prompt");
+
+    let counter = state
+        .runners
+        .lock()
+        .unwrap()
+        .get(&session.id)
+        .map(|runner| runner.mid_stream_retries.load(Ordering::SeqCst));
+    assert_eq!(
+        counter,
+        Some(0),
+        "successful retry must reset the per-turn counter",
+    );
+
+    state.runners.lock().unwrap().remove(&session.id);
+    std::env::remove_var("KILO_MID_STREAM_RETRY_MS");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn mid_stream_retry_does_not_fire_for_pre_response_errors() {
+    // Regression: a stream that errors BEFORE any text/reasoning/tool
+    // streams must still go through the existing pre-response retry
+    // path (driven by `RetryState`), NOT the new mid-stream branch.
+    // A non-retryable Api error returned with no streamed side
+    // effects bubbles up as a terminal error after a single attempt.
+    std::env::set_var("KILO_MID_STREAM_RETRY_MS", "10");
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    std::fs::create_dir_all(root.join("repo")).unwrap();
+    // Single error event, no preceding deltas: the parser surfaces
+    // `ProviderError::Api(...)` immediately. The mid-stream branch
+    // gates on `!clean`; this stream is `clean` (no side effects)
+    // so the retry counter must remain at 0 and the loop must
+    // terminate without firing a second request.
+    let server = stream_provider_sequence(vec![
+        "data: {\"type\":\"error\",\"error\":{\"message\":\"pre-response failure\"}}\n\n\
+data: [DONE]\n\n"
+            .to_string(),
+    ])
+    .await;
+    state
+        .store
+        .set_provider_auth("openai", oauth_auth())
+        .unwrap();
+    write_openai_config(&root, &server.url);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+    let cancel = install_runner(&state, &session.id);
+
+    let out = prompt_turn(
+        &state,
+        &session.id,
+        PromptInput {
+            parts: vec![json!({ "type": "text", "text": "hello" })],
+            model: Some(json!({ "providerID": "openai", "modelID": "gpt-5.1-codex" })),
+            ..Default::default()
+        },
+        cancel,
+    )
+    .await
+    .expect("prompt turn");
+
+    // Pre-response failure surfaces a terminal error, no mid-stream
+    // retry was attempted.
+    assert!(
+        out.info.get("error").is_some(),
+        "expected terminal error envelope on pre-response failure",
+    );
+    let counter = state
+        .runners
+        .lock()
+        .unwrap()
+        .get(&session.id)
+        .map(|runner| runner.mid_stream_retries.load(Ordering::SeqCst));
+    assert_eq!(
+        counter,
+        Some(0),
+        "mid-stream counter must NOT increment on pre-response failures",
+    );
+    let bodies = server.bodies.lock().unwrap().clone();
+    assert_eq!(
+        bodies.len(),
+        1,
+        "pre-response error must not trigger a mid-stream retry round",
+    );
+
+    state.runners.lock().unwrap().remove(&session.id);
+    std::env::remove_var("KILO_MID_STREAM_RETRY_MS");
     let _ = std::fs::remove_dir_all(root);
 }

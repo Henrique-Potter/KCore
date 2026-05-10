@@ -42,7 +42,7 @@ impl AppState {
     /// Register a plugin tool. Idempotent on `name`: a second call with
     /// the same name replaces the prior registration. Mirrors Bun's
     /// `plugin.tool()` decorator semantics — last writer wins.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn register_plugin_tool<F>(
         &self,
         name: impl Into<String>,

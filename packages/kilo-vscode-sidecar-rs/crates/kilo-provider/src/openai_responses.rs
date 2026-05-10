@@ -87,7 +87,8 @@ pub fn classify_event(
         StreamEvent::TextDelta(delta) => Some(ResponsesStreamPart::TextDelta(delta)),
         StreamEvent::ReasoningStart { .. }
         | StreamEvent::ReasoningDelta { .. }
-        | StreamEvent::ReasoningEnd { .. } => None,
+        | StreamEvent::ReasoningEnd { .. }
+        | StreamEvent::ReasoningItem { .. } => None,
         StreamEvent::ToolDelta {
             id,
             name: Some(name),

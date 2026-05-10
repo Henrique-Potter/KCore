@@ -8,6 +8,10 @@ version.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "bench-compare"
+path = "src/bin/bench-compare.rs"
+
 [dependencies]
 anyhow = "1"
 base64 = { workspace = true }

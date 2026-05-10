@@ -80,6 +80,7 @@ pub(crate) async fn compact_session(
         role: "user".to_string(),
         content: format_history_for_summary(&history),
         responses: Vec::new(),
+        attachments: Vec::new(),
     }];
     let out = chat_tools_with_auth_cancel(
         &cfg,

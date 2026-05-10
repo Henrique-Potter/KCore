@@ -18,19 +18,31 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use axum::{
-    extract::{Json, Path, State},
+    body::Bytes,
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Json, Path, Query, State,
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use futures_util::{SinkExt, StreamExt};
 use kilo_protocol::GlobalEvent;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::AppState;
+
+const BUFFER_LIMIT: usize = 1024 * 1024 * 2;
+const BUFFER_CHUNK: usize = 64 * 1024;
+
+static SUBSCRIBER_IDS: AtomicU64 = AtomicU64::new(1);
 
 /// One pty session. The master `writer` is wrapped behind a Mutex so
 /// the route handler thread can write input bytes without coordinating
@@ -44,7 +56,10 @@ pub(crate) struct PtyHandle {
     pub(crate) master: Box<dyn portable_pty::MasterPty + Send>,
     pub(crate) writer: Mutex<Box<dyn std::io::Write + Send>>,
     pub(crate) child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
-    pub(crate) title: String,
+    pub(crate) buffer: Mutex<PtyBuffer>,
+    pub(crate) subscribers: Mutex<BTreeMap<u64, tokio::sync::mpsc::UnboundedSender<String>>>,
+    pub(crate) status: Mutex<String>,
+    pub(crate) title: Mutex<String>,
     pub(crate) command: String,
     pub(crate) args: Vec<String>,
     pub(crate) cwd: String,
@@ -53,7 +68,82 @@ pub(crate) struct PtyHandle {
 
 /// `state.pty: Mutex<BTreeMap<String, PtyHandle>>` is registered in
 /// `AppState` (see `state.rs`). Use this alias to keep the type tidy.
-pub(crate) type PtyMap = BTreeMap<String, PtyHandle>;
+pub(crate) type PtyMap = BTreeMap<String, Arc<Mutex<PtyHandle>>>;
+
+#[derive(Default, Deserialize)]
+pub(crate) struct PtyConnectQuery {
+    cursor: Option<i64>,
+}
+
+#[derive(Default)]
+pub(crate) struct PtyBuffer {
+    text: String,
+    start: usize,
+    cursor: usize,
+}
+
+impl PtyBuffer {
+    fn push(&mut self, data: &str) {
+        self.cursor += data.len();
+        self.text.push_str(data);
+        if self.text.len() <= BUFFER_LIMIT {
+            return;
+        }
+        let excess = self.text.len() - BUFFER_LIMIT;
+        let split = next_char_boundary(&self.text, excess);
+        self.text.drain(..split);
+        self.start += split;
+    }
+
+    fn replay_from(&self, cursor: Option<i64>) -> (Vec<String>, usize) {
+        let from = match cursor {
+            Some(-1) => self.cursor,
+            Some(value) if value >= 0 => value as usize,
+            _ => 0,
+        };
+        if self.text.is_empty() || from >= self.cursor {
+            return (Vec::new(), self.cursor);
+        }
+        let raw = from.saturating_sub(self.start).min(self.text.len());
+        let offset = next_char_boundary(&self.text, raw);
+        let data = &self.text[offset..];
+        let mut chunks = Vec::new();
+        let mut idx = 0;
+        while idx < data.len() {
+            let end = prev_char_boundary(data, (idx + BUFFER_CHUNK).min(data.len()));
+            if end <= idx {
+                break;
+            }
+            chunks.push(data[idx..end].to_string());
+            idx = end;
+        }
+        (chunks, self.cursor)
+    }
+}
+
+fn next_char_boundary(text: &str, idx: usize) -> usize {
+    let mut idx = idx.min(text.len());
+    while idx < text.len() && !text.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+fn prev_char_boundary(text: &str, idx: usize) -> usize {
+    let mut idx = idx.min(text.len());
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn meta_frame(cursor: usize) -> Bytes {
+    let text = json!({ "cursor": cursor }).to_string();
+    let mut out = Vec::with_capacity(text.len() + 1);
+    out.push(0);
+    out.extend_from_slice(text.as_bytes());
+    Bytes::from(out)
+}
 
 /// `POST /pty` — spawn a shell. Body shape:
 /// `{ "cwd": "...", "title": "...", "command": [...], "env": {...}, "size": { "cols", "rows" } }`.
@@ -174,17 +264,25 @@ pub(crate) async fn pty_create(
         "pty_{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
-    let handle = PtyHandle {
+    let handle = Arc::new(Mutex::new(PtyHandle {
         master: pair.master,
         writer: Mutex::new(writer),
         child: Mutex::new(child),
-        title: title.clone(),
+        buffer: Mutex::default(),
+        subscribers: Mutex::default(),
+        status: Mutex::new("running".to_string()),
+        title: Mutex::new(title.clone()),
         command: command.clone(),
         args: args.clone(),
         cwd: cwd.clone(),
         pid,
-    };
+    }));
     state.pty.lock().unwrap().insert(id.clone(), handle);
+    let info = pty_info(&id, &title, &command, &args, &cwd, "running", pid);
+    crate::http::sse::publish(
+        &state,
+        GlobalEvent::bus("pty.created", json!({ "info": info.clone() })),
+    );
 
     // Reader thread: pump stdout/stderr bytes onto the SSE bus until
     // EOF. Spawned via `spawn_blocking` because `read()` is sync.
@@ -198,6 +296,25 @@ pub(crate) async fn pty_create(
                 Ok(0) => break,
                 Ok(n) => {
                     let data = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if let Some(handle) = bus_state.pty.lock().unwrap().get(&bus_id).cloned() {
+                        let handle = handle.lock().unwrap();
+                        handle.buffer.lock().unwrap().push(&data);
+                        let stale = {
+                            let subscribers = handle.subscribers.lock().unwrap();
+                            subscribers
+                                .iter()
+                                .filter_map(|(key, tx)| {
+                                    tx.send(data.clone()).is_err().then_some(*key)
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        if !stale.is_empty() {
+                            let mut subscribers = handle.subscribers.lock().unwrap();
+                            for key in stale {
+                                subscribers.remove(&key);
+                            }
+                        }
+                    }
                     crate::http::sse::publish(
                         &bus_state,
                         GlobalEvent::bus("pty.output", json!({ "id": bus_id, "data": data })),
@@ -206,13 +323,17 @@ pub(crate) async fn pty_create(
                 Err(_) => break,
             }
         }
+        if let Some(handle) = bus_state.pty.lock().unwrap().get(&bus_id).cloned() {
+            let handle = handle.lock().unwrap();
+            *handle.status.lock().unwrap() = "exited".to_string();
+        }
         crate::http::sse::publish(
             &bus_state,
-            GlobalEvent::bus("pty.exited", json!({ "id": bus_id })),
+            GlobalEvent::bus("pty.exited", json!({ "id": bus_id, "exitCode": 0 })),
         );
     });
 
-    Json(pty_info(&id, &title, &command, &args, &cwd, "running", pid)).into_response()
+    Json(info).into_response()
 }
 
 /// SDK `Pty` shape:
@@ -245,6 +366,21 @@ fn cwd_basename(cwd: &str) -> String {
         .unwrap_or_else(|| cwd.to_string())
 }
 
+fn write_to_pty(handle: &PtyHandle, text: &str) -> Result<(), String> {
+    if handle.status.lock().unwrap().as_str() == "exited" {
+        return Ok(());
+    }
+    let mut writer = handle
+        .writer
+        .lock()
+        .map_err(|_| "writer lock poisoned".to_string())?;
+    writer
+        .write_all(text.as_bytes())
+        .map_err(|err| format!("write failed: {err}"))?;
+    writer.flush().ok();
+    Ok(())
+}
+
 /// `PUT /pty/:id` — write input and/or resize. Returns the SDK `Pty`
 /// info shape on success.
 pub(crate) async fn pty_update(
@@ -252,24 +388,24 @@ pub(crate) async fn pty_update(
     Path(id): Path<String>,
     Json(input): Json<Value>,
 ) -> Response {
-    let map = state.pty.lock().unwrap();
-    let Some(handle) = map.get(&id) else {
-        return pty_error(
-            StatusCode::NOT_FOUND,
-            "RustPtyNotFoundError",
-            &format!("PTY {id} not found"),
-        );
+    let handle = {
+        let map = state.pty.lock().unwrap();
+        let Some(handle) = map.get(&id).cloned() else {
+            return pty_error(
+                StatusCode::NOT_FOUND,
+                "RustPtyNotFoundError",
+                &format!("PTY {id} not found"),
+            );
+        };
+        handle
     };
+    let handle = handle.lock().unwrap();
+    if let Some(title) = input.get("title").and_then(Value::as_str) {
+        *handle.title.lock().unwrap() = title.to_string();
+    }
     if let Some(text) = input.get("input").and_then(Value::as_str) {
-        if let Ok(mut writer) = handle.writer.lock() {
-            if let Err(err) = writer.write_all(text.as_bytes()) {
-                return pty_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "RustPtyWriteError",
-                    &format!("write failed: {err}"),
-                );
-            }
-            let _ = writer.flush();
+        if let Err(err) = write_to_pty(&handle, text) {
+            return pty_error(StatusCode::INTERNAL_SERVER_ERROR, "RustPtyWriteError", &err);
         }
     }
     if let Some(size) = input.get("size") {
@@ -296,30 +432,119 @@ pub(crate) async fn pty_update(
             );
         }
     }
-    let status = if handle
-        .child
-        .lock()
-        .ok()
-        .and_then(|mut child| child.try_wait().ok().flatten())
-        .is_some()
+    let status = if handle.status.lock().unwrap().as_str() == "exited"
+        || handle
+            .child
+            .lock()
+            .ok()
+            .and_then(|mut child| child.try_wait().ok().flatten())
+            .is_some()
     {
         "exited"
     } else {
         "running"
     };
-    Json(pty_info(
+    let info = pty_info(
         &id,
-        &handle.title,
+        &handle.title.lock().unwrap(),
         &handle.command,
         &handle.args,
         &handle.cwd,
         status,
         handle.pid,
-    ))
-    .into_response()
+    );
+    crate::http::sse::publish(
+        &state,
+        GlobalEvent::bus("pty.updated", json!({ "info": info.clone() })),
+    );
+    Json(info).into_response()
 }
 
 /// `DELETE /pty/:id` — kill the child + drop the handle.
+/// `GET /pty/:id/connect` - WebSocket transport used by Agent Manager
+/// terminals. Text frames are PTY bytes; binary control frames use the
+/// Bun-compatible `0x00 + {"cursor": n}` shape for replay bookkeeping.
+pub(crate) async fn pty_connect(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<PtyConnectQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !state.pty.lock().unwrap().contains_key(&id) {
+        return pty_error(
+            StatusCode::NOT_FOUND,
+            "RustPtyNotFoundError",
+            &format!("PTY {id} not found"),
+        );
+    }
+    ws.on_upgrade(move |socket| pty_socket(state, id, query.cursor, socket))
+}
+
+async fn pty_socket(state: Arc<AppState>, id: String, cursor: Option<i64>, socket: WebSocket) {
+    let (chunks, end, key, mut rx) = {
+        let map = state.pty.lock().unwrap();
+        let Some(handle) = map.get(&id).cloned() else {
+            return;
+        };
+        let handle = handle.lock().unwrap();
+        let (chunks, end) = handle.buffer.lock().unwrap().replay_from(cursor);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let key = SUBSCRIBER_IDS.fetch_add(1, Ordering::Relaxed);
+        handle.subscribers.lock().unwrap().insert(key, tx);
+        (chunks, end, key, rx)
+    };
+
+    let (mut out, mut input) = socket.split();
+    for chunk in chunks {
+        if out.send(Message::Text(chunk.into())).await.is_err() {
+            remove_subscriber(&state, &id, key);
+            return;
+        }
+    }
+    if out.send(Message::Binary(meta_frame(end))).await.is_err() {
+        remove_subscriber(&state, &id, key);
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            Some(data) = rx.recv() => {
+                if out.send(Message::Text(data.into())).await.is_err() {
+                    break;
+                }
+            }
+            msg = input.next() => {
+                let Some(Ok(msg)) = msg else { break };
+                match msg {
+                    Message::Text(text) => write_socket_input(&state, &id, text.as_str()),
+                    Message::Binary(bytes) => {
+                        let text = String::from_utf8_lossy(&bytes);
+                        write_socket_input(&state, &id, &text);
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    remove_subscriber(&state, &id, key);
+}
+
+fn write_socket_input(state: &AppState, id: &str, text: &str) {
+    if let Some(handle) = state.pty.lock().unwrap().get(id).cloned() {
+        let handle = handle.lock().unwrap();
+        let _ = write_to_pty(&handle, text);
+    }
+}
+
+fn remove_subscriber(state: &AppState, id: &str, key: u64) {
+    if let Some(handle) = state.pty.lock().unwrap().get(id).cloned() {
+        let handle = handle.lock().unwrap();
+        handle.subscribers.lock().unwrap().remove(&key);
+    }
+}
+
 pub(crate) async fn pty_delete(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -331,6 +556,7 @@ pub(crate) async fn pty_delete(
             &format!("PTY {id} not found"),
         );
     };
+    let handle = handle.lock().unwrap();
     if let Ok(mut child) = handle.child.lock() {
         // Tree-kill first so grandchildren forked by the shell (npm
         // post-install scripts, nested REPLs, child shells) don't
@@ -347,6 +573,7 @@ pub(crate) async fn pty_delete(
         // master/slave fds even if `taskkill` already terminated it.
         let _ = child.wait();
     }
+    crate::http::sse::publish(&state, GlobalEvent::bus("pty.deleted", json!({ "id": id })));
     Json(true).into_response()
 }
 
@@ -622,5 +849,30 @@ mod tests {
         std::env::set_var("SHELL", "/usr/bin/zsh");
         assert_eq!(resolve_default_shell(), "/usr/bin/zsh");
         std::env::remove_var("SHELL");
+    }
+
+    #[test]
+    fn pty_buffer_replays_from_cursor_and_meta_frame_matches_bun_shape() {
+        let mut buffer = PtyBuffer::default();
+        buffer.push("hello");
+        buffer.push(" world");
+
+        let (chunks, end) = buffer.replay_from(Some(6));
+        assert_eq!(chunks, vec!["world"]);
+        assert_eq!(end, 11);
+
+        let frame = meta_frame(end);
+        assert_eq!(frame[0], 0);
+        assert_eq!(&frame[1..], br#"{"cursor":11}"#);
+    }
+
+    #[test]
+    fn pty_buffer_cursor_minus_one_starts_at_tail() {
+        let mut buffer = PtyBuffer::default();
+        buffer.push("old output");
+
+        let (chunks, end) = buffer.replay_from(Some(-1));
+        assert!(chunks.is_empty());
+        assert_eq!(end, "old output".len());
     }
 }

@@ -29,7 +29,7 @@ use kilo_provider::{chat_tools_with_auth_cancel, ChatMessage, ChatTool};
 use serde_json::{json, Value};
 
 use crate::util::git::git_text;
-use crate::AppState;
+use crate::{oauth, AppState};
 
 pub(crate) async fn remote_enable() -> impl IntoResponse {
     Json(remote_disabled())
@@ -106,7 +106,6 @@ async fn generate_commit_message(
     if diff.trim().is_empty() {
         return Err("no diff content".to_string());
     }
-    let auths = collect_auths(state);
     let cfg = state.store.config();
     let model = json!({ "providerID": "openai", "modelID": "gpt-5.1-codex" });
 
@@ -123,8 +122,10 @@ async fn generate_commit_message(
         role: "user".to_string(),
         content: user,
         responses: Vec::new(),
+        attachments: Vec::new(),
     }];
     let cancel = AtomicBool::new(false);
+    let auths = oauth::tokens::fresh_auths(state, &cancel).await?;
     let call = chat_tools_with_auth_cancel(
         &cfg,
         &auths,
@@ -432,17 +433,6 @@ fn valid_agent_name(name: &str) -> bool {
 
 fn remove_error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
-}
-
-/// Build the auth blob expected by `chat_tools_with_auth_cancel`.
-/// Returns `Value::Null` when there's no openai auth on disk; the
-/// provider call then fails with `MissingKey` and the caller falls back
-/// to the stub message.
-fn collect_auths(state: &AppState) -> Value {
-    match state.store.provider_auth("openai") {
-        Some(auth) => json!({ "openai": auth }),
-        None => Value::Null,
-    }
 }
 
 fn remote_disabled() -> Value {

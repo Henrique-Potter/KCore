@@ -578,8 +578,8 @@ pub(crate) async fn suggestions(State(state): State<Arc<AppState>>) -> impl Into
     Json(suggestion_list(&state))
 }
 
-pub(crate) fn reject_pending_for_sessions(state: &AppState, ids: &[String]) {
-    let ids: BTreeSet<&str> = ids.iter().map(String::as_str).collect();
+pub(crate) fn reject_pending_for_sessions(state: &AppState, sessions: &[String]) {
+    let ids: BTreeSet<&str> = sessions.iter().map(String::as_str).collect();
     let perms = {
         let mut items = state.permissions.lock().unwrap();
         let keys = items
@@ -605,6 +605,11 @@ pub(crate) fn reject_pending_for_sessions(state: &AppState, ids: &[String]) {
         let _ = entry.reply.send(PermissionDecision::Reject);
     }
 
+    dismiss_question_suggestion_waits(state, sessions);
+}
+
+pub(crate) fn dismiss_question_suggestion_waits(state: &AppState, ids: &[String]) {
+    let ids: BTreeSet<&str> = ids.iter().map(String::as_str).collect();
     let questions = {
         let mut items = state.questions.lock().unwrap();
         let keys = items

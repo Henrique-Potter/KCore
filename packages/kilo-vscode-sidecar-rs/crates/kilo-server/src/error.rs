@@ -121,15 +121,6 @@ impl From<rusqlite::Error> for TurnError {
     }
 }
 
-pub(crate) fn turn_error(err: TurnError) -> Response {
-    match err {
-        TurnError::Busy => busy_error(),
-        TurnError::NotFound => StatusCode::NOT_FOUND.into_response(),
-        TurnError::Unsupported(err) => unsupported_provider_error(err),
-        TurnError::Db(err) => internal_error(err.to_string()),
-    }
-}
-
 pub(crate) fn busy_error() -> Response {
     (
         StatusCode::CONFLICT,

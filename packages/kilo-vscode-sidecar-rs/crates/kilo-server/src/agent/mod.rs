@@ -16,7 +16,7 @@ use axum::{
 };
 use kilo_protocol::{MessageAppendResult, PromptInput};
 
-use crate::{busy_error, turn_error, unsupported_provider_error, AppState, TurnError};
+use crate::{unsupported_provider_error, AppState, TurnError};
 
 pub(crate) mod catalog;
 pub(crate) mod compaction;
@@ -27,6 +27,7 @@ pub(crate) mod openai_stream;
 pub(crate) mod parts;
 pub(crate) mod permission;
 pub(crate) mod plugin;
+pub(crate) mod retry;
 pub(crate) mod shape;
 pub(crate) mod tools;
 pub(crate) mod turn;
@@ -51,9 +52,9 @@ pub(crate) async fn run_turn(
     turn::prompt_guarded(state, id, input).await
 }
 
-/// Async variant: validate, claim a runner slot, and spawn the turn loop in
-/// the background. Mirrors the body `routes::prompt::prompt_async` used to
-/// inline; the seam is explicit so the spawned call routes through here.
+/// Async variant: validate, enqueue by session, and spawn the turn loop in
+/// the background. Same-session follow-ups wait for the current runner instead
+/// of surfacing `BusyError`; different sessions still run independently.
 pub(crate) async fn run_turn_async(
     state: State<Arc<AppState>>,
     id: Path<String>,
@@ -69,14 +70,35 @@ pub(crate) async fn run_turn_async(
     if let Err(err) = turn::ensure_prompt_supported(&state, &input, &text) {
         return unsupported_provider_error(err);
     }
-    let guard = match turn::start_runner(state.clone(), &id) {
-        Ok(guard) => guard,
-        Err(TurnError::Busy) => return busy_error(),
-        Err(err) => return turn_error(err),
-    };
-    let runner_id = guard.id.clone();
+    let queue = state.prompt_queue(&id);
+    let version = state.prompt_queue_version(&id);
+    let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<tokio::task::AbortHandle>();
     let task = tokio::spawn(async move {
-        let id = guard.id.clone();
+        let _slot = queue.lock().await;
+        if !state.prompt_queue_current(&id, version) {
+            return;
+        }
+        let guard = loop {
+            match turn::start_runner(state.clone(), &id) {
+                Ok(guard) => break guard,
+                Err(TurnError::Busy) => {
+                    state.runner_notify.notified().await;
+                    if !state.prompt_queue_current(&id, version) {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[kilo-server] prompt_async {id}: {err:?}");
+                    return;
+                }
+            }
+        };
+        let Ok(handle) = abort_rx.await else {
+            return;
+        };
+        if let Some(runner) = guard.state.runners.lock().unwrap().get(&id) {
+            *runner.abort.lock().unwrap() = Some(handle);
+        }
         let res = turn::prompt_turn(&guard.state, &id, input, guard.cancel.clone()).await;
         if let Err(err) = res {
             eprintln!("[kilo-server] prompt_async {id}: {err:?}");
@@ -86,8 +108,6 @@ pub(crate) async fn run_turn_async(
     // Install the abort handle so `abort_session` can preempt a task
     // suspended on a non-cooperative `.await`. The runner may already be
     // gone by the time the task finishes — guard against that race.
-    if let Some(runner) = state.runners.lock().unwrap().get(&runner_id) {
-        *runner.abort.lock().unwrap() = Some(task.abort_handle());
-    }
+    let _ = abort_tx.send(task.abort_handle());
     StatusCode::NO_CONTENT.into_response()
 }

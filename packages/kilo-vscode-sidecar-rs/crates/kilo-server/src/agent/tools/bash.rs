@@ -13,7 +13,11 @@ use std::{
 
 use serde_json::{json, Value};
 
-use crate::util::paths::resolve_under;
+use std::sync::Arc;
+
+use crate::agent::permission::{ask_external_directory, PermissionError};
+use crate::util::paths::{resolve_relaxed, resolve_under};
+use crate::AppState;
 
 pub(crate) const MAX_BASH_OUTPUT_BYTES: usize = 64 * 1024;
 pub(crate) const DEFAULT_BASH_TIMEOUT_MS: u64 = 60_000;
@@ -28,13 +32,26 @@ pub(crate) fn fake_bash_with_cancel(
     input: &Value,
     cancel: Option<&AtomicBool>,
 ) -> Result<(String, String, Value), String> {
+    fake_bash_inner(root, input, cancel, false)
+}
+
+fn fake_bash_inner(
+    root: &FsPath,
+    input: &Value,
+    cancel: Option<&AtomicBool>,
+    allow_external: bool,
+) -> Result<(String, String, Value), String> {
     let command = input
         .get("command")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "command is required".to_string())?;
     let dir = input.get("workdir").and_then(Value::as_str).unwrap_or("");
-    let cwd = resolve_under(root, dir).map_err(|_| format!("Unsafe workdir: {dir}"))?;
+    let cwd = if allow_external {
+        resolve_relaxed(root, dir).map_err(|_| format!("Unsafe workdir: {dir}"))?
+    } else {
+        resolve_under(root, dir).map_err(|_| format!("Unsafe workdir: {dir}"))?
+    };
     let timeout = tool_timeout(input)?;
     let description = input
         .get("description")
@@ -86,8 +103,9 @@ pub(crate) fn fake_bash_with_cancel(
     let stderr = err
         .join()
         .map_err(|_| "Unable to collect command stderr".to_string())?;
-    let text = combined_output(&stdout, &stderr);
+    let text = combined_output(&stdout.bytes, &stderr.bytes);
     let (preview, truncated) = truncate_output(&text);
+    let truncated = truncated || stdout.truncated || stderr.truncated;
     let output = if preview.is_empty() {
         "(no output)".to_string()
     } else {
@@ -103,6 +121,35 @@ pub(crate) fn fake_bash_with_cancel(
     });
 
     Ok((description.to_string(), output, metadata))
+}
+
+/// Gated bash: kind = "execute". Pre-flights `workdir` (the only path
+/// argument we can extract reliably from a bash invocation) and raises
+/// an `external_directory` ask when it resolves outside the worktree.
+/// Per the migration plan, paths embedded inside the command string are
+/// NOT parsed — bash quoting/redirects/expansion make that fragile, so
+/// we fall back to ungated for those.
+pub(crate) async fn fake_bash_gated(
+    state: &Arc<AppState>,
+    sid: &str,
+    mid: &str,
+    pid: &str,
+    idx: usize,
+    root: &FsPath,
+    input: &Value,
+    cancel: Option<&AtomicBool>,
+) -> Result<(String, String, Value), String> {
+    let workdir = input
+        .get("workdir")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+    if !workdir.is_empty() {
+        ask_external_directory(state, sid, mid, pid, idx, root, &[workdir], "execute")
+            .await
+            .map_err(|err: PermissionError| err.to_display())?;
+    }
+    fake_bash_inner(root, input, cancel, true)
 }
 
 fn kill_child(child: &mut Child) -> std::io::Result<()> {
@@ -246,11 +293,38 @@ fn find_in_path(name: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-fn read_pipe(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+struct PipeOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn read_pipe(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<PipeOutput> {
     std::thread::spawn(move || {
         let mut out = Vec::new();
-        let _ = pipe.read_to_end(&mut out);
-        out
+        let mut buf = [0u8; 8192];
+        let mut truncated = false;
+        loop {
+            let Ok(n) = pipe.read(&mut buf) else {
+                break;
+            };
+            if n == 0 {
+                break;
+            }
+            let remaining = MAX_BASH_OUTPUT_BYTES.saturating_sub(out.len());
+            if remaining == 0 {
+                truncated = true;
+                continue;
+            }
+            let take = remaining.min(n);
+            out.extend_from_slice(&buf[..take]);
+            if take < n {
+                truncated = true;
+            }
+        }
+        PipeOutput {
+            bytes: out,
+            truncated,
+        }
     })
 }
 
@@ -291,4 +365,21 @@ fn tool_timeout(input: &Value) -> Result<Duration, String> {
     Ok(Duration::from_millis(
         (ms as u64).min(DEFAULT_BASH_TIMEOUT_MS),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn read_pipe_drains_but_keeps_bounded_output() {
+        let bytes = vec![b'x'; MAX_BASH_OUTPUT_BYTES + 4096];
+        let out = read_pipe(Cursor::new(bytes))
+            .join()
+            .expect("pipe reader should finish");
+
+        assert_eq!(out.bytes.len(), MAX_BASH_OUTPUT_BYTES);
+        assert!(out.truncated);
+    }
 }

@@ -22,6 +22,7 @@ mod lock;
 mod oauth;
 mod registry;
 mod routes;
+mod snapshot;
 mod state;
 mod telemetry;
 mod util;
@@ -36,16 +37,16 @@ mod tests;
 // `super::*` and a small set of state types whose canonical home is
 // `state.rs`.
 pub(crate) use error::{
-    busy_error, internal_error, internal_error_named, turn_error, unsupported_provider_error,
-    RouteError, TurnError,
+    busy_error, internal_error, internal_error_named, unsupported_provider_error, RouteError,
+    TurnError,
 };
 pub(crate) use http::sse::{
     publish_error, publish_events, publish_for_session, publish_idle, publish_part_delta,
-    publish_status, publish_turn_close, publish_turn_open,
+    publish_status, publish_status_value, publish_turn_close, publish_turn_open,
 };
 #[allow(unused_imports)]
 pub(crate) use state::{
-    AppState, FakeCall, McpChild, PendingAuth, PendingPermission, PendingQuestion,
+    AppState, FakeCall, McpChild, PendingAuth, PendingNetwork, PendingPermission, PendingQuestion,
     PendingSuggestion, PermissionDecision, PermissionRule, QuestionReply, Repair, Runner,
     RunnerGuard, SuggestionDecision, ViewedState,
 };
@@ -135,10 +136,14 @@ pub async fn serve(
         bus,
         viewed: RwLock::default(),
         runners: Mutex::default(),
+        runner_notify: tokio::sync::Notify::new(),
+        prompt_queues: Mutex::default(),
+        prompt_queue_versions: Mutex::default(),
         permissions: Mutex::default(),
         approvals: Mutex::new(persisted_approvals),
         questions: Mutex::default(),
         suggestions: Mutex::default(),
+        network: Mutex::default(),
         mcp: Mutex::default(),
         mcp_configs: Mutex::default(),
         mcp_children: Mutex::default(),
@@ -146,6 +151,7 @@ pub async fn serve(
         plugin_tools: Mutex::default(),
         session_agents: Mutex::default(),
         session_hard_rules: Mutex::default(),
+        broken_turn_anchors: Mutex::default(),
         oauth_pending: Mutex::default(),
         oauth_listener: Mutex::default(),
         oauth_listener_addr: SocketAddr::from(([127, 0, 0, 1], 1455)),
@@ -153,6 +159,48 @@ pub async fn serve(
         sse_capacity: AppState::new_sse_capacity(),
     });
     let app = http::build_router(state.clone());
+
+    // Periodic GC of snapshot worktrees and orphaned plan markdowns. Both
+    // walks are sync filesystem I/O, so we hop onto `spawn_blocking` rather
+    // than holding a tokio worker. Gated behind `cfg!(not(test))` so unit
+    // test runs (which never call `serve`) stay deterministic and don't
+    // leave a stray task chewing on the shared store between cases.
+    if cfg!(not(test)) {
+        let cleanup_state = state.clone();
+        tokio::spawn(async move {
+            // Run once at startup to mop up anything left over from a prior
+            // run that crashed before the next tick fired.
+            let store = cleanup_state.store.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let snap = crate::snapshot::cleanup_old_snapshots(&store, 30);
+                let plans = crate::snapshot::cleanup_orphaned_plans(&store, 30);
+                if snap > 0 || plans > 0 {
+                    eprintln!(
+                        "[kilo-server] cleanup: removed {snap} snapshots, {plans} orphan plans"
+                    );
+                }
+            })
+            .await;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            // First tick fires immediately; we just ran the startup pass, so
+            // skip it.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let store = cleanup_state.store.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let snap = crate::snapshot::cleanup_old_snapshots(&store, 30);
+                    let plans = crate::snapshot::cleanup_orphaned_plans(&store, 30);
+                    if snap > 0 || plans > 0 {
+                        eprintln!(
+                            "[kilo-server] cleanup: removed {snap} snapshots, {plans} orphan plans"
+                        );
+                    }
+                })
+                .await;
+            }
+        });
+    }
 
     // Backward-compatible readiness line. The extension's `parseServerPort`
     // matches `listening on http://<host>:<port>`; the trailing

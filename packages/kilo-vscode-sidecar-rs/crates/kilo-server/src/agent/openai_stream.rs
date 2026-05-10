@@ -18,12 +18,20 @@
 use std::{
     collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
-use kilo_protocol::{KiloPath, MessageAppendInput, MessageAppendResult, PromptInput};
+use kilo_protocol::{
+    GlobalEvent, KiloPath, MessageAppendInput, MessageAppendResult, PromptInput, SessionUpdateInput,
+};
+#[cfg(test)]
+use kilo_provider::ChatTool;
 use kilo_provider::{
-    ChatMessage, ChatResponseItem, ChatTool, ChatUsage, ProviderError, StreamEvent,
+    ChatMessage, ChatResponseItem, ChatUsage, ProviderError, ReasoningItem, StreamEvent,
 };
 use serde_json::{json, Value};
 use tokio::task::JoinSet;
@@ -34,13 +42,15 @@ use crate::agent::parts::{
     provider_error, real_messages, real_tool_part, real_tools, tool_error, tool_part_response,
     tool_running,
 };
+use crate::agent::retry::{retry_status, sleep_or_cancel, RetryPolicy, RetryState};
 use crate::agent::shape::{
     repair_tool_name, step_finish_part_iter, step_start_part, tokens_value, usage_accumulate,
     usage_cost_value,
 };
 use crate::{oauth, registry};
 use crate::{
-    publish_error, publish_events, publish_idle, publish_part_delta, publish_turn_close, AppState,
+    publish_error, publish_events, publish_idle, publish_part_delta, publish_status,
+    publish_status_value, publish_turn_close, AppState,
 };
 use crate::{Repair, KNOWN_TOOLS};
 
@@ -54,6 +64,33 @@ pub(crate) const OPENAI_OAUTH_MAX_ITERATIONS: usize = 16;
 /// pauses and asks the user via `ask_doom_loop`. Matches Bun's
 /// `processor.ts:27` constant.
 pub(crate) const DOOM_LOOP_THRESHOLD: usize = 3;
+
+/// Maximum mid-stream retries per turn. When the OpenAI Responses
+/// stream errors AFTER content (text deltas, reasoning, or tool calls)
+/// has already streamed within an iteration, the agent loop replays
+/// the iteration with the partial assistant content appended to the
+/// request so the model can continue coherently. Beyond this cap the
+/// partial is finalized with a terminal error envelope.
+pub(crate) const MID_STREAM_RETRY_CAP: u8 = 3;
+
+/// Default delay between mid-stream retry rounds when the upstream
+/// error doesn't carry a `Retry-After`. Matches the lower bound of the
+/// pre-response retry backoff so users see the same minimum wait shape.
+const MID_STREAM_RETRY_DEFAULT_DELAY: Duration = Duration::from_millis(1_000);
+
+/// Returns the per-retry delay to use when the upstream error has no
+/// explicit `Retry-After`. Tests override via `KILO_MID_STREAM_RETRY_MS`
+/// to keep three back-to-back retries from blowing a multi-second
+/// timeout; production callers always see [`MID_STREAM_RETRY_DEFAULT_DELAY`].
+fn mid_stream_default_delay() -> Duration {
+    std::env::var("KILO_MID_STREAM_RETRY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(MID_STREAM_RETRY_DEFAULT_DELAY)
+}
+
+const TITLE_PROMPT: &str = include_str!("../../../../../opencode/src/agent/prompt/title.txt");
 
 #[derive(Clone)]
 struct PendingTool {
@@ -97,7 +134,7 @@ pub(crate) async fn prompt_openai_stream(
         .unwrap_or_default()
         .to_string();
     let root = PathBuf::from(paths.directory.clone());
-    let auths = match oauth::tokens::fresh_auths(&state, &cancel).await {
+    let mut auths = match oauth::tokens::fresh_auths(&state, &cancel).await {
         Ok(auths) => auths,
         Err(err) => {
             if is_canceled(&cancel) || err.contains("aborted") {
@@ -142,6 +179,15 @@ pub(crate) async fn prompt_openai_stream(
     let tools = real_tools(&state, &input);
     let base_messages = real_messages(&state, id, &text);
     let stream_model = input.model.clone();
+    spawn_title_generation(
+        state.clone(),
+        id.to_string(),
+        cfg.clone(),
+        auths.clone(),
+        input.model.clone(),
+        text.clone(),
+        cancel.clone(),
+    );
 
     // Accumulated state across iterations.
     let mut deltas = String::new();
@@ -158,6 +204,7 @@ pub(crate) async fn prompt_openai_stream(
     let mut last_text: String = String::new();
     let mut seen_malformed_tool_arguments: HashSet<String> = HashSet::new();
     let mut compaction_attempts: usize = 0;
+    let mut retry = RetryState::new(RetryPolicy::from_env());
 
     // Captured `StructuredOutput` payload, set when the model calls the
     // synthetic structured-output tool (Bun: `prompt.ts:1969-1995`). The
@@ -188,6 +235,42 @@ pub(crate) async fn prompt_openai_stream(
                 &tool_parts,
                 Some(&total_usage),
             );
+        }
+        match oauth::tokens::fresh_auths(&state, &cancel).await {
+            Ok(next) => auths = next,
+            Err(err) => {
+                if is_canceled(&cancel) || err.contains("aborted") {
+                    return finalize_openai_aborted(
+                        &state,
+                        id,
+                        &dir,
+                        &project,
+                        &start.result,
+                        &mid,
+                        &pid,
+                        &deltas,
+                        &tool_parts,
+                        Some(&total_usage),
+                    );
+                }
+                let assistant = state.store.append_message_record(
+                    id,
+                    MessageAppendInput {
+                        info: assistant_error_info(
+                            &paths,
+                            &user,
+                            &input,
+                            provider_error(ProviderError::Api(err)),
+                        ),
+                        parts: Vec::new(),
+                    },
+                )?;
+                publish_events(&state, dir, project, assistant.events);
+                publish_error(&state, id, assistant.result.info["error"].clone());
+                publish_idle(&state, id);
+                publish_turn_close(&state, id, "error");
+                return Ok(assistant.result);
+            }
         }
 
         // Per-iteration `step-start` part. Bun emits this from the AI SDK
@@ -220,6 +303,15 @@ pub(crate) async fn prompt_openai_stream(
             Arc::new(std::sync::Mutex::new(String::new()));
         let iter_reasoning: Arc<std::sync::Mutex<BTreeMap<String, String>>> =
             Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        // Encrypted reasoning items captured from `response.output_item.done`
+        // — replayed verbatim into the next iteration's request `input[]`
+        // so cache hits survive a multi-step turn. Keyed by the same `rid`
+        // (raw item id from `rs_*`) used for `iter_reasoning` summary text.
+        // Insertion order is preserved via `Vec` rather than a map so the
+        // request emits items in the order the model produced them.
+        let iter_reasoning_encrypted: Arc<std::sync::Mutex<Vec<ReasoningItem>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plan_exit_seen = Arc::new(AtomicBool::new(false));
         let stream_root = root.clone();
         let stream_mid = mid.clone();
         let stream_pid = pid.clone();
@@ -233,6 +325,8 @@ pub(crate) async fn prompt_openai_stream(
         let stream_project = project.clone();
         let stream_text_pid = iteration_text_part_id(&pid, iteration);
         let stream_reasoning = iter_reasoning.clone();
+        let stream_reasoning_encrypted = iter_reasoning_encrypted.clone();
+        let stream_plan_exit = plan_exit_seen.clone();
         let base_idx = tool_parts.len();
         let start_time = start.result.time;
 
@@ -243,129 +337,340 @@ pub(crate) async fn prompt_openai_stream(
         let mut iter_messages = base_messages.clone();
         iter_messages.extend(history_extension.iter().cloned());
 
-        let out = kilo_provider::stream_openai_oauth(
-            &cfg,
-            &auths,
-            input.model.as_ref(),
-            Some(id),
-            instructions.clone(),
-            iter_messages,
-            tools.clone(),
-            &cancel,
-            |event| match event {
-                StreamEvent::TextDelta(delta) => {
-                    publish_part_delta(&state, id, &mid, &stream_text_pid, &delta);
-                    if let Ok(mut buf) = iter_text.lock() {
-                        buf.push_str(&delta);
-                    }
-                    deltas.push_str(&delta);
-                }
-                StreamEvent::ReasoningStart { id: rid } => {
-                    let pid = reasoning_part_id(&pid, iteration, &rid);
-                    if let Ok(mut map) = stream_reasoning.lock() {
-                        map.entry(rid).or_default();
-                    }
-                    let part = reasoning_part(&pid, "", start_time, None);
-                    if let Ok(record) = state.store.append_message_record(
-                        id,
-                        MessageAppendInput {
-                            info: start.result.info.clone(),
-                            parts: vec![part],
-                        },
-                    ) {
-                        publish_events(&state, dir.clone(), project.clone(), record.events);
-                    }
-                }
-                StreamEvent::ReasoningDelta { id: rid, delta } => {
-                    let pid = reasoning_part_id(&pid, iteration, &rid);
-                    publish_part_delta(&state, id, &mid, &pid, &delta);
-                    if let Ok(mut map) = stream_reasoning.lock() {
-                        map.entry(rid).or_default().push_str(&delta);
-                    }
-                }
-                StreamEvent::ReasoningEnd { .. } => {}
-                StreamEvent::ToolCall(call) => {
-                    // Intercept the synthetic `StructuredOutput` tool: the
-                    // model invoking this means it's providing the final
-                    // typed payload. Capture the input, do NOT spawn a
-                    // tool runner (there is no real implementation), and
-                    // let the loop terminate normally on the next pass.
-                    if call.name == crate::agent::parts::STRUCTURED_OUTPUT_TOOL_NAME {
-                        if let Ok(mut slot) = structured_capture.lock() {
-                            *slot = Some(call.input.clone());
+        let out = loop {
+            let before_delta_len = deltas.len();
+            let before_pending_len = pending_tools.lock().map(|items| items.len()).unwrap_or(0);
+            let before_reasoning_len = iter_reasoning.lock().map(|items| items.len()).unwrap_or(0);
+            let result = kilo_provider::stream_openai_oauth(
+                &cfg,
+                &auths,
+                input.model.as_ref(),
+                Some(id),
+                instructions.clone(),
+                iter_messages.clone(),
+                tools.clone(),
+                &cancel,
+                |event| match event {
+                    StreamEvent::TextDelta(delta) => {
+                        publish_part_delta(&state, id, &mid, &stream_text_pid, &delta);
+                        if let Ok(mut buf) = iter_text.lock() {
+                            buf.push_str(&delta);
                         }
-                        return;
+                        deltas.push_str(&delta);
                     }
-                    let join = stream_join.clone();
-                    let cancel = stream_cancel.clone();
-                    let root = stream_root.clone();
-                    let mid = stream_mid.clone();
-                    let pid = stream_pid.clone();
-                    let id = stream_id.clone();
-                    let state = stream_state.clone();
-                    let model = stream_model.clone();
-                    let dir = stream_dir.clone();
-                    let project = stream_project.clone();
-                    let pending_tools = stream_pending.clone();
-                    let idx = {
-                        let guard = join.lock().unwrap();
-                        base_idx + guard.len()
-                    };
-                    let tool = live_tool_name(&call.name);
-                    let pending =
-                        tool_running(&mid, &pid, idx, &tool, &call.id, &call.input, start_time);
-                    if let Ok(record) = state.store.append_message_record(
-                        &id,
-                        MessageAppendInput {
-                            info: start.result.info.clone(),
-                            parts: vec![pending],
-                        },
-                    ) {
-                        publish_events(&state, dir, project, record.events);
+                    StreamEvent::ReasoningStart { id: rid } => {
+                        let pid = reasoning_part_id(&pid, iteration, &rid);
+                        if let Ok(mut map) = stream_reasoning.lock() {
+                            map.entry(rid).or_default();
+                        }
+                        let part = reasoning_part(&pid, "", start_time, None);
+                        if let Ok(record) = state.store.append_message_record(
+                            id,
+                            MessageAppendInput {
+                                info: start.result.info.clone(),
+                                parts: vec![part],
+                            },
+                        ) {
+                            publish_events(&state, dir.clone(), project.clone(), record.events);
+                        }
                     }
-                    if let Ok(mut pending) = pending_tools.lock() {
-                        pending.push(PendingTool {
-                            idx,
-                            tool: tool.clone(),
-                            call: call.id.clone(),
-                            input: call.input.clone(),
+                    StreamEvent::ReasoningDelta { id: rid, delta } => {
+                        let pid = reasoning_part_id(&pid, iteration, &rid);
+                        publish_part_delta(&state, id, &mid, &pid, &delta);
+                        if let Ok(mut map) = stream_reasoning.lock() {
+                            map.entry(rid).or_default().push_str(&delta);
+                        }
+                    }
+                    StreamEvent::ReasoningEnd { .. } => {}
+                    StreamEvent::ReasoningItem {
+                        id: rid,
+                        encrypted_content,
+                    } => {
+                        // Capture the encrypted reasoning blob (verbatim
+                        // shape: `id` + `encrypted_content`) for replay
+                        // into the next iteration's request `input[]`.
+                        // Bun's converter emits these as first-class
+                        // `{type:"reasoning"}` items between prior tool
+                        // I/O and the current user input — see
+                        // `provider/sdk/copilot/responses/convert-to-openai-responses-input.ts:185-244`.
+                        // The streamed summaries live under
+                        // `<item_id>:<summary_index>` keys (per
+                        // `reasoning_id` in the provider parser); collect
+                        // every matching prefix so multi-summary traces
+                        // round-trip in order.
+                        let summary = stream_reasoning
+                            .lock()
+                            .ok()
+                            .map(|map| {
+                                let prefix = format!("{rid}:");
+                                map.iter()
+                                    .filter(|(key, _)| key.starts_with(&prefix))
+                                    .filter(|(_, text)| !text.is_empty())
+                                    .map(|(_, text)| text.clone())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        if let Ok(mut items) = stream_reasoning_encrypted.lock() {
+                            // Dedupe on id — the parser may emit a
+                            // duplicate `output_item.done` if the upstream
+                            // resends the trailing frame.
+                            if !items.iter().any(|item| item.id == rid) {
+                                items.push(ReasoningItem {
+                                    id: rid,
+                                    encrypted_content,
+                                    summary,
+                                });
+                            }
+                        }
+                    }
+                    StreamEvent::ToolCall(call) => {
+                        if call.name == crate::agent::parts::STRUCTURED_OUTPUT_TOOL_NAME {
+                            if let Ok(mut slot) = structured_capture.lock() {
+                                *slot = Some(call.input.clone());
+                            }
+                            return;
+                        }
+                        let exit = call.name == "plan_exit";
+                        if stream_plan_exit.load(Ordering::SeqCst) && !exit {
+                            return;
+                        }
+                        let join = stream_join.clone();
+                        let cancel = stream_cancel.clone();
+                        let root = stream_root.clone();
+                        let mid = stream_mid.clone();
+                        let pid = stream_pid.clone();
+                        let id = stream_id.clone();
+                        let state = stream_state.clone();
+                        let model = stream_model.clone();
+                        let dir = stream_dir.clone();
+                        let project = stream_project.clone();
+                        let pending_tools = stream_pending.clone();
+                        let plan_exit = stream_plan_exit.clone();
+                        let idx = {
+                            let guard = join.lock().unwrap();
+                            base_idx + guard.len()
+                        };
+                        let tool = live_tool_name(&call.name);
+                        let pending =
+                            tool_running(&mid, &pid, idx, &tool, &call.id, &call.input, start_time);
+                        if let Ok(record) = state.store.append_message_record(
+                            &id,
+                            MessageAppendInput {
+                                info: start.result.info.clone(),
+                                parts: vec![pending],
+                            },
+                        ) {
+                            publish_events(&state, dir, project, record.events);
+                        }
+                        if let Ok(mut pending) = pending_tools.lock() {
+                            pending.push(PendingTool {
+                                idx,
+                                tool: tool.clone(),
+                                call: call.id.clone(),
+                                input: call.input.clone(),
+                            });
+                        }
+                        if exit {
+                            plan_exit.store(true, Ordering::SeqCst);
+                            if let Ok(mut guard) = join.lock() {
+                                guard.abort_all();
+                            }
+                        }
+                        let mut guard = join.lock().unwrap();
+                        guard.spawn(async move {
+                            if is_canceled(&cancel) {
+                                return (
+                                    idx,
+                                    tool_error(
+                                        &mid,
+                                        &pid,
+                                        idx,
+                                        &tool,
+                                        &call.id,
+                                        &call.input,
+                                        "Tool call aborted".to_string(),
+                                        start_time,
+                                    ),
+                                );
+                            }
+                            let part = real_tool_part(
+                                &state, &root, &id, &mid, &pid, idx, &call, start_time, cancel,
+                                model,
+                            )
+                            .await;
+                            (idx, part)
                         });
                     }
-                    let mut guard = join.lock().unwrap();
-                    guard.spawn(async move {
-                        // Cooperative pre-check. Synchronous filesystem
-                        // calls inside `real_tool_part` cannot themselves
-                        // observe cancel; this gate lets a mid-stream
-                        // abort skip the actual handler invocation.
-                        if is_canceled(&cancel) {
-                            return (
-                                idx,
-                                tool_error(
-                                    &mid,
-                                    &pid,
-                                    idx,
-                                    &tool,
-                                    &call.id,
-                                    &call.input,
-                                    "Tool call aborted".to_string(),
-                                    start_time,
-                                ),
+                    StreamEvent::ToolDelta { .. }
+                    | StreamEvent::Usage(_)
+                    | StreamEvent::Finish(_) => {}
+                    StreamEvent::Error(err) => {
+                        publish_error(&state, id, provider_error(ProviderError::Api(err)))
+                    }
+                },
+            )
+            .await;
+            if let Err(err) = &result {
+                let pending_len = pending_tools.lock().map(|items| items.len()).unwrap_or(0);
+                let reasoning_len = iter_reasoning.lock().map(|items| items.len()).unwrap_or(0);
+                let clean = deltas.len() == before_delta_len
+                    && pending_len == before_pending_len
+                    && reasoning_len == before_reasoning_len;
+                // Mid-stream branch: content streamed before the failure.
+                // The pre-response retry path only fires for `clean`
+                // failures; here we replay the iteration with the
+                // partial assistant content appended so the model
+                // continues coherently. Capped at
+                // `MID_STREAM_RETRY_CAP` per turn — beyond that, the
+                // partial finalizes as a terminal error.
+                if !clean && !is_canceled(&cancel) && !matches!(err, ProviderError::Aborted) {
+                    let retries = mid_stream_retry_counter(&state, id);
+                    let attempt = retries
+                        .as_ref()
+                        .map(|counter| counter.load(Ordering::SeqCst))
+                        .unwrap_or(MID_STREAM_RETRY_CAP);
+                    if attempt < MID_STREAM_RETRY_CAP {
+                        if let Some(counter) = retries.as_ref() {
+                            counter.store(attempt + 1, Ordering::SeqCst);
+                        }
+                        let next_attempt = attempt + 1;
+                        let delay = err
+                            .retry_after_ms()
+                            .map(Duration::from_millis)
+                            .unwrap_or_else(mid_stream_default_delay);
+                        let next_at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|value| value.as_millis() as u64)
+                            .unwrap_or(0)
+                            .saturating_add(delay.as_millis() as u64);
+                        publish_status_value(
+                            &state,
+                            id,
+                            json!({
+                                "type": "retry",
+                                "attempt": next_attempt,
+                                "message": err.to_string(),
+                                "next": next_at,
+                            }),
+                        );
+                        // Abort any in-flight tool tasks; the retry's
+                        // model output will re-issue them. The
+                        // `pending_tools` slate gets cleared so the
+                        // doom-loop / missing-output bookkeeping
+                        // doesn't double-count.
+                        {
+                            let mut guard = join_set.lock().unwrap();
+                            guard.abort_all();
+                        }
+                        if let Ok(mut pending) = pending_tools.lock() {
+                            pending.clear();
+                        }
+                        // Snapshot the partial assistant content the
+                        // model produced this iteration. We splice it
+                        // into the request `input[]` as a synthetic
+                        // assistant ChatMessage so the retry round
+                        // continues from where the failure cut the
+                        // stream — no `previous_response_id` needed,
+                        // works regardless of the upstream `store`
+                        // flag.
+                        let partial_text = iter_text
+                            .lock()
+                            .map(|guard| guard.clone())
+                            .unwrap_or_default();
+                        let partial_reasoning: Vec<ReasoningItem> = iter_reasoning_encrypted
+                            .lock()
+                            .map(|items| items.clone())
+                            .unwrap_or_default();
+                        if !partial_text.is_empty() || !partial_reasoning.is_empty() {
+                            let responses: Vec<ChatResponseItem> = partial_reasoning
+                                .into_iter()
+                                .map(ChatResponseItem::Reasoning)
+                                .collect();
+                            iter_messages.push(ChatMessage {
+                                role: "assistant".to_string(),
+                                content: partial_text,
+                                responses,
+                                attachments: Vec::new(),
+                            });
+                        }
+                        if sleep_or_cancel(&cancel, delay).await {
+                            break Err(ProviderError::Aborted);
+                        }
+                        publish_status(&state, id, "busy");
+                        continue;
+                    }
+                }
+                if clean {
+                    if crate::routes::network::disconnected(err) {
+                        // Audit Fix: skip the SSE fan-out if a wait is
+                        // already pending for this session. Bun's
+                        // `SessionNetwork.ask` only ever holds one wait
+                        // per session in practice (the resolver clears
+                        // the slot before the loop reaches another
+                        // failed connect); rapid back-to-back transport
+                        // failures here would otherwise queue duplicate
+                        // `session.network.asked` envelopes for the
+                        // webview before the user has a chance to reply
+                        // to the first.
+                        let already_asked = state.has_network_wait_for_session(id);
+                        if !already_asked {
+                            publish_status_value(
+                                &state,
+                                id,
+                                json!({
+                                    "type": "retry",
+                                    "attempt": 0,
+                                    "message": crate::routes::network::message(err),
+                                    "next": 0,
+                                }),
                             );
                         }
-                        let part = real_tool_part(
-                            &state, &root, &id, &mid, &pid, idx, &call, start_time, cancel, model,
+                        match crate::routes::network::ask_network_wait(
+                            &state,
+                            id,
+                            crate::routes::network::message(err),
+                            &cancel,
                         )
-                        .await;
-                        (idx, part)
-                    });
+                        .await
+                        {
+                            Ok(()) => {
+                                // Wait resolved cleanly (user replied,
+                                // or — once `routes/network.rs` is wired
+                                // to the auto-probe path — connectivity
+                                // returned). Publish the parity
+                                // `session.network.restored` envelope
+                                // (Bun: `session/network.ts:228-244`)
+                                // so the webview can clear any
+                                // "offline" UI before the retry round
+                                // streams any deltas.
+                                crate::http::sse::publish(
+                                    &state,
+                                    GlobalEvent::bus(
+                                        "session.network.restored",
+                                        json!({ "sessionID": id }),
+                                    ),
+                                );
+                                publish_status(&state, id, "busy");
+                                continue;
+                            }
+                            Err(reason) if reason == "aborted" => {
+                                break Err(ProviderError::Aborted)
+                            }
+                            Err(reason) => break Err(ProviderError::Api(reason)),
+                        }
+                    }
+                    if let Some(wait) = retry.next(err) {
+                        publish_status_value(&state, id, retry_status(&wait));
+                        if sleep_or_cancel(&cancel, wait.delay).await {
+                            break Err(ProviderError::Aborted);
+                        }
+                        publish_status(&state, id, "busy");
+                        continue;
+                    }
                 }
-                StreamEvent::ToolDelta { .. } | StreamEvent::Usage(_) | StreamEvent::Finish(_) => {}
-                StreamEvent::Error(err) => {
-                    publish_error(&state, id, provider_error(ProviderError::Api(err)))
-                }
-            },
-        )
-        .await;
+            }
+            break result;
+        };
 
         let aborting = is_canceled(&cancel) || matches!(&out, Err(ProviderError::Aborted));
         if aborting {
@@ -424,6 +729,7 @@ pub(crate) async fn prompt_openai_stream(
         ));
         let had_tools_this_iter = !iter_tools_only.is_empty();
         let denied_this_iter = iter_tools_only.iter().any(is_permission_denial);
+        let plan_exit_this_iter = iter_tools_only.iter().any(is_plan_exit);
         let malformed_this_iter = iter_tools_only.iter().find_map(malformed_tool_arguments);
         tool_parts.extend(iter_tools_only.iter().cloned());
 
@@ -443,6 +749,16 @@ pub(crate) async fn prompt_openai_stream(
                 &tool_parts,
                 Some(&total_usage),
             );
+        }
+
+        // The stream completed without a terminal error path. Reset
+        // the per-turn mid-stream retry counter so a later iteration
+        // that hits its own mid-stream failure can retry up to the
+        // cap again — a clean success budget always replenishes.
+        if matches!(&out, Ok(_)) {
+            if let Some(counter) = mid_stream_retry_counter(&state, id) {
+                counter.store(0, Ordering::SeqCst);
+            }
         }
 
         let provider_out = match out {
@@ -558,26 +874,51 @@ pub(crate) async fn prompt_openai_stream(
         // conclusion text in the continuation step. Reusing the initial empty
         // text part for every iteration made final answers appear above long
         // tool transcripts in the UI.
-        let this_iter_text = if !provider_out.text.is_empty() {
-            provider_out.text.clone()
+        //
+        // After a mid-stream retry the iteration's accumulated `iter_text`
+        // spans both halves of the stream while `provider_out.text` carries
+        // only the retry's continuation. Prefer the longer of the two so
+        // the persisted text part includes everything the user saw.
+        let iter_text_snapshot = iter_text
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let this_iter_text = if iter_text_snapshot.len() >= provider_out.text.len() {
+            iter_text_snapshot
         } else {
-            iter_text
-                .lock()
-                .map(|guard| guard.clone())
-                .unwrap_or_default()
+            provider_out.text.clone()
         };
         last_text = this_iter_text.clone();
+        // Snapshot encrypted reasoning items so the persisted part can
+        // carry `encryptedContent` for any future round-trip. Read once
+        // here so we don't fight the per-event closure for the lock.
+        let encrypted_snapshot: Vec<ReasoningItem> = iter_reasoning_encrypted
+            .lock()
+            .map(|items| items.clone())
+            .unwrap_or_default();
         let reasoning_parts = iter_reasoning
             .lock()
             .map(|map| {
                 map.iter()
                     .filter(|(_, text)| !text.is_empty())
                     .map(|(rid, text)| {
-                        reasoning_part(
+                        // `iter_reasoning`'s key is the per-summary
+                        // `<item_id>:<summary_index>` shape (`reasoning_id`
+                        // in the provider parser). Strip the suffix so we
+                        // can match the bare `<item_id>` carried on the
+                        // `ReasoningItem` event.
+                        let item_id = rid.split(':').next().unwrap_or(rid.as_str());
+                        let encrypted = encrypted_snapshot
+                            .iter()
+                            .find(|item| item.id == item_id)
+                            .map(|item| item.encrypted_content.clone());
+                        reasoning_part_with(
                             &reasoning_part_id(&pid, iteration, rid),
                             text,
                             start_time,
                             Some(start_time),
+                            item_id,
+                            encrypted.as_deref(),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -645,6 +986,11 @@ pub(crate) async fn prompt_openai_stream(
             .map(|slot| slot.is_some())
             .unwrap_or(false)
         {
+            last_finish = Some("stop".to_string());
+            break;
+        }
+
+        if plan_exit_this_iter {
             last_finish = Some("stop".to_string());
             break;
         }
@@ -726,16 +1072,30 @@ pub(crate) async fn prompt_openai_stream(
         // to the Responses API. Bun's converter emits native
         // `function_call` and `function_call_output` input items; mirror
         // that shape instead of summarizing tools as prompt text.
-        if !this_iter_text.is_empty() || !provider_out.tool_calls.is_empty() {
-            history_extension.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: this_iter_text.clone(),
-                responses: provider_out
+        // Encrypted reasoning items captured this iteration are echoed
+        // first so the Responses API can attach cache continuity to the
+        // prior trace (`provider/sdk/copilot/responses/convert-to-openai-responses-input.ts:185-244`).
+        if !this_iter_text.is_empty()
+            || !provider_out.tool_calls.is_empty()
+            || !encrypted_snapshot.is_empty()
+        {
+            let mut responses: Vec<ChatResponseItem> = encrypted_snapshot
+                .iter()
+                .cloned()
+                .map(ChatResponseItem::Reasoning)
+                .collect();
+            responses.extend(
+                provider_out
                     .tool_calls
                     .iter()
                     .cloned()
-                    .map(ChatResponseItem::FunctionCall)
-                    .collect(),
+                    .map(ChatResponseItem::FunctionCall),
+            );
+            history_extension.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: this_iter_text.clone(),
+                responses,
+                attachments: Vec::new(),
             });
         }
         let outputs = iter_tools_only
@@ -747,6 +1107,7 @@ pub(crate) async fn prompt_openai_stream(
                 role: "tool".to_string(),
                 content: String::new(),
                 responses: outputs,
+                attachments: Vec::new(),
             });
         }
 
@@ -790,7 +1151,7 @@ pub(crate) async fn prompt_openai_stream(
     } else {
         last_text
     };
-    let parts = assistant_parts_with(
+    let mut parts = assistant_parts_with(
         &mid,
         &pid,
         &final_text,
@@ -799,6 +1160,27 @@ pub(crate) async fn prompt_openai_stream(
         last_finish.as_deref(),
         id,
     );
+    if let Some(part) = patch_part_for_snapshot(
+        state.store.clone(),
+        project.clone(),
+        &user.info,
+        id,
+        &mid,
+        &pid,
+    )
+    .await
+    {
+        if let Ok(record) = state.store.append_message_record(
+            id,
+            MessageAppendInput {
+                info: start.result.info.clone(),
+                parts: vec![part.clone()],
+            },
+        ) {
+            publish_events(&state, dir.clone(), project.clone(), record.events);
+        }
+        parts.push(part);
+    }
     let captured_structured = structured_capture
         .lock()
         .ok()
@@ -829,6 +1211,15 @@ pub(crate) async fn prompt_openai_stream(
         Some(&total_usage),
         last_finish.as_deref(),
     );
+    if let Some(existing) = state
+        .store
+        .message(id, &mid)
+        .and_then(|message| message.info.get("cost").and_then(Value::as_f64))
+        .filter(|cost| cost.is_finite() && *cost > 0.0)
+    {
+        let own = info.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
+        info["cost"] = json!(existing + own);
+    }
     if let Some(structured) = captured_structured {
         info["structured"] = structured;
     }
@@ -840,6 +1231,33 @@ pub(crate) async fn prompt_openai_stream(
     publish_turn_close(&state, id, "completed");
 
     Ok(assistant.result)
+}
+
+async fn patch_part_for_snapshot(
+    store: kilo_store::Store,
+    project: String,
+    info: &Value,
+    sid: &str,
+    mid: &str,
+    pid: &str,
+) -> Option<Value> {
+    let base = info.get("snapshot").and_then(Value::as_str)?.to_string();
+    let patch =
+        tokio::task::spawn_blocking(move || crate::snapshot::patch(&store, &project, &base))
+            .await
+            .ok()
+            .and_then(Result::ok)?;
+    if patch.files.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "id": format!("{pid}_patch"),
+        "messageID": mid,
+        "sessionID": sid,
+        "type": "patch",
+        "hash": patch.hash,
+        "files": patch.files,
+    }))
 }
 
 fn pending_abort_parts(
@@ -964,6 +1382,133 @@ pub(crate) fn detect_doom_loop(parts: &[Value]) -> Option<(String, Value)> {
     Some((tool, input))
 }
 
+fn spawn_title_generation(
+    state: Arc<AppState>,
+    id: String,
+    cfg: kilo_protocol::Config,
+    auths: Value,
+    model: Option<Value>,
+    text: String,
+    cancel: Arc<AtomicBool>,
+) {
+    if has_openai_base_override(&cfg) || !should_generate_title(&state, &id) {
+        return;
+    }
+    tokio::spawn(async move {
+        let msg = format!("Generate a title for this conversation:\n\n{}", text.trim());
+        let out = kilo_provider::chat_tools_with_auth_cancel(
+            &cfg,
+            &auths,
+            model.as_ref(),
+            Some(TITLE_PROMPT.to_string()),
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: msg,
+                responses: Vec::new(),
+                attachments: Vec::new(),
+            }],
+            Vec::new(),
+            &cancel,
+        )
+        .await;
+        let Ok(out) = out else {
+            return;
+        };
+        let Some(title) = clean_title(&out.text) else {
+            return;
+        };
+        if !should_generate_title(&state, &id) {
+            return;
+        }
+        let updated = state.store.update_session(
+            &id,
+            SessionUpdateInput {
+                title: Some(title),
+                permission: None,
+                time: None,
+            },
+        );
+        if let Ok(Some(session)) = updated {
+            crate::http::sse::publish(
+                &state,
+                GlobalEvent::session(
+                    "session.updated",
+                    Arc::from(state.store.paths().directory.as_str()),
+                    session,
+                ),
+            );
+        }
+    });
+}
+
+fn has_openai_base_override(cfg: &kilo_protocol::Config) -> bool {
+    cfg.data
+        .get("provider")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get("openai"))
+        .and_then(Value::as_object)
+        .and_then(|openai| openai.get("options"))
+        .and_then(Value::as_object)
+        .and_then(|options| options.get("baseURL"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+pub(crate) fn should_generate_title(state: &AppState, id: &str) -> bool {
+    let Some(session) = state.store.session(id) else {
+        return false;
+    };
+    if session.parent_id.is_some() || !is_default_session_title(&session.title) {
+        return false;
+    }
+    let Some(page) = state.store.messages(id, None, None) else {
+        return false;
+    };
+    page.items
+        .iter()
+        .filter(|msg| is_real_user_message(msg))
+        .count()
+        == 1
+}
+
+fn is_real_user_message(msg: &kilo_protocol::Message) -> bool {
+    if msg.info.get("role").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    !msg.parts.iter().all(|part| part.get("synthetic").is_some())
+}
+
+pub(crate) fn is_default_session_title(title: &str) -> bool {
+    ["New session - ", "Child session - "]
+        .iter()
+        .filter_map(|prefix| title.strip_prefix(prefix))
+        .any(|rest| rest.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(rest).is_ok())
+}
+
+pub(crate) fn clean_title(text: &str) -> Option<String> {
+    let mut text = text.to_string();
+    while let Some(start) = text.find("<think>") {
+        let after = start + "<think>".len();
+        let Some(end) = text[after..].find("</think>") else {
+            text.truncate(start);
+            break;
+        };
+        let end = after + end + "</think>".len();
+        text.replace_range(start..end, "");
+    }
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| {
+            let chars = line.chars().collect::<Vec<_>>();
+            if chars.len() > 100 {
+                format!("{}...", chars.iter().take(97).collect::<String>())
+            } else {
+                line.to_string()
+            }
+        })
+}
+
 fn live_tool_name(raw: &str) -> String {
     match repair_tool_name(raw, KNOWN_TOOLS) {
         Repair::Valid(name) => name,
@@ -978,6 +1523,16 @@ fn is_permission_denial(part: &Value) -> bool {
         .and_then(|error| error.get("name"))
         .and_then(Value::as_str)
         == Some("PermissionRejectedError")
+}
+
+fn is_plan_exit(part: &Value) -> bool {
+    part.get("type").and_then(Value::as_str) == Some("tool")
+        && part.get("tool").and_then(Value::as_str) == Some("plan_exit")
+        && part
+            .get("state")
+            .and_then(|state| state.get("status"))
+            .and_then(Value::as_str)
+            == Some("completed")
 }
 
 struct MalformedToolArguments {
@@ -1041,12 +1596,33 @@ fn structured_output_error() -> Value {
     })
 }
 
+/// Snapshot the runner's mid-stream retry counter, or `None` when no
+/// runner is registered for the session (test paths that drive the
+/// agent loop without a `RunnerGuard` see `None` and skip the cap).
+fn mid_stream_retry_counter(state: &AppState, id: &str) -> Option<Arc<AtomicU8>> {
+    state
+        .runners
+        .lock()
+        .ok()?
+        .get(id)
+        .map(|runner| runner.mid_stream_retries.clone())
+}
+
 /// Persist an aborted OAuth turn IN-PLACE on the existing assistant
 /// message. Mirrors Bun's `run-state.ts:48-68 onInterrupt`: one assistant
 /// record per cancelled turn, carrying whatever partial deltas and
 /// completed tool-result parts had streamed before the abort. Re-issuing
 /// `append_message_record` with the same `info.id` and explicit `id`
 /// fields on each part triggers the store's upsert path.
+///
+/// Branches on the active runner's `follow_up_break` flag. When
+/// `prompt_async` arrives mid-turn for the same session, the route trips
+/// both `cancel` and `follow_up_break`; we then stamp `finish: "follow_up"`,
+/// omit the error envelope, and skip `publish_error` so the webview does
+/// not surface an error toast for an intentional break. A regular
+/// user-driven abort (`abort_session`) leaves `follow_up_break` clear —
+/// the turn finalizes with the canonical `MessageAbortedError` envelope
+/// and `publish_turn_close(_, "interrupted")`.
 #[allow(clippy::too_many_arguments)]
 fn finalize_openai_aborted(
     state: &AppState,
@@ -1060,9 +1636,22 @@ fn finalize_openai_aborted(
     tool_parts: &[Value],
     usage: Option<&ChatUsage>,
 ) -> rusqlite::Result<MessageAppendResult> {
+    let follow_up = state
+        .runners
+        .lock()
+        .unwrap()
+        .get(id)
+        .map(|runner| runner.follow_up_break.load(Ordering::SeqCst))
+        .unwrap_or(false);
+
     let mut info = start.info.clone();
-    info["error"] = aborted_error();
-    info["finish"] = json!("aborted");
+    if follow_up {
+        info["finish"] = json!("follow_up");
+        info.as_object_mut().map(|map| map.remove("error"));
+    } else {
+        info["error"] = aborted_error();
+        info["finish"] = json!("aborted");
+    }
     if let Some(usage) = usage {
         info["tokens"] = tokens_value(usage);
     }
@@ -1089,9 +1678,14 @@ fn finalize_openai_aborted(
         project.to_string(),
         assistant.events,
     );
-    publish_error(state, id, assistant.result.info["error"].clone());
-    publish_idle(state, id);
-    publish_turn_close(state, id, "interrupted");
+    if follow_up {
+        publish_idle(state, id);
+        publish_turn_close(state, id, "follow_up");
+    } else {
+        publish_error(state, id, assistant.result.info["error"].clone());
+        publish_idle(state, id);
+        publish_turn_close(state, id, "interrupted");
+    }
 
     // Drop the unused pre-existing message id binding silently — the
     // `mid` and `start.info["id"]` are the same value, but this fn uses
@@ -1157,6 +1751,22 @@ fn reasoning_part_id(pid: &str, iteration: usize, id: &str) -> String {
 }
 
 fn reasoning_part(pid: &str, text: &str, start: i64, end: Option<i64>) -> Value {
+    reasoning_part_with(pid, text, start, end, "", None)
+}
+
+/// Like [`reasoning_part`] but also stamps the upstream item id
+/// (`itemID`) and verbatim `encryptedContent` blob so a future
+/// persistence-driven reload can rebuild the encrypted reasoning items
+/// for cache-hit replay. Empty `item_id` / `encrypted` are skipped so
+/// non-reasoning models don't get a payload bloat.
+fn reasoning_part_with(
+    pid: &str,
+    text: &str,
+    start: i64,
+    end: Option<i64>,
+    item_id: &str,
+    encrypted: Option<&str>,
+) -> Value {
     let mut part = json!({
         "id": pid,
         "type": "reasoning",
@@ -1165,6 +1775,12 @@ fn reasoning_part(pid: &str, text: &str, start: i64, end: Option<i64>) -> Value 
     });
     if let Some(end) = end {
         part["time"]["end"] = json!(end);
+    }
+    if !item_id.is_empty() {
+        part["itemID"] = json!(item_id);
+    }
+    if let Some(blob) = encrypted.filter(|text| !text.is_empty()) {
+        part["encryptedContent"] = json!(blob);
     }
     part
 }
@@ -1359,6 +1975,14 @@ fn env_block(input: &PromptInput, working_dir: &str) -> String {
     // Bun uses verbatim. chrono's `format("%a %b %d %Y")` produces the same
     // shape ("Sun May 02 2026").
     let today = chrono::Local::now().format("%a %b %d %Y").to_string();
+    let shell = input
+        .editor_context
+        .as_ref()
+        .and_then(|ctx| ctx.get("shell"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("\n  Default shell: {value}"))
+        .unwrap_or_default();
     format!(
         "You are powered by the model named {model}. The exact model ID is {provider}/{model}\n\
          Here is some useful information about the environment you are running in:\n\
@@ -1366,7 +1990,7 @@ fn env_block(input: &PromptInput, working_dir: &str) -> String {
            Working directory: {working_dir}\n  \
            Platform: {platform}\n  \
            Today's date: {today}\n  \
-           Optional project config: AGENTS.md, kilo.json[c], .kilo/kilo.json[c], .kilo/command/*.md, .kilo/agent/*.md. Do not assume optional config files exist; list/glob before reading them. Put new commands and agents in .kilo/. Do not use .kilocode/ or .opencode/.\n\
+           Optional project config: AGENTS.md, kilo.json[c], .kilo/kilo.json[c], .kilo/command/*.md, .kilo/agent/*.md. Do not assume optional config files exist; list/glob before reading them. Put new commands and agents in .kilo/. Do not use .kilocode/ or .opencode/.{shell}\n\
          </env>",
     )
 }
@@ -1430,12 +2054,12 @@ pub(crate) fn zero_tokens() -> Value {
     })
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn has_tool_calls(messages: &[Value]) -> bool {
     messages.iter().any(|message| has_tool_call(message))
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn has_tool_call(value: &Value) -> bool {
     match value {
         Value::Object(map) => {
@@ -1460,7 +2084,7 @@ pub(crate) fn has_tool_call(value: &Value) -> bool {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn should_inject_noop(
     provider: &str,
     lite: bool,

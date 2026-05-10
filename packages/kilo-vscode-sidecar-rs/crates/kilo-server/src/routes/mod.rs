@@ -10,6 +10,10 @@ pub(crate) mod enhance;
 pub(crate) mod files;
 pub(crate) mod health;
 pub(crate) mod indexing;
+pub(crate) mod integrations;
+// `log` collides with the `log` crate / tracing macros in some scopes; the
+// suffix keeps the route module unambiguous at the use sites.
+pub(crate) mod log_route;
 pub(crate) mod mcp;
 pub(crate) mod messages;
 pub(crate) mod network;
@@ -18,4 +22,5 @@ pub(crate) mod prompt;
 pub(crate) mod pty;
 pub(crate) mod registry;
 pub(crate) mod sessions;
+pub(crate) mod vcs;
 pub(crate) mod worktree;

@@ -1,0 +1,6 @@
+{
+  "runtime": "bun",
+  "status": "bootstrap",
+  "note": "Populate with `cargo run -p kilo-oracle --bin bench-compare -- --runtime bun --scenario smoke --trials 30 --warmups 3 --output packages/kilo-vscode-sidecar-rs/benchmarks/raw/windows-bun.jsonl` and bless the generated summary.",
+  "scenarios": []
+}

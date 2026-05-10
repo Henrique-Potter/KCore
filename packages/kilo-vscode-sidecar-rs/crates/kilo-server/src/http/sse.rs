@@ -292,11 +292,15 @@ pub(crate) fn publish_turn_close(state: &AppState, id: &str, reason: &str) {
 }
 
 pub(crate) fn publish_status(state: &AppState, id: &str, status: &str) {
+    publish_status_value(state, id, json!({ "type": status }));
+}
+
+pub(crate) fn publish_status_value(state: &AppState, id: &str, status: Value) {
     publish(
         state,
         GlobalEvent::bus(
             "session.status",
-            json!({ "sessionID": id, "status": { "type": status } }),
+            json!({ "sessionID": id, "status": status }),
         ),
     );
 }

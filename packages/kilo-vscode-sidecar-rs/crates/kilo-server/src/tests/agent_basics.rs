@@ -15,10 +15,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::agent::fake::{fake_tool_parts, wait_fake};
-use crate::agent::turn::{ensure_prompt_supported, prompt_guarded, prompt_turn};
+use crate::agent::parts::prompt_text;
+use crate::agent::turn::{
+    ensure_prompt_supported, plan_followup_decision, prompt_guarded, prompt_turn, start_runner,
+    PlanFollowup,
+};
 use crate::routes::health::agents;
 use crate::routes::prompt::{abort_session, prompt, prompt_async};
-use crate::{FakeCall, TurnError};
+use crate::{FakeCall, PendingPermission, PendingQuestion, PendingSuggestion, TurnError};
 
 use super::common::{
     assert_delta, assert_sync, drain, drain_no_store_mirror, response_to_value, seed, state,
@@ -821,6 +825,474 @@ async fn prompt_async_returns_no_content_and_persists_transcript() {
 }
 
 #[tokio::test]
+async fn prompt_async_queues_same_session_followup() {
+    // After the mid-loop follow-up break landed, a same-session
+    // `prompt_async` arriving while the first turn is still running
+    // signals the active runner to break (not just queue and wait).
+    // The first turn finalizes as `interrupted` with whatever partial
+    // state it had; the queued follow-up then runs normally.
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("create session");
+
+    let first = prompt_async(
+        State(state.clone()),
+        Path(session.id.clone()),
+        Json(PromptInput {
+            parts: vec![json!({ "type": "text", "text": "first" })],
+            provider: Some(json!({ "fake": true, "fakeDelayMs": 80 })),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::NO_CONTENT);
+    for _ in 0..20 {
+        if state.runners.lock().unwrap().contains_key(&session.id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let second = prompt_async(
+        State(state.clone()),
+        Path(session.id.clone()),
+        Json(PromptInput {
+            parts: vec![json!({ "type": "text", "text": "second" })],
+            provider: Some(json!({ "fake": true })),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::NO_CONTENT);
+
+    for _ in 0..80 {
+        let page = state.store.messages(&session.id, None, None).unwrap();
+        if page.items.len() == 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let page = state.store.messages(&session.id, None, None).unwrap();
+    assert_eq!(page.items.len(), 4);
+    assert_eq!(page.items[0].parts[0]["text"], "first");
+    // First turn was broken mid-flight by the follow-up — assistant
+    // record carries an aborted error envelope rather than the full
+    // echo. `finish` is the generic `"error"` because that's what
+    // `assistant_error_info` stamps; the discriminator is `error.name`.
+    assert_eq!(
+        page.items[1].info["error"]["name"].as_str(),
+        Some("MessageAbortedError")
+    );
+    assert_eq!(page.items[2].parts[0]["text"], "second");
+    assert_eq!(prompt_text(&page.items[3].parts), "Echo: second");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn prompt_async_follow_up_breaks_active_turn_and_continues_with_new_user_message() {
+    // Bun parity: `kilocode/session/prompt-queue.ts:hasFollowup` —
+    // when a follow-up `prompt_async` arrives mid-turn, the active
+    // turn breaks at the next safe boundary (cancel observed inside
+    // `wait_fake`) and the queued follow-up turn fires with the new
+    // user message appended. The first turn's partial state must
+    // persist (user message + interrupted assistant record), and
+    // the abort-style `reject_pending_for_sessions` cascade must NOT
+    // fire (this is a follow-up break, not a user abort).
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("create session");
+
+    // Stage a pending permission so we can assert the follow-up does
+    // NOT reject it (distinguishing follow-up break from abort_session).
+    let (perm_tx, mut perm_rx) = tokio::sync::oneshot::channel();
+    state.permissions.lock().unwrap().insert(
+        "perm_followup".to_string(),
+        PendingPermission {
+            info: json!({
+                "id": "perm_followup",
+                "sessionID": session.id.clone(),
+                "permission": "edit",
+            }),
+            reply: perm_tx,
+        },
+    );
+
+    let first = prompt_async(
+        State(state.clone()),
+        Path(session.id.clone()),
+        Json(PromptInput {
+            parts: vec![json!({ "type": "text", "text": "long" })],
+            // 400ms gives the cancel-observing wait_fake loop plenty of
+            // chances to see the follow-up signal mid-flight.
+            provider: Some(json!({ "fake": true, "fakeDelayMs": 400 })),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::NO_CONTENT);
+    let mut active = false;
+    for _ in 0..30 {
+        if state.runners.lock().unwrap().contains_key(&session.id) {
+            active = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(active, "first runner never started");
+
+    // Snapshot the active runner's flag pre-followup (must be false).
+    {
+        let runners = state.runners.lock().unwrap();
+        let runner = runners.get(&session.id).expect("runner present");
+        assert!(!runner.follow_up_break.load(Ordering::SeqCst));
+        assert!(!runner.cancel.load(Ordering::SeqCst));
+    }
+
+    let second = prompt_async(
+        State(state.clone()),
+        Path(session.id.clone()),
+        Json(PromptInput {
+            parts: vec![json!({ "type": "text", "text": "appended" })],
+            provider: Some(json!({ "fake": true })),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::NO_CONTENT);
+
+    // Wait for both turns to settle: 4 messages total
+    // (user "long", aborted assistant, user "appended", echo assistant).
+    for _ in 0..200 {
+        let page = state.store.messages(&session.id, None, None).unwrap();
+        if page.items.len() >= 4 && state.runners.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let page = state.store.messages(&session.id, None, None).unwrap();
+    assert_eq!(
+        page.items.len(),
+        4,
+        "expected 4 messages, got {}",
+        page.items.len()
+    );
+    assert_eq!(page.items[0].info["role"].as_str(), Some("user"));
+    assert_eq!(page.items[0].parts[0]["text"], "long");
+    // First assistant: interrupted (mid-turn break before echo could land).
+    // `finish` is the generic `"error"` per `assistant_error_info`; the
+    // distinguishing field is `error.name == "MessageAbortedError"`.
+    assert_eq!(page.items[1].info["role"].as_str(), Some("assistant"));
+    assert_eq!(
+        page.items[1].info["error"]["name"].as_str(),
+        Some("MessageAbortedError"),
+        "first turn should finalize as aborted on follow-up break"
+    );
+    // Follow-up turn carries the new user message and a clean echo.
+    assert_eq!(page.items[2].info["role"].as_str(), Some("user"));
+    assert_eq!(page.items[2].parts[0]["text"], "appended");
+    assert_eq!(page.items[3].info["role"].as_str(), Some("assistant"));
+    assert_eq!(prompt_text(&page.items[3].parts), "Echo: appended");
+
+    // Bun parity (`KiloSessionPromptQueue.scope()`): the queued
+    // follow-up's user message is a SIBLING of the broken turn's user
+    // message (sharing the same parent), not a child of the partial
+    // assistant. Both U1 and U2 here have no parent (session root), so
+    // their `parentID` fields match (absent).
+    let u1_parent = page.items[0].info.get("parentID").cloned();
+    let u2_parent = page.items[2].info.get("parentID").cloned();
+    assert_eq!(
+        u1_parent, u2_parent,
+        "follow-up user message must be a sibling of the broken user message"
+    );
+    // The session-scoped anchor must have been consumed by the
+    // follow-up; subsequent prompts get natural parentage.
+    assert!(
+        state.take_broken_turn_anchor(&session.id).is_none(),
+        "broken_turn_anchor must be consumed exactly once"
+    );
+
+    // Permission survived the break — follow-up did NOT call
+    // reject_pending_for_sessions.
+    assert!(
+        state
+            .permissions
+            .lock()
+            .unwrap()
+            .contains_key("perm_followup"),
+        "follow-up break must not reject pending permissions"
+    );
+    assert!(
+        perm_rx.try_recv().is_err(),
+        "permission reply channel must remain unresolved"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn prompt_async_followup_inherits_broken_turn_parent_anchor() {
+    // Bun parity: `KiloSessionPromptQueue.scope()` retargets the queued
+    // follow-up's `parentID` onto the broken turn's parent. Here we
+    // pre-seed a non-empty anchor (simulating what `commit_broken_turn_anchor`
+    // would write) and assert the next regular `prompt` turn picks it
+    // up as the new user message's `parentID`, then clears the anchor.
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("create session");
+
+    // Simulate a broken-turn anchor pointing at a fake parent message id.
+    state.set_broken_turn_anchor(&session.id, "msg_root_parent");
+
+    let res = prompt(
+        State(state.clone()),
+        Path(session.id.clone()),
+        Json(PromptInput {
+            parts: vec![json!({ "type": "text", "text": "after-break" })],
+            provider: Some(json!({ "fake": true })),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let page = state.store.messages(&session.id, None, None).unwrap();
+    let user = page
+        .items
+        .iter()
+        .find(|m| m.info["role"].as_str() == Some("user"))
+        .expect("user message persisted");
+    assert_eq!(
+        user.info.get("parentID").and_then(|v| v.as_str()),
+        Some("msg_root_parent"),
+        "follow-up user message must adopt the pending broken_turn_anchor"
+    );
+
+    // Anchor must be consumed exactly once.
+    assert!(
+        state.take_broken_turn_anchor(&session.id).is_none(),
+        "broken_turn_anchor must be cleared after the first follow-up reads it"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn regular_prompt_without_break_uses_natural_parentage() {
+    // Regression: a normal prompt turn (no prior follow-up break) must
+    // not invent a stale anchor. The new user message's `parentID` is
+    // absent — the session-root case — exactly as the pre-anchor flow.
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("create session");
+
+    // Sanity: no anchor preset.
+    assert!(state.take_broken_turn_anchor(&session.id).is_none());
+
+    let res = prompt(
+        State(state.clone()),
+        Path(session.id.clone()),
+        Json(PromptInput {
+            parts: vec![json!({ "type": "text", "text": "fresh" })],
+            provider: Some(json!({ "fake": true })),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let page = state.store.messages(&session.id, None, None).unwrap();
+    let user = page
+        .items
+        .iter()
+        .find(|m| m.info["role"].as_str() == Some("user"))
+        .expect("user message persisted");
+    assert!(
+        user.info.get("parentID").is_none(),
+        "natural turn must not stamp a parentID on the user message; got {:?}",
+        user.info.get("parentID")
+    );
+
+    // Anchor remains unset post-turn.
+    assert!(
+        state.take_broken_turn_anchor(&session.id).is_none(),
+        "successful turn must not leak a broken_turn_anchor"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn abort_session_cancels_queued_async_followup() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("create session");
+
+    let first = prompt_async(
+        State(state.clone()),
+        Path(session.id.clone()),
+        Json(PromptInput {
+            parts: vec![json!({ "type": "text", "text": "slow" })],
+            provider: Some(json!({ "fake": true, "fakeDelayMs": 120 })),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::NO_CONTENT);
+    for _ in 0..20 {
+        if state.runners.lock().unwrap().contains_key(&session.id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let second = prompt_async(
+        State(state.clone()),
+        Path(session.id.clone()),
+        Json(PromptInput {
+            parts: vec![json!({ "type": "text", "text": "queued" })],
+            provider: Some(json!({ "fake": true })),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::NO_CONTENT);
+    let res = abort_session(State(state.clone()), Path(session.id.clone())).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    for _ in 0..40 {
+        if state.runners.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let page = state.store.messages(&session.id, None, None).unwrap();
+    assert!(page.items.len() <= 2);
+    assert!(page
+        .items
+        .iter()
+        .all(|msg| prompt_text(&msg.parts) != "queued"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn prompt_async_dismisses_question_suggestion_waits_without_rejecting_permissions() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("create session");
+
+    let first = prompt_async(
+        State(state.clone()),
+        Path(session.id.clone()),
+        Json(PromptInput {
+            parts: vec![json!({ "type": "text", "text": "slow" })],
+            provider: Some(json!({ "fake": true, "fakeDelayMs": 120 })),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::NO_CONTENT);
+    for _ in 0..20 {
+        if state.runners.lock().unwrap().contains_key(&session.id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let (perm_tx, _perm_rx) = tokio::sync::oneshot::channel();
+    state.permissions.lock().unwrap().insert(
+        "perm_wait".to_string(),
+        PendingPermission {
+            info: json!({
+                "id": "perm_wait",
+                "sessionID": session.id.clone(),
+                "permission": "edit",
+            }),
+            reply: perm_tx,
+        },
+    );
+    let (que_tx, que_rx) = tokio::sync::oneshot::channel();
+    state.questions.lock().unwrap().insert(
+        "que_wait".to_string(),
+        PendingQuestion {
+            info: json!({
+                "id": "que_wait",
+                "sessionID": session.id.clone(),
+            }),
+            reply: que_tx,
+        },
+    );
+    let (sgt_tx, sgt_rx) = tokio::sync::oneshot::channel();
+    state.suggestions.lock().unwrap().insert(
+        "sgt_wait".to_string(),
+        PendingSuggestion {
+            info: json!({
+                "id": "sgt_wait",
+                "sessionID": session.id.clone(),
+            }),
+            reply: sgt_tx,
+        },
+    );
+
+    let second = prompt_async(
+        State(state.clone()),
+        Path(session.id.clone()),
+        Json(PromptInput {
+            parts: vec![json!({ "type": "text", "text": "queued" })],
+            provider: Some(json!({ "fake": true })),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::NO_CONTENT);
+    assert!(matches!(
+        que_rx.await.unwrap(),
+        crate::QuestionReply::Rejected
+    ));
+    assert_eq!(sgt_rx.await.unwrap(), crate::SuggestionDecision::Dismiss);
+    assert!(!state.questions.lock().unwrap().contains_key("que_wait"));
+    assert!(!state.suggestions.lock().unwrap().contains_key("sgt_wait"));
+    assert!(state.permissions.lock().unwrap().contains_key("perm_wait"));
+
+    let res = abort_session(State(state.clone()), Path(session.id.clone())).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    for _ in 0..40 {
+        if state.runners.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn prompt_rejects_same_busy_session_without_queueing() {
     let root = unique_root();
     let state = state_at(&root);
@@ -988,6 +1460,296 @@ async fn fake_tool_calls_run_in_parallel_and_return_input_order() {
     );
     assert_eq!(parts[0]["state"]["input"]["filePath"], "a.txt");
     assert_eq!(parts[1]["state"]["input"]["filePath"], "b.txt");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+// ---------------------------------------------------------------------
+// Plan-mode follow-up handoff
+// ---------------------------------------------------------------------
+
+/// Build a synthetic assistant `MessageAppendResult` carrying a
+/// completed `plan_exit` tool part. Used by the plan-followup tests to
+/// drive `plan_followup_decision` without needing a fake provider that
+/// can dispatch `plan_exit` end-to-end.
+fn synth_plan_exit_result(
+    mid: &str,
+    agent: &str,
+    plan_path: Option<&str>,
+) -> kilo_protocol::MessageAppendResult {
+    let metadata = match plan_path {
+        Some(path) => json!({ "plan": path }),
+        None => json!({ "plan": null }),
+    };
+    let part = json!({
+        "id": format!("{mid}_part_plan_exit"),
+        "type": "tool",
+        "messageID": mid,
+        "callID": format!("call_{mid}_plan"),
+        "tool": "plan_exit",
+        "state": {
+            "status": "completed",
+            "input": {},
+            "output": "Plan is ready",
+            "metadata": metadata,
+            "title": "Planning complete",
+            "time": { "start": 1, "end": 1 },
+        },
+    });
+    kilo_protocol::MessageAppendResult {
+        info: json!({
+            "id": mid,
+            "role": "assistant",
+            "agent": agent,
+            "finish": "stop",
+        }),
+        parts: vec![part],
+        time: 1,
+    }
+}
+
+#[tokio::test]
+async fn plan_exit_raises_continue_question() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("session");
+    let _runner = start_runner(state.clone(), &session.id).expect("runner");
+    let mut bus = state.bus.subscribe();
+
+    let result = synth_plan_exit_result("msg_plan_exit", "plan", Some(".kilo/plans/draft.md"));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let state_for_task = state.clone();
+    let sid = session.id.clone();
+    let task = tokio::spawn(async move {
+        plan_followup_decision(&state_for_task, &sid, &result, cancel).await
+    });
+
+    // Wait for the question to land in state.questions.
+    let qid = "question_plan_followup_msg_plan_exit".to_string();
+    for _ in 0..50 {
+        if state.questions.lock().unwrap().contains_key(&qid) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let info = state
+        .questions
+        .lock()
+        .unwrap()
+        .get(&qid)
+        .expect("plan-followup question")
+        .info
+        .clone();
+    assert_eq!(info["sessionID"], session.id);
+    assert_eq!(
+        info["questions"][0]["question"],
+        "Continue with implementation?"
+    );
+    assert_eq!(info["questions"][0]["options"][0]["label"], "yes");
+    assert_eq!(info["questions"][0]["options"][1]["label"], "no");
+    assert_eq!(info["metadata"]["kind"], "plan_followup");
+
+    // The runner should be marked as awaiting the follow-up question.
+    let awaiting = state
+        .runners
+        .lock()
+        .unwrap()
+        .get(&session.id)
+        .map(|r| r.awaiting_plan_followup.load(Ordering::SeqCst))
+        .unwrap_or(false);
+    assert!(awaiting, "runner should be marked awaiting plan follow-up");
+
+    // The bus should have published the question.
+    let mut saw_asked = false;
+    while let Ok(event) = bus.try_recv() {
+        if event.as_global().payload.kind == "question.asked" {
+            saw_asked = true;
+            break;
+        }
+    }
+    assert!(saw_asked, "expected question.asked SSE event");
+
+    // Reject the question to let the spawned task complete.
+    let entry = state.questions.lock().unwrap().remove(&qid).unwrap();
+    let _ = entry.reply.send(crate::QuestionReply::Rejected);
+    let outcome = task.await.unwrap().unwrap();
+    assert!(matches!(outcome, PlanFollowup::Stay));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_followup_yes_dispatches_implementation_prompt() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("session");
+    let _runner = start_runner(state.clone(), &session.id).expect("runner");
+
+    let result = synth_plan_exit_result("msg_yes", "plan", Some(".kilo/plans/handoff.md"));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let state_for_task = state.clone();
+    let sid = session.id.clone();
+    let task = tokio::spawn(async move {
+        plan_followup_decision(&state_for_task, &sid, &result, cancel).await
+    });
+
+    let qid = "question_plan_followup_msg_yes".to_string();
+    for _ in 0..50 {
+        if state.questions.lock().unwrap().contains_key(&qid) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let entry = state
+        .questions
+        .lock()
+        .unwrap()
+        .remove(&qid)
+        .expect("question");
+    let _ = entry
+        .reply
+        .send(crate::QuestionReply::Answers(json!([["yes"]])));
+
+    let outcome = task.await.unwrap().unwrap();
+    let PlanFollowup::Continue { next, agent_switch } = outcome else {
+        panic!("expected PlanFollowup::Continue");
+    };
+    assert_eq!(agent_switch, "code");
+    assert_eq!(next.agent.as_deref(), Some("code"));
+    assert_eq!(next.parts.len(), 1);
+    assert_eq!(next.parts[0]["type"], "text");
+    assert_eq!(next.parts[0]["synthetic"], true);
+    let text = next.parts[0]["text"].as_str().unwrap();
+    assert!(
+        text.contains(".kilo/plans/handoff.md"),
+        "expected plan path in synth prompt, got {text}"
+    );
+    assert!(text.to_lowercase().contains("implement"));
+
+    // Awaiting flag should be cleared once the helper returns.
+    let awaiting = state
+        .runners
+        .lock()
+        .unwrap()
+        .get(&session.id)
+        .map(|r| r.awaiting_plan_followup.load(Ordering::SeqCst))
+        .unwrap_or(false);
+    assert!(!awaiting, "awaiting flag should be cleared after reply");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_followup_no_ends_turn_cleanly() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("session");
+    let _runner = start_runner(state.clone(), &session.id).expect("runner");
+
+    let result = synth_plan_exit_result("msg_no", "plan", None);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let state_for_task = state.clone();
+    let sid = session.id.clone();
+    let task = tokio::spawn(async move {
+        plan_followup_decision(&state_for_task, &sid, &result, cancel).await
+    });
+
+    let qid = "question_plan_followup_msg_no".to_string();
+    for _ in 0..50 {
+        if state.questions.lock().unwrap().contains_key(&qid) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let entry = state
+        .questions
+        .lock()
+        .unwrap()
+        .remove(&qid)
+        .expect("question");
+    let _ = entry
+        .reply
+        .send(crate::QuestionReply::Answers(json!([["no"]])));
+
+    let outcome = task.await.unwrap().unwrap();
+    assert!(
+        matches!(outcome, PlanFollowup::Stay),
+        "expected Stay outcome on `no` reply"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_followup_skips_when_agent_is_not_plan() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("session");
+    let _runner = start_runner(state.clone(), &session.id).expect("runner");
+
+    // Same plan_exit part shape but assistant.agent = "code" — must
+    // not raise the follow-up question (Bun parity: only the `plan`
+    // agent triggers the handoff prompt).
+    let result = synth_plan_exit_result("msg_code", "code", Some(".kilo/plans/x.md"));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let outcome = plan_followup_decision(&state, &session.id, &result, cancel)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, PlanFollowup::Stay));
+    assert!(state.questions.lock().unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_followup_skips_when_no_plan_exit_part() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("session");
+    let _runner = start_runner(state.clone(), &session.id).expect("runner");
+
+    // Plan agent but the assistant message has no plan_exit tool part —
+    // user is still planning, no follow-up.
+    let result = kilo_protocol::MessageAppendResult {
+        info: json!({
+            "id": "msg_planning",
+            "role": "assistant",
+            "agent": "plan",
+            "finish": "stop",
+        }),
+        parts: vec![json!({
+            "id": "msg_planning_text",
+            "type": "text",
+            "text": "Working on the plan.",
+        })],
+        time: 1,
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let outcome = plan_followup_decision(&state, &session.id, &result, cancel)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, PlanFollowup::Stay));
+    assert!(state.questions.lock().unwrap().is_empty());
 
     let _ = std::fs::remove_dir_all(root);
 }

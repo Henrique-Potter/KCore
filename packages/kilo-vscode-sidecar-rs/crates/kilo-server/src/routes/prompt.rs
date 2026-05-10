@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 use crate::{agent, busy_error, internal_error, unsupported_provider_error, AppState, TurnError};
 
-use super::permissions::reject_pending_for_sessions;
+use super::permissions::{dismiss_question_suggestion_waits, reject_pending_for_sessions};
 
 pub(crate) async fn prompt(
     State(state): State<Arc<AppState>>,
@@ -75,6 +75,25 @@ pub(crate) async fn prompt_async(
     id: Path<String>,
     input: Json<PromptInput>,
 ) -> Response {
+    if state.0.store.session(&id.0).is_some() {
+        let ids = active_session_family(&state.0, session_family(&state.0, &id.0));
+        dismiss_question_suggestion_waits(&state.0, &ids);
+        // Mid-loop follow-up break: if a runner is already active for
+        // this session, signal it to break at the next safe boundary so
+        // the queued follow-up turn picks up the partial assistant
+        // message in history. Distinct from `abort_session` — we do NOT
+        // bump the prompt-queue version (queue is preserved) and do NOT
+        // run the reject-pending cascade on permissions. Bun parity:
+        // `kilocode/session/prompt-queue.ts:hasFollowup` short-circuits
+        // the active turn when a same-session prompt arrives.
+        let runners = state.0.runners.lock().unwrap();
+        for sid in &ids {
+            if let Some(runner) = runners.get(sid) {
+                runner.follow_up_break.store(true, Ordering::SeqCst);
+                runner.cancel.store(true, Ordering::SeqCst);
+            }
+        }
+    }
     agent::run_turn_async(state, id, input).await
 }
 
@@ -104,6 +123,9 @@ pub(crate) async fn abort_session(
         return StatusCode::NOT_FOUND.into_response();
     }
     let ids = active_session_family(&state, session_family(&state, &id));
+    for id in &ids {
+        state.cancel_prompt_queue(id);
+    }
     {
         let runners = state.runners.lock().unwrap();
         for id in &ids {

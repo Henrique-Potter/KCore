@@ -34,6 +34,8 @@ use crate::routes::{
         warnings,
     },
     indexing::indexing_status,
+    integrations::{formatter_status, lsp_status},
+    log_route::log_handler,
     mcp::{
         mcp_add, mcp_auth, mcp_call_tool, mcp_connect, mcp_disconnect, mcp_oauth_authorize,
         mcp_oauth_callback, mcp_status,
@@ -45,13 +47,14 @@ use crate::routes::{
         questions, reject_question, reply_permission, reply_question, suggestions,
     },
     prompt::{abort_session, command, prompt, prompt_async},
-    pty::{pty_create, pty_delete, pty_update},
+    pty::{pty_connect, pty_create, pty_delete, pty_update},
     registry::{commands, skills},
     sessions::{
         append_message, children, create_session, delete_session, diff_session, fork_session,
-        revert_session, session, sessions, share_session, summarize_session, todos,
+        init_session, revert_session, session, sessions, share_session, summarize_session, todos,
         unrevert_session, unshare_session, update_session, viewed,
     },
+    vcs::{vcs_branch, vcs_diff},
     worktree::{
         create_worktree, delete_worktree, reset_worktree, worktree_diff, worktree_diff_file,
         worktree_diff_summary, worktrees,
@@ -93,6 +96,8 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
         .route("/agent", get(agents))
         .route("/skill", get(skills))
         .route("/command", get(commands))
+        .route("/lsp", get(lsp_status))
+        .route("/formatter", get(formatter_status))
         .route("/project/current", get(project))
         .route("/session", get(sessions).post(create_session))
         .route("/session/viewed", post(viewed))
@@ -103,6 +108,7 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/session/{id}/children", get(children))
         .route("/session/{id}/todo", get(todos))
+        .route("/session/{id}/init", post(init_session))
         .route("/session/{id}/fork", post(fork_session))
         .route("/session/{id}/diff", get(diff_session))
         .route(
@@ -149,6 +155,7 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
         .route("/file/content", get(file_content))
         .route("/file/status", get(file_status))
         .route("/pty", post(pty_create))
+        .route("/pty/{id}/connect", get(pty_connect))
         .route("/pty/{id}", put(pty_update).delete(pty_delete))
         .route(
             "/experimental/worktree",
@@ -190,6 +197,9 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
         .route("/kilocode/session-import/part", post(kilocode_import_part))
         .route("/kilocode/skill/remove", post(kilocode_remove_skill))
         .route("/kilocode/agent/remove", post(kilocode_remove_agent))
+        .route("/log", post(log_handler))
+        .route("/vcs", get(vcs_branch))
+        .route("/vcs/diff", get(vcs_diff))
         .with_state(state.clone())
         .layer(from_fn_with_state(state, auth))
         // Header→query rewrite must run BEFORE the inner extractors see Query<>

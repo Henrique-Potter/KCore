@@ -13,7 +13,10 @@
 
 use std::{
     path::Path,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc,
+    },
 };
 
 use kilo_protocol::{KiloPath, MessageAppendInput, MessageAppendResult, PromptInput};
@@ -28,6 +31,7 @@ use crate::agent::parts::{
     aborted_error, api_error, append_assistant, assistant_error_info, assistant_path, prompt_text,
     provider_error, real_tools, task_tool_part, user_info,
 };
+use crate::agent::permission::ask_question;
 use crate::{
     publish_error, publish_events, publish_idle, publish_status, publish_turn_close,
     publish_turn_open, registry, AppState, RouteError, Runner, RunnerGuard, TurnError,
@@ -69,8 +73,11 @@ pub(crate) fn start_runner_with_parent(
             id.to_string(),
             Runner {
                 cancel: cancel.clone(),
+                follow_up_break: Arc::new(AtomicBool::new(false)),
                 parent,
                 abort: std::sync::Mutex::new(None),
+                awaiting_plan_followup: Arc::new(AtomicBool::new(false)),
+                mid_stream_retries: Arc::new(AtomicU8::new(0)),
             },
         );
         cancel
@@ -83,6 +90,31 @@ pub(crate) fn start_runner_with_parent(
 }
 
 pub(crate) async fn prompt_turn(
+    state: &Arc<AppState>,
+    id: &str,
+    input: PromptInput,
+    cancel: Arc<AtomicBool>,
+) -> Result<MessageAppendResult, TurnError> {
+    let mut current = input;
+    // Plan-mode follow-up loop. Each pass runs the inner turn once,
+    // then — if the assistant just emitted `plan_exit` from the `plan`
+    // agent — asks the user via `ask_question` whether to hand off to
+    // the implementation agent. On "yes" we synthesize a new user
+    // message and re-enter the loop with `agent = "code"`. On "no" or
+    // a rejected/dropped question we return the original assistant
+    // result. Bun parity: `kilocode/plan-followup.ts::ask`.
+    loop {
+        let result = run_one_turn(state, id, current.clone(), cancel.clone()).await?;
+        match plan_followup_decision(state, id, &result, cancel.clone()).await? {
+            PlanFollowup::Stay => return Ok(result),
+            PlanFollowup::Continue { next, .. } => {
+                current = next;
+            }
+        }
+    }
+}
+
+async fn run_one_turn(
     state: &Arc<AppState>,
     id: &str,
     input: PromptInput,
@@ -105,10 +137,40 @@ pub(crate) async fn prompt_turn(
     publish_turn_open(&state, id);
     publish_status(&state, id, "busy");
 
+    let is_child = state
+        .runners
+        .lock()
+        .unwrap()
+        .get(id)
+        .and_then(|runner| runner.parent.as_ref())
+        .is_some();
+    let snapshot =
+        if is_child || fake_provider(&input) || fake_abort(&input) || fake_error(&input, &text) {
+            None
+        } else {
+            pre_turn_snapshot(state.store.clone(), project.clone()).await
+        };
+    let mut info = user_info(&paths, &input);
+    // Bun parity: `KiloSessionPromptQueue.scope()` retargeting. If the
+    // previous turn broke via `follow_up_break`, the session has a
+    // pending anchor — the parent of the broken user message — that
+    // this follow-up should adopt so the new user message lands as a
+    // sibling of the broken one, not a child of the partial assistant.
+    // Empty anchor means "session root" (no parent).
+    if let Some(anchor) = state.take_broken_turn_anchor(id) {
+        if anchor.is_empty() {
+            info.as_object_mut().map(|map| map.remove("parentID"));
+        } else {
+            info["parentID"] = json!(anchor);
+        }
+    }
+    if let Some(snapshot) = snapshot {
+        info["snapshot"] = json!(snapshot);
+    }
     let user = state.store.append_message_record(
         id,
         MessageAppendInput {
-            info: user_info(&paths, &input),
+            info,
             parts: input.parts.clone(),
         },
     )?;
@@ -118,6 +180,7 @@ pub(crate) async fn prompt_turn(
     let mut active_text = text.clone();
 
     if is_canceled(&cancel) || fake_abort(&input) {
+        commit_broken_turn_anchor(state, id, &user);
         let assistant = state.store.append_message_record(
             id,
             MessageAppendInput {
@@ -165,6 +228,7 @@ pub(crate) async fn prompt_turn(
         active_text = next.text;
     }
     if is_canceled(&cancel) {
+        commit_broken_turn_anchor(state, id, &user);
         let assistant = state.store.append_message_record(
             id,
             MessageAppendInput {
@@ -181,11 +245,20 @@ pub(crate) async fn prompt_turn(
     }
 
     if fake_provider(&active) {
-        return Ok(prompt_fake(&state, id, active, user, active_text, dir, project, cancel).await?);
+        // Capture the user's parentage before the value is consumed by
+        // `prompt_fake`. If the runtime breaks via `follow_up_break`
+        // mid-stream, the queued follow-up turn must re-anchor under
+        // this parent (Bun parity: queue scope retargeting).
+        let user_parent = user_parent_anchor(&user);
+        let result =
+            prompt_fake(&state, id, active, user, active_text, dir, project, cancel).await?;
+        commit_broken_turn_anchor_for_parent(state, id, &user_parent);
+        return Ok(result);
     }
 
     if is_openai_oauth(&state, active.model.as_ref()) {
-        return Ok(prompt_openai_stream(
+        let user_parent = user_parent_anchor(&user);
+        let result = prompt_openai_stream(
             state.clone(),
             id,
             active,
@@ -195,7 +268,9 @@ pub(crate) async fn prompt_turn(
             project,
             cancel,
         )
-        .await?);
+        .await?;
+        commit_broken_turn_anchor_for_parent(state, id, &user_parent);
+        return Ok(result);
     }
 
     let out = match kilo_provider::chat_tools_with_auth(
@@ -207,6 +282,7 @@ pub(crate) async fn prompt_turn(
             role: "user".to_string(),
             content: active_text,
             responses: Vec::new(),
+            attachments: Vec::new(),
         }],
         real_tools(&state, &active),
     )
@@ -233,6 +309,20 @@ pub(crate) async fn prompt_turn(
     Ok(append_assistant(
         &state, id, &active, &user, out, dir, project,
     )?)
+}
+
+async fn pre_turn_snapshot(store: kilo_store::Store, project: String) -> Option<String> {
+    #[cfg(test)]
+    {
+        let root = std::path::PathBuf::from(store.paths().worktree);
+        if !root.starts_with(std::env::temp_dir()) {
+            return None;
+        }
+    }
+    tokio::task::spawn_blocking(move || crate::snapshot::track(&store, &project))
+        .await
+        .ok()
+        .and_then(Result::ok)
 }
 
 struct InlineSubtask {
@@ -465,4 +555,270 @@ fn expand_command(
     );
     input.parts = parts;
     Ok((input, text))
+}
+
+/// Outcome of the plan-followup decision after a single inner turn.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum PlanFollowup {
+    /// No follow-up needed (or the user declined). The caller returns
+    /// the assistant message produced by the just-completed turn.
+    Stay,
+    /// User accepted the implementation handoff. The caller re-enters
+    /// the turn loop with `next` as the synthesized user prompt;
+    /// `agent_switch` records which agent the loop is now running for
+    /// any downstream telemetry.
+    Continue {
+        next: PromptInput,
+        /// Read by tests only — production callers in `turn.rs:110` ignore
+        /// it. Kept on the enum so the migration assertion in
+        /// `agent_basics.rs` can verify the routed agent name without
+        /// reaching into private state.
+        #[allow(dead_code)]
+        agent_switch: String,
+    },
+}
+
+/// Detect a `plan_exit` tool-call on the just-persisted assistant
+/// message and, if the message belonged to the `plan` agent, ask the
+/// user whether to continue with implementation. Mirrors Bun's
+/// `kilocode/plan-followup.ts::ask` flow (`prompt({sessionID})` then
+/// branches on the answer).
+///
+/// Returns `Stay` when:
+/// - the assistant agent isn't `plan`,
+/// - no completed `plan_exit` part was emitted,
+/// - the question gets rejected/dropped, or
+/// - the user picks "no".
+///
+/// Returns `Continue` with a synthesized user prompt when the user
+/// picks "yes". The caller is responsible for re-entering the turn
+/// loop; this helper does not call back into `prompt_turn` itself
+/// to keep the recursion shape obvious.
+pub(crate) async fn plan_followup_decision(
+    state: &Arc<AppState>,
+    sid: &str,
+    result: &MessageAppendResult,
+    cancel: Arc<AtomicBool>,
+) -> Result<PlanFollowup, TurnError> {
+    if is_canceled(&cancel) {
+        return Ok(PlanFollowup::Stay);
+    }
+    if !is_plan_agent(result) {
+        return Ok(PlanFollowup::Stay);
+    }
+    let plan_path = match find_completed_plan_exit(result) {
+        Some(path) => path,
+        None => return Ok(PlanFollowup::Stay),
+    };
+    // Mark the runner as suspended on a follow-up question so abort/
+    // cancel routes can distinguish a paused turn from a producing one.
+    set_awaiting_plan_followup(state, sid, true);
+    let target_agent = preferred_followup_agent(state);
+    let info = plan_followup_question_info(sid, result);
+    let answer = ask_question(state, info).await;
+    set_awaiting_plan_followup(state, sid, false);
+    let yes = match answer {
+        Ok(value) => answer_is_yes(&value),
+        Err(_) => false,
+    };
+    if !yes {
+        return Ok(PlanFollowup::Stay);
+    }
+    let prompt_text = followup_prompt_text(plan_path.as_deref());
+    let next = synth_followup_input(result, &target_agent, prompt_text);
+    Ok(PlanFollowup::Continue {
+        next,
+        agent_switch: target_agent,
+    })
+}
+
+fn is_plan_agent(result: &MessageAppendResult) -> bool {
+    result.info.get("agent").and_then(Value::as_str) == Some("plan")
+}
+
+/// Walk `result.parts` for the latest completed `plan_exit` tool. The
+/// tool's metadata carries the planned file path under `state.metadata.plan`
+/// (see `agent::parts::real_mutating_tool_part::"plan_exit"`).
+fn find_completed_plan_exit(result: &MessageAppendResult) -> Option<Option<String>> {
+    for part in result.parts.iter().rev() {
+        if part.get("type").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        if part.get("tool").and_then(Value::as_str) != Some("plan_exit") {
+            continue;
+        }
+        let status = part
+            .get("state")
+            .and_then(|state| state.get("status"))
+            .and_then(Value::as_str);
+        if status != Some("completed") {
+            continue;
+        }
+        let plan = part
+            .get("state")
+            .and_then(|state| state.get("metadata"))
+            .and_then(|metadata| metadata.get("plan"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        return Some(plan);
+    }
+    None
+}
+
+/// Pick the agent the implementation phase should run under. Bun's
+/// `resolveCodeModel` defaults to the `code` agent; if that builtin has
+/// been disabled by config, fall back to the `general` orchestrator
+/// agent which is always present in the catalog.
+fn preferred_followup_agent(state: &AppState) -> String {
+    if state.agent_info("code").is_some() {
+        return "code".to_string();
+    }
+    if state.agent_info("general").is_some() {
+        return "general".to_string();
+    }
+    "code".to_string()
+}
+
+fn plan_followup_question_info(sid: &str, result: &MessageAppendResult) -> Value {
+    let mid = result
+        .info
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let qid = format!("question_plan_followup_{mid}");
+    json!({
+        "id": qid,
+        "sessionID": sid,
+        "status": "pending",
+        "questions": [{
+            "question": "Continue with implementation?",
+            "header": "Implement",
+            "options": [
+                { "label": "yes", "description": "Implement the plan in this session" },
+                { "label": "no", "description": "End this turn without implementing" }
+            ],
+            "multiple": false,
+            "custom": false,
+        }],
+        "blocking": true,
+        "metadata": { "kind": "plan_followup" },
+        "text": "Continue with implementation?",
+    })
+}
+
+fn answer_is_yes(value: &Value) -> bool {
+    let pick = first_answer(value);
+    matches!(pick.as_deref(), Some(s) if matches!(s.trim().to_ascii_lowercase().as_str(), "yes" | "y" | "continue"))
+}
+
+/// Pull the first reply string out of the answers payload that
+/// `reply_question` forwards. Accepts both the nested array shape
+/// (`[["yes"]]`) and the flat string fallback (`"yes"`).
+fn first_answer(value: &Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(outer) = value.as_array() {
+        for item in outer {
+            if let Some(s) = item.as_str() {
+                return Some(s.to_string());
+            }
+            if let Some(inner) = item.as_array() {
+                for entry in inner {
+                    if let Some(s) = entry.as_str() {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn followup_prompt_text(plan_path: Option<&str>) -> String {
+    let suffix = match plan_path {
+        Some(path) if !path.is_empty() => {
+            format!(" The plan is also saved at {path}.")
+        }
+        _ => String::new(),
+    };
+    format!(
+        "The plan above describes the work. Implement it now.{suffix} \
+Use the `code` agent (or default agent) and execute the plan step-by-step, \
+asking for permission only when required by the agent's own permission rules."
+    )
+}
+
+/// Build the synthetic user `PromptInput` for the implementation
+/// re-entry. Reuses the original prompt's model so the next turn keeps
+/// the same provider routing, but switches the agent and replaces the
+/// parts with a single text part marked synthetic.
+fn synth_followup_input(
+    result: &MessageAppendResult,
+    target_agent: &str,
+    prompt_text: String,
+) -> PromptInput {
+    let model = result.info.get("model").cloned();
+    PromptInput {
+        parts: vec![json!({
+            "type": "text",
+            "text": prompt_text,
+            "synthetic": true,
+        })],
+        agent: Some(target_agent.to_string()),
+        model,
+        ..Default::default()
+    }
+}
+
+fn set_awaiting_plan_followup(state: &AppState, sid: &str, value: bool) {
+    if let Some(runner) = state.runners.lock().unwrap().get(sid) {
+        runner
+            .awaiting_plan_followup
+            .store(value, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Read the runner's `follow_up_break` flag without holding the lock
+/// across the caller's work.
+fn follow_up_break_set(state: &AppState, sid: &str) -> bool {
+    state
+        .runners
+        .lock()
+        .unwrap()
+        .get(sid)
+        .map(|runner| runner.follow_up_break.load(Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
+/// Read the parentID off a just-persisted user message. Empty string
+/// means the message was a session-root child (no parent).
+fn user_parent_anchor(user: &MessageAppendResult) -> String {
+    user.info
+        .get("parentID")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// If the active runner is breaking via `follow_up_break`, persist the
+/// broken user message's parentage as the session's pending anchor for
+/// the next queued follow-up. Bun parity:
+/// `KiloSessionPromptQueue.scope()` retargets the next prompt under
+/// `target.base`'s parent rather than the broken assistant.
+fn commit_broken_turn_anchor(state: &AppState, sid: &str, user: &MessageAppendResult) {
+    if !follow_up_break_set(state, sid) {
+        return;
+    }
+    state.set_broken_turn_anchor(sid, &user_parent_anchor(user));
+}
+
+/// Variant of [`commit_broken_turn_anchor`] for call sites that already
+/// extracted the parent before passing the user message into a consumer
+/// (the fake/oauth pipelines move it by value).
+fn commit_broken_turn_anchor_for_parent(state: &AppState, sid: &str, parent: &str) {
+    if !follow_up_break_set(state, sid) {
+        return;
+    }
+    state.set_broken_turn_anchor(sid, parent);
 }

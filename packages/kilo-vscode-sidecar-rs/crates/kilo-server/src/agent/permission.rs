@@ -16,7 +16,112 @@ use kilo_protocol::GlobalEvent;
 use serde_json::{json, Value};
 
 use crate::agent::tools::common::{tool_patterns, tool_permission};
+use crate::util::paths::{resolve_with_external, ResolveOutcome};
 use crate::{AppState, PendingPermission, PermissionDecision, PermissionRule};
+
+/// Bun-parity errors the per-tool `external_directory` gate can raise.
+/// Tools convert these into a flat string for the existing tool-error
+/// pipeline via [`PermissionError::to_display`]. Carrying the structured
+/// shape lets callers (and future tests) inspect the rejected paths
+/// without re-parsing a free-form message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PermissionError {
+    /// User denied the `external_directory` permission ask. `paths` is
+    /// the list of out-of-worktree absolute paths that were presented.
+    ExternalDirectoryDenied { paths: Vec<String> },
+}
+
+impl PermissionError {
+    /// Render as a flat string for the existing tool-error surface.
+    /// Mentions the specific denied paths so the user understands why
+    /// the tool refused to run.
+    pub(crate) fn to_display(&self) -> String {
+        match self {
+            PermissionError::ExternalDirectoryDenied { paths } => {
+                if paths.is_empty() {
+                    "External directory access denied".to_string()
+                } else {
+                    format!("External directory access denied for: {}", paths.join(", "))
+                }
+            }
+        }
+    }
+}
+
+/// Bun-parity `external_directory` gate. Filter `candidates` to those
+/// that resolve OUTSIDE `root`, then raise a single `permission.asked`
+/// event covering the lot. Mirrors
+/// [`packages/opencode/src/tool/external-directory.ts:25-56`](../../../../../opencode/src/tool/external-directory.ts).
+///
+/// `kind` is one of `"read" | "write" | "execute"` and rides through to
+/// the metadata so the UI can show an appropriate prompt.
+///
+/// Skips the ask entirely when every candidate already lives under
+/// `root` — that's the hot path and must not deadlock waiting for a UI
+/// reply that no one would ever send.
+pub(crate) async fn ask_external_directory(
+    state: &Arc<AppState>,
+    sid: &str,
+    mid: &str,
+    pid: &str,
+    idx: usize,
+    root: &FsPath,
+    candidates: &[String],
+    kind: &str,
+) -> Result<(), PermissionError> {
+    let mut externals: Vec<String> = Vec::new();
+    for value in candidates {
+        if value.is_empty() {
+            continue;
+        }
+        if let ResolveOutcome::External(abs) = resolve_with_external(root, value) {
+            externals.push(abs.to_string_lossy().into_owned());
+        }
+    }
+    if externals.is_empty() {
+        return Ok(());
+    }
+
+    // De-dupe identical paths; the model can repeat a path across
+    // arguments (e.g. apply_patch source + move-to dest pointing at the
+    // same external file) and we don't want to wallpaper the UI with
+    // duplicate ask entries inside the same metadata blob.
+    externals.sort();
+    externals.dedup();
+
+    let metadata = json!({
+        "paths": externals.clone(),
+        "kind": kind,
+    });
+    let info_input = metadata.clone();
+    let id = format!("permission_{mid}_{pid}_{idx}_external");
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let info = json!({
+        "id": id,
+        "sessionID": sid,
+        "status": "pending",
+        "permission": "external_directory",
+        "patterns": externals.clone(),
+        "always": ["*"],
+        "metadata": info_input,
+        "tool": { "messageID": mid, "callID": "", "name": "external_directory" },
+    });
+    state.permissions.lock().unwrap().insert(
+        id.clone(),
+        PendingPermission {
+            info: info.clone(),
+            reply: tx,
+        },
+    );
+    crate::http::sse::publish(state, GlobalEvent::bus("permission.asked", info));
+    match rx.await {
+        Ok(PermissionDecision::Allow) | Ok(PermissionDecision::Always) => Ok(()),
+        Ok(PermissionDecision::Reject) => {
+            Err(PermissionError::ExternalDirectoryDenied { paths: externals })
+        }
+        Err(_) => Err(PermissionError::ExternalDirectoryDenied { paths: externals }),
+    }
+}
 
 pub(crate) async fn ask_permission(
     state: &Arc<AppState>,
@@ -729,5 +834,188 @@ mod tests {
         assert!(!is_relative(".kilo/plans/draft.md"));
         assert!(!is_relative("src/main.rs"));
         assert!(!is_relative("docs/README.md"));
+    }
+
+    // ----------------------------------------------------------------
+    // External-directory gate tests. Built on a minimal in-memory
+    // AppState — we only need `permissions` + `bus` + the fields the
+    // SSE publisher reaches for. Reusing `tests/common::state_at` would
+    // require either widening its visibility or pulling in a full Store,
+    // both of which are noisier than just constructing the bag here.
+    // ----------------------------------------------------------------
+
+    fn ext_test_state() -> Arc<AppState> {
+        let (bus, _) = tokio::sync::broadcast::channel(64);
+        Arc::new(AppState {
+            username: "kilo".to_string(),
+            password: None,
+            store: kilo_store::Store::new(),
+            bus,
+            viewed: tokio::sync::RwLock::default(),
+            runners: std::sync::Mutex::default(),
+            runner_notify: tokio::sync::Notify::new(),
+            prompt_queues: std::sync::Mutex::default(),
+            prompt_queue_versions: std::sync::Mutex::default(),
+            permissions: std::sync::Mutex::default(),
+            approvals: std::sync::Mutex::default(),
+            questions: std::sync::Mutex::default(),
+            suggestions: std::sync::Mutex::default(),
+            network: std::sync::Mutex::default(),
+            mcp: std::sync::Mutex::default(),
+            mcp_configs: std::sync::Mutex::default(),
+            mcp_children: std::sync::Mutex::default(),
+            pty: std::sync::Mutex::default(),
+            plugin_tools: std::sync::Mutex::default(),
+            session_agents: std::sync::Mutex::default(),
+            session_hard_rules: std::sync::Mutex::default(),
+            broken_turn_anchors: std::sync::Mutex::default(),
+            oauth_pending: std::sync::Mutex::default(),
+            oauth_listener: std::sync::Mutex::default(),
+            oauth_listener_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            oauth_token_endpoint: format!("{}/oauth/token", crate::oauth::OPENAI_ISSUER),
+            sse_capacity: AppState::new_sse_capacity(),
+        })
+    }
+
+    fn unique_root(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!("kilo-extdir-{label}-{stamp}-{n}"));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn external_directory_paths_inside_worktree_pass_without_ask() {
+        let root = unique_root("inside");
+        let worktree = root.join("repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let state = ext_test_state();
+        // Inside-only candidates must short-circuit before any UI ask is
+        // queued. Empty-string candidates are also ignored.
+        let candidates = vec![
+            "src/main.rs".to_string(),
+            "".to_string(),
+            worktree.join("nested.rs").to_string_lossy().into_owned(),
+        ];
+        let res = ask_external_directory(
+            &state,
+            "sid",
+            "mid",
+            "pid",
+            0,
+            &worktree,
+            &candidates,
+            "read",
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "inside-only candidates must not block: {res:?}"
+        );
+        assert!(
+            state.permissions.lock().unwrap().is_empty(),
+            "no PendingPermission should be queued for inside-only candidates",
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn external_directory_paths_outside_raise_permission_ask() {
+        let root = unique_root("outside");
+        let worktree = root.join("repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let outside = root.join("outside.txt").to_string_lossy().into_owned();
+        let state = ext_test_state();
+        let task_state = state.clone();
+        let task_outside = outside.clone();
+        let task_worktree = worktree.clone();
+        let join = tokio::spawn(async move {
+            ask_external_directory(
+                &task_state,
+                "sid",
+                "mid",
+                "pid",
+                7,
+                &task_worktree,
+                &[task_outside],
+                "read",
+            )
+            .await
+        });
+
+        // Spin briefly until the gate registers its PendingPermission.
+        let key = loop {
+            tokio::task::yield_now().await;
+            let key = state.permissions.lock().unwrap().keys().next().cloned();
+            if let Some(key) = key {
+                break key;
+            }
+        };
+        assert_eq!(key, "permission_mid_pid_7_external");
+        let entry = state.permissions.lock().unwrap().remove(&key).unwrap();
+        assert_eq!(entry.info["permission"], "external_directory");
+        assert_eq!(entry.info["sessionID"], "sid");
+        assert_eq!(entry.info["metadata"]["kind"], "read");
+        let patterns = entry.info["patterns"].as_array().unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].as_str().unwrap(), &outside);
+        // Resolve the gate so the spawned task can finish.
+        let _ = entry.reply.send(PermissionDecision::Allow);
+        let res = join.await.unwrap();
+        assert!(res.is_ok(), "approval must let the gate return Ok: {res:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn external_directory_denied_returns_structured_error() {
+        let root = unique_root("denied");
+        let worktree = root.join("repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let outside_a = root.join("a.txt").to_string_lossy().into_owned();
+        let outside_b = root.join("b.txt").to_string_lossy().into_owned();
+        let state = ext_test_state();
+        let task_state = state.clone();
+        let task_worktree = worktree.clone();
+        let candidates = vec![outside_a.clone(), outside_b.clone()];
+        let join = tokio::spawn(async move {
+            ask_external_directory(
+                &task_state,
+                "sid",
+                "mid",
+                "pid",
+                3,
+                &task_worktree,
+                &candidates,
+                "write",
+            )
+            .await
+        });
+        let entry = loop {
+            tokio::task::yield_now().await;
+            let mut perms = state.permissions.lock().unwrap();
+            if let Some((k, _)) = perms.iter().next() {
+                let k = k.clone();
+                let v = perms.remove(&k).unwrap();
+                break v;
+            }
+        };
+        let _ = entry.reply.send(PermissionDecision::Reject);
+        let err = join.await.unwrap().unwrap_err();
+        let PermissionError::ExternalDirectoryDenied { paths } = err;
+        let mut sorted = paths.clone();
+        sorted.sort();
+        let mut expected = vec![outside_a.clone(), outside_b.clone()];
+        expected.sort();
+        assert_eq!(sorted, expected);
+        let display = PermissionError::ExternalDirectoryDenied { paths }.to_display();
+        assert!(display.contains(&outside_a), "{display}");
+        assert!(display.contains(&outside_b), "{display}");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

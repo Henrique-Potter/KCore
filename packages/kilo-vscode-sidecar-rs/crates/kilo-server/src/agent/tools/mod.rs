@@ -25,6 +25,7 @@ pub(crate) mod encoding;
 pub(crate) mod fs;
 pub(crate) mod patch;
 pub(crate) mod replacers;
+pub(crate) mod truncate;
 pub(crate) mod webfetch;
 
 use bash::{fake_bash, fake_bash_with_cancel};
@@ -42,15 +43,6 @@ use patch::fake_apply_patch;
 /// `agent::fake::fake_tool_part` carries the FakeCall-specific shape
 /// (e.g. the `invalid: Some(name)` field) that informs the error
 /// message; reproducing it here would just be a forwarding wrapper.
-#[allow(dead_code)]
-pub(crate) fn dispatch(
-    name: &str,
-    input: &Value,
-    root: &FsPath,
-) -> Option<Result<(String, String, Value), String>> {
-    dispatch_with_cancel(name, input, root, None)
-}
-
 pub(crate) fn dispatch_with_cancel(
     name: &str,
     input: &Value,

@@ -1194,3 +1194,115 @@ fn fake_edit_indentation_skew_succeeds_via_replacer_chain() {
 
     let _ = std::fs::remove_dir_all(root);
 }
+
+// ----------------------------------------------------------------
+// External-directory permission gate (Bun parity:
+// `packages/opencode/src/tool/external-directory.ts:25-56`).
+// Exercises the full `fake_read_gated` flow including the
+// `permission.asked` event and the structured deny error.
+// ----------------------------------------------------------------
+
+#[tokio::test]
+async fn read_outside_worktree_asks_external_directory_permission() {
+    use crate::agent::tools::fs::fake_read_gated;
+    use crate::PermissionDecision;
+
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let outside = root.join("secrets.txt");
+    std::fs::write(&outside, "top secret\n").unwrap();
+
+    let task_state = state.clone();
+    let task_repo = repo.clone();
+    let task_outside = outside.clone();
+    let join = tokio::spawn(async move {
+        fake_read_gated(
+            &task_state,
+            "sid-ext-1",
+            "mid-ext-1",
+            "pid-ext-1",
+            0,
+            &task_repo,
+            &json!({ "filePath": task_outside.to_string_lossy() }),
+            None,
+        )
+        .await
+    });
+
+    // Wait for the gate to publish the ask.
+    let entry = loop {
+        tokio::task::yield_now().await;
+        let mut perms = state.permissions.lock().unwrap();
+        if let Some(key) = perms.keys().next().cloned() {
+            break perms.remove(&key).unwrap();
+        }
+    };
+    assert_eq!(entry.info["permission"], "external_directory");
+    assert_eq!(entry.info["metadata"]["kind"], "read");
+    let patterns = entry.info["patterns"].as_array().unwrap();
+    assert_eq!(patterns.len(), 1);
+    let pattern = patterns[0].as_str().unwrap();
+    assert!(
+        pattern.contains("secrets.txt"),
+        "ask pattern must point at the external file: {pattern}",
+    );
+
+    // Deny → tool returns a structured error mentioning the path.
+    let _ = entry.reply.send(PermissionDecision::Reject);
+    let err = join.await.unwrap().unwrap_err();
+    assert!(
+        err.contains("External directory access denied"),
+        "expected denial message; got: {err}",
+    );
+    assert!(err.contains("secrets.txt"), "got: {err}");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_outside_worktree_with_approval_succeeds() {
+    use crate::agent::tools::fs::fake_read_gated;
+    use crate::PermissionDecision;
+
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let outside = root.join("notes.txt");
+    std::fs::write(&outside, "line one\nline two\n").unwrap();
+
+    let task_state = state.clone();
+    let task_repo = repo.clone();
+    let task_outside = outside.clone();
+    let join = tokio::spawn(async move {
+        fake_read_gated(
+            &task_state,
+            "sid-ext-2",
+            "mid-ext-2",
+            "pid-ext-2",
+            0,
+            &task_repo,
+            &json!({ "filePath": task_outside.to_string_lossy() }),
+            None,
+        )
+        .await
+    });
+
+    let entry = loop {
+        tokio::task::yield_now().await;
+        let mut perms = state.permissions.lock().unwrap();
+        if let Some(key) = perms.keys().next().cloned() {
+            break perms.remove(&key).unwrap();
+        }
+    };
+    let _ = entry.reply.send(PermissionDecision::Allow);
+    let (_title, output, _meta) = join.await.unwrap().expect("approved external read");
+    assert!(output.contains("line one"), "{output}");
+    assert!(output.contains("line two"), "{output}");
+
+    let _ = std::fs::remove_dir_all(root);
+}

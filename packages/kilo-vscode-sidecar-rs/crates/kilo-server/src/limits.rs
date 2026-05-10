@@ -55,12 +55,10 @@ pub(crate) const MAX_MESSAGE_PART_BYTES: usize = 1024 * 1024;
 /// The `bash` tool has a tighter local cap (`MAX_BASH_OUTPUT_BYTES = 64 KiB`)
 /// in [`agent::tools::bash`]; this is the global ceiling that newer tools
 /// (write, edit, apply_patch result payloads) MUST stay under.
-#[allow(dead_code)]
 pub(crate) const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// Appended to truncated tool output / message-part payloads. Stable string
 /// so the UI can recognize and render it.
-#[allow(dead_code)]
 pub(crate) const TRUNCATION_SENTINEL: &str = "\n…[output truncated by sidecar]\n";
 
 /// Reserved: surface 413 with stable name `request_too_large` from a route
@@ -120,7 +118,6 @@ pub(crate) fn message_part_too_large_error(actual_bytes: usize) -> Response {
 /// nearest char boundary to keep output valid UTF-8. The bash tool already
 /// has a tighter local truncation; this helper exists for the M8/M11 tools
 /// that produce large captured payloads.
-#[allow(dead_code)]
 pub(crate) fn truncate_tool_output(mut output: String) -> String {
     if output.len() <= MAX_TOOL_OUTPUT_BYTES {
         return output;
