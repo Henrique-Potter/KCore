@@ -17,6 +17,7 @@ use axum::{
 use kilo_protocol::{Config, GlobalEvent};
 use serde_json::{json, Map, Value};
 
+use crate::error::bad_request_named;
 use crate::oauth::crypto::{oauth_secret, pkce_challenge};
 use crate::oauth::listener::ensure_oauth_listener;
 use crate::oauth::tokens::exchange_code;
@@ -28,17 +29,6 @@ use crate::{http::sse, internal_error, internal_error_named, AppState, PendingAu
 const OAUTH_CALLBACK_WAIT: Duration = OAUTH_PENDING_TTL;
 #[cfg(test)]
 const OAUTH_CALLBACK_WAIT: Duration = Duration::from_millis(25);
-
-fn bad_request_named(name: &str, message: &str) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({
-            "name": name,
-            "data": { "message": message },
-        })),
-    )
-        .into_response()
-}
 
 fn oauth_method(input: &Value) -> Option<&str> {
     match input.get("method") {

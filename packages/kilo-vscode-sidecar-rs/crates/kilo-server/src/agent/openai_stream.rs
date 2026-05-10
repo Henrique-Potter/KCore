@@ -177,7 +177,7 @@ pub(crate) async fn prompt_openai_stream(
         agent_prompt(&state, &input).as_deref(),
     );
     let tools = real_tools(&state, &input);
-    let base_messages = real_messages(&state, id, &text);
+    let mut base_messages = real_messages(&state, id, &text);
     let stream_model = input.model.clone();
     spawn_title_generation(
         state.clone(),
@@ -974,6 +974,76 @@ pub(crate) async fn prompt_openai_stream(
             publish_events(&state, dir.clone(), project.clone(), record.events);
         }
         tool_parts.push(step_finish);
+
+        // Bun-parity proactive compaction (overflow.ts:19-26 +
+        // prompt.ts:1493-1497). After every iteration's step-finish is
+        // persisted, check whether the cumulative turn usage has crossed
+        // the model's context-window threshold; if so, run compaction
+        // BEFORE the next request. This is additive to the reactive
+        // ContextWindow path above — proactive just lowers how often the
+        // upstream 400 has to fire. `compaction.auto = false` opts out.
+        // Bounded by the same `MAX_COMPACTION_ATTEMPTS` cap so a turn
+        // that keeps re-overflowing terminates instead of looping.
+        if compaction_attempts < crate::agent::compaction::MAX_COMPACTION_ATTEMPTS
+            && should_compact_proactively(&cfg, input.model.as_ref(), &total_usage)
+        {
+            compaction_attempts += 1;
+            match crate::agent::compaction::compact_session(
+                &state,
+                id,
+                input.model.as_ref(),
+                &auths,
+                &cancel,
+            )
+            .await
+            {
+                Ok(_) => {
+                    // Drop the per-turn `history_extension` so the next
+                    // iteration's `iter_messages` is rebuilt from
+                    // `real_messages`, which now anchors on the new
+                    // summary record. Reset `total_usage` to reflect
+                    // the post-compaction reality: the model's input
+                    // context has been replaced with the summary, so
+                    // accumulated tokens from before the compaction
+                    // shouldn't count toward the next threshold check.
+                    // Bun's loop re-enters with fresh `tokens` after
+                    // `compaction.create` (`prompt.ts:1493-1516`); we
+                    // mirror that by zeroing here. Note: assistant
+                    // `info.tokens` for the user-visible turn is built
+                    // from `total_usage` at finalize time — this means
+                    // the user sees only post-compaction tokens, which
+                    // matches Bun's behavior since the pre-compaction
+                    // streamed parts have been replaced by the
+                    // summary anchor.
+                    history_extension.clear();
+                    base_messages = real_messages(&state, id, &text);
+                    total_usage = ChatUsage::default();
+                    last_iter_usage = None;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[kilo-server] proactive compaction failed: {err}"
+                    );
+                    let assistant = state.store.append_message_record(
+                        id,
+                        MessageAppendInput {
+                            info: assistant_error_info(
+                                &paths,
+                                &user,
+                                &input,
+                                crate::agent::compaction::compaction_error_envelope(&err),
+                            ),
+                            parts: Vec::new(),
+                        },
+                    )?;
+                    publish_events(&state, dir, project, assistant.events);
+                    publish_error(&state, id, assistant.result.info["error"].clone());
+                    publish_idle(&state, id);
+                    publish_turn_close(&state, id, "error");
+                    return Ok(assistant.result);
+                }
+            }
+        }
 
         // Structured output capture (Bun: `prompt.ts:1629-1634`). Once
         // the model has called the synthetic `StructuredOutput` tool, the
@@ -1810,6 +1880,95 @@ pub(crate) fn model_name(model: Option<&Value>) -> Option<&str> {
         .or_else(|| model.get("modelId"))
         .or_else(|| model.get("id"))
         .and_then(Value::as_str)
+}
+
+/// Bun-parity proactive compaction threshold. Mirrors
+/// [`packages/opencode/src/session/overflow.ts:19-26`](../../../../../opencode/src/session/overflow.ts):
+/// `count >= context * (1 - reserve_fraction)` where the reserve roughly
+/// matches Bun's `min(20_000, model.limit.output)`. We keep this as a
+/// single fraction (0.85) per the task spec instead of recomputing the
+/// reserve per request — it's a conservative, threshold-only check.
+pub(crate) const PROACTIVE_COMPACTION_THRESHOLD: f64 = 0.85;
+
+/// Resolve the model's context-window limit. Walks (in order):
+///
+/// 1. `model.limit.context` if the caller passed an enriched model record;
+/// 2. the OpenAI registry shipped in `kilo_provider::openai_models` —
+///    looked up by `modelID`; OR
+/// 3. a conservative fallback derived from the id pattern. Bun does the
+///    same fallback shape inside the Provider model loader.
+///
+/// Returns `0` when nothing is known — callers treat `0` as "skip the
+/// proactive check" (matches Bun's `overflow.ts:21`).
+pub(crate) fn model_context_limit(model: Option<&Value>) -> u64 {
+    if let Some(model) = model {
+        if let Some(ctx) = model
+            .pointer("/limit/context")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+        {
+            return ctx;
+        }
+    }
+    let id = model_name(model).unwrap_or_default();
+    if id.is_empty() {
+        return 0;
+    }
+    if let Some(ctx) = kilo_provider::openai_models::registry("")
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(id))
+        .and_then(|(_, value)| value.pointer("/limit/context").and_then(Value::as_u64))
+        .filter(|value| *value > 0)
+    {
+        return ctx;
+    }
+    let lower = id.to_ascii_lowercase();
+    if lower.starts_with("gpt-5") || lower.starts_with("gpt-4") {
+        return 200_000;
+    }
+    if lower.starts_with("o1") {
+        return 128_000;
+    }
+    32_000
+}
+
+/// Read `cfg.compaction.auto` — `false` opts out of proactive compaction.
+/// Default (missing key, non-bool) is `true`, mirroring Bun's
+/// `overflow.ts:20` short-circuit.
+pub(crate) fn compaction_auto_enabled(cfg: &kilo_protocol::Config) -> bool {
+    cfg.data
+        .get("compaction")
+        .and_then(|value| value.get("auto"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// Returns `true` when the cumulative iteration tokens have crossed the
+/// proactive compaction threshold. Bun keys on `tokens.input + output +
+/// cache.read + cache.write` (`overflow.ts:24`); we use the same
+/// components from [`ChatUsage`].
+pub(crate) fn should_compact_proactively(
+    cfg: &kilo_protocol::Config,
+    model: Option<&Value>,
+    usage: &ChatUsage,
+) -> bool {
+    if !compaction_auto_enabled(cfg) {
+        return false;
+    }
+    let context = model_context_limit(model);
+    if context == 0 {
+        return false;
+    }
+    let count = if usage.total > 0 {
+        usage.total
+    } else {
+        usage
+            .input
+            .saturating_add(usage.output)
+            .saturating_add(usage.cache_read)
+            .saturating_add(usage.cache_write)
+    };
+    (count as f64) >= (context as f64) * PROACTIVE_COMPACTION_THRESHOLD
 }
 
 pub(crate) fn is_openai_oauth(state: &AppState, model: Option<&Value>) -> bool {

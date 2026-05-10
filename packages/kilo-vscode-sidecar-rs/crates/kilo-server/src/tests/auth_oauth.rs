@@ -422,6 +422,33 @@ async fn internal_error_named_uses_provided_name() {
     assert_eq!(value["data"]["message"], "exchange failed");
 }
 
+/// Wave 1 Group E follow-up: every OAuth NamedError that the
+/// `routes/config.rs` handlers can emit must be listed in
+/// `ALLOWED_INTERNAL_ERROR_NAMES`. The canonical
+/// `error::bad_request_named` enforces this via `debug_assert!`, so the
+/// loop below would panic in test builds if any name leaked through
+/// without registration.
+#[tokio::test]
+async fn bad_request_named_emits_only_registered_names() {
+    use crate::error::bad_request_named;
+
+    for name in [
+        "OauthUnsupportedProvider",
+        "OauthUnsupportedMethod",
+        "OauthCodeMissing",
+        "OauthPendingMissing",
+        "OauthStateMismatch",
+        "OauthCallbackTimeout",
+    ] {
+        let res = bad_request_named(name, "msg");
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["name"], name);
+        assert_eq!(value["data"]["message"], "msg");
+    }
+}
+
 /// Audit Fix 8: the `read` tool schema must require `filePath` and not
 /// surface a `path` synonym in `properties`.
 #[test]

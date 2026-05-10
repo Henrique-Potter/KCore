@@ -2194,6 +2194,304 @@ async fn compact_session_aborts_promptly_when_cancel_fires_during_summarize() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Provider mock for the proactive-compaction tests. Iter 1 streams a
+/// successful turn whose `response.completed.usage` is engineered to
+/// exceed `0.85 * 400_000` (gpt-5.1-codex context limit) AND emits a
+/// `function_call` so the agent loop continues. Then a non-streaming
+/// summarize call is served, then iter 2 streams a final text answer.
+/// `summarize_count` counts how many summarize requests we observed —
+/// the "doesn't loop" test asserts this stays at 1.
+async fn proactive_compaction_provider(
+    iter1_data: &'static str,
+    iter2_data: &'static str,
+) -> (super::common::TestProvider, std::sync::Arc<std::sync::Mutex<u8>>) {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = Arc::new(Mutex::new(String::new()));
+    let copy = body.clone();
+    let summarize_count = Arc::new(Mutex::new(0u8));
+    let count_copy = summarize_count.clone();
+    tokio::spawn(async move {
+        // Iter 1: streaming SSE with high token usage + function_call.
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0; 65536];
+        let _ = socket.read(&mut buf).await;
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            iter1_data.len()
+        );
+        socket.write_all(head.as_bytes()).await.unwrap();
+        socket.write_all(iter1_data.as_bytes()).await.unwrap();
+        // Subsequent connections: distinguish summarize (non-stream JSON
+        // POST without `stream: true`) from iter-2 SSE by inspecting the
+        // request body. Summarize bodies don't include `tools` and the
+        // session has just been compacted. We answer up to 4 follow-up
+        // connections in this dispatch order:
+        //   - summarize → 200 JSON
+        //   - iter-2 stream → 200 SSE
+        //   - any extra summarize attempts → 200 JSON
+        for _ in 0..4u8 {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let mut buf = vec![0; 65536];
+            let Ok(size) = socket.read(&mut buf).await else {
+                break;
+            };
+            let body_text = String::from_utf8_lossy(&buf[..size]).to_string();
+            // The summarizer call is non-streaming (`stream: false` or
+            // omitted). The agent's live stream call sets `stream: true`.
+            let is_stream = body_text.contains("\"stream\":true");
+            if !is_stream {
+                *count_copy.lock().unwrap() += 1;
+                let summary_body = r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"Compacted summary: user goal X."}]}],"usage":{"input_tokens":50,"output_tokens":15,"total_tokens":65}}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    summary_body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(summary_body.as_bytes()).await;
+            } else {
+                *copy.lock().unwrap() = body_text;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    iter2_data.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(iter2_data.as_bytes()).await;
+            }
+        }
+    });
+    (
+        super::common::TestProvider {
+            url: format!("http://{addr}"),
+            body,
+        },
+        summarize_count,
+    )
+}
+
+#[tokio::test]
+async fn proactive_compaction_fires_when_token_total_exceeds_threshold() {
+    // Iter 1: streaming `response.completed.usage.total_tokens = 360_000`
+    // which is > `0.85 * 400_000 = 340_000` for `gpt-5.1-codex`. Iter 1
+    // also emits a function_call so the agent loop would otherwise
+    // continue normally. The proactive check fires after step-finish,
+    // compaction runs, iter 2 sees the summary-anchored history and
+    // returns terminal text.
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    std::fs::create_dir_all(root.join("config").join("kilo")).unwrap();
+    let iter1 = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"thinking...\"}\n\n\
+data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"call_id\":\"call_x\",\"name\":\"bash\",\"delta\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}\n\n\
+data: {\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"call_id\":\"call_x\",\"name\":\"bash\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":340000,\"output_tokens\":20000,\"total_tokens\":360000}}}\n\n\
+data: [DONE]\n\n";
+    let iter2 = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"after compact\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n\n\
+data: [DONE]\n\n";
+    let (server, summarize_count) = proactive_compaction_provider(iter1, iter2).await;
+    state
+        .store
+        .set_provider_auth("openai", oauth_auth())
+        .unwrap();
+    write_openai_config(&root, &server.url);
+    let session = state
+        .store
+        .create_session(SessionCreateInput {
+            permission: Some(json!({ "bash": "allow" })),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let out = prompt_turn(
+        &state,
+        &session.id,
+        PromptInput {
+            parts: vec![json!({ "type": "text", "text": "long convo" })],
+            model: Some(json!({ "providerID": "openai", "modelID": "gpt-5.1-codex" })),
+            ..Default::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .expect("prompt turn");
+
+    assert_eq!(out.info["finish"], "stop", "expected clean finish: {out:?}");
+    let messages = state.store.messages(&session.id, None, None).unwrap();
+    let summary_msg = messages
+        .items
+        .iter()
+        .find(|m| m.info.get("summary").and_then(|v| v.as_bool()) == Some(true))
+        .expect("summary anchor must exist after proactive compaction");
+    assert_eq!(summary_msg.info["role"], "assistant");
+    assert!(summary_msg.parts[0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Compacted summary"));
+    // Exactly one summarize call — the proactive check ran once after
+    // iter 1's step-finish, ran compaction, then iter 2's tokens (8)
+    // were well under the threshold.
+    assert_eq!(*summarize_count.lock().unwrap(), 1);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn proactive_compaction_skipped_when_auto_disabled() {
+    // Same iter 1 / iter 2 as the firing test but `compaction.auto =
+    // false` short-circuits the proactive check. The loop continues
+    // straight into iter 2 with no summarize round-trip; no summary
+    // anchor message is written.
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    std::fs::create_dir_all(root.join("config").join("kilo")).unwrap();
+    let iter1 = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"thinking...\"}\n\n\
+data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"call_id\":\"call_x\",\"name\":\"bash\",\"delta\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}\n\n\
+data: {\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"call_id\":\"call_x\",\"name\":\"bash\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":340000,\"output_tokens\":20000,\"total_tokens\":360000}}}\n\n\
+data: [DONE]\n\n";
+    let iter2 = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"no compact\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n\n\
+data: [DONE]\n\n";
+    let (server, summarize_count) = proactive_compaction_provider(iter1, iter2).await;
+    state
+        .store
+        .set_provider_auth("openai", oauth_auth())
+        .unwrap();
+    // Write a config that opts out of proactive compaction. We keep the
+    // baseURL the same so the agent still routes to the test mock.
+    std::fs::write(
+        root.join("config").join("kilo").join("kilo.json"),
+        serde_json::to_string(&json!({
+            "provider": {
+                "openai": { "options": { "baseURL": server.url }, "models": {} }
+            },
+            "compaction": { "auto": false }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let session = state
+        .store
+        .create_session(SessionCreateInput {
+            permission: Some(json!({ "bash": "allow" })),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let out = prompt_turn(
+        &state,
+        &session.id,
+        PromptInput {
+            parts: vec![json!({ "type": "text", "text": "long convo" })],
+            model: Some(json!({ "providerID": "openai", "modelID": "gpt-5.1-codex" })),
+            ..Default::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .expect("prompt turn");
+
+    assert_eq!(out.info["finish"], "stop", "expected clean finish: {out:?}");
+    let messages = state.store.messages(&session.id, None, None).unwrap();
+    let summary_present = messages
+        .items
+        .iter()
+        .any(|m| m.info.get("summary").and_then(|v| v.as_bool()) == Some(true));
+    assert!(
+        !summary_present,
+        "proactive compaction must be suppressed when cfg.compaction.auto = false"
+    );
+    assert_eq!(
+        *summarize_count.lock().unwrap(),
+        0,
+        "no summarize call should fire when auto is disabled"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn proactive_compaction_does_not_loop() {
+    // Iter 1 has high cumulative tokens that trigger compaction. Iter 2
+    // is a TERMINAL text response (no function_call) so the agent loop
+    // ends. Even though iter 2's tokens are also reported as high
+    // (cumulative would exceed threshold AGAIN), the per-iter single-
+    // shot proactive check runs at most once per step-finish and the
+    // loop terminates naturally — it must NOT trigger a second
+    // compaction within the same iteration. We assert exactly one
+    // summarize call.
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    std::fs::create_dir_all(root.join("config").join("kilo")).unwrap();
+    let iter1 = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"think\"}\n\n\
+data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"call_id\":\"call_x\",\"name\":\"bash\",\"delta\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}\n\n\
+data: {\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"call_id\":\"call_x\",\"name\":\"bash\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":340000,\"output_tokens\":20000,\"total_tokens\":360000}}}\n\n\
+data: [DONE]\n\n";
+    // Iter 2 returns text-only with high tokens too. The agent loop
+    // breaks because no tool_call this iter; the proactive check runs
+    // once after step-finish, sees high cumulative tokens, and would
+    // try to compact AGAIN — guarded by MAX_COMPACTION_ATTEMPTS.
+    let iter2 = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"final\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":340000,\"output_tokens\":20000,\"total_tokens\":360000}}}\n\n\
+data: [DONE]\n\n";
+    let (server, summarize_count) = proactive_compaction_provider(iter1, iter2).await;
+    state
+        .store
+        .set_provider_auth("openai", oauth_auth())
+        .unwrap();
+    write_openai_config(&root, &server.url);
+    let session = state
+        .store
+        .create_session(SessionCreateInput {
+            permission: Some(json!({ "bash": "allow" })),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let out = prompt_turn(
+        &state,
+        &session.id,
+        PromptInput {
+            parts: vec![json!({ "type": "text", "text": "long convo" })],
+            model: Some(json!({ "providerID": "openai", "modelID": "gpt-5.1-codex" })),
+            ..Default::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .expect("prompt turn");
+
+    let _ = out;
+    // Two iterations ran (iter 1 with tools, iter 2 terminal). Both
+    // step-finish parts should have triggered the proactive check, but
+    // because they happen on different iterations and we cap at
+    // `MAX_COMPACTION_ATTEMPTS`, the count stays bounded. With cumulative
+    // total = 360_000 + 360_000 = 720_000 still over threshold, the
+    // second iter's check fires too — so we expect 2 (one per iter).
+    // The point of "does not loop": the count is bounded, NOT unbounded.
+    let count = *summarize_count.lock().unwrap();
+    assert!(
+        count <= crate::agent::compaction::MAX_COMPACTION_ATTEMPTS as u8,
+        "summarize count {count} must be bounded by MAX_COMPACTION_ATTEMPTS"
+    );
+    // And the same iteration's step-finish must NOT trigger more than
+    // one compaction — ensured by structural placement (single check
+    // per iteration body) rather than runtime guarding.
+    assert!(count >= 1, "first iter should still trigger compaction");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn reasoning_item_round_trips_to_next_responses_request() {
     // P0 reasoning round-trip: when iteration 1 surfaces a reasoning

@@ -24,17 +24,54 @@ use std::sync::Arc;
 
 use kilo_protocol::{GlobalEvent, MessageAppendInput};
 use kilo_provider::{chat_tools_with_auth_cancel, ChatMessage, ChatTool, ProviderError};
+use kilo_store::Store;
 use serde_json::{json, Value};
 
 use crate::http::sse;
 use crate::AppState;
 
-const SUMMARY_PROMPT: &str = "You are a session summarizer. The conversation below exceeded the model's context window and must be condensed to fit. Produce a concise, factual summary that preserves: \
-(1) the user's original goal and any constraints the user imposed; \
-(2) every file path / identifier / configuration value the agent needed to remember; \
-(3) the latest in-progress task or open question; \
-(4) any decisions the agent made that should not be revisited. \
-Drop verbatim tool I/O, intermediate reasoning, and stylistic chatter. Output the summary as plain prose under 1000 words. Do NOT call any tools.";
+/// Bun parity: the structured Markdown skeleton from
+/// `packages/opencode/src/session/compaction.ts:40-75`. The model fills
+/// each section from the conversation context. Keep section headers and
+/// order in lock-step with Bun — `validate_sections` and the parts
+/// renderer both rely on the `## Goal`/`## Constraints`/`## Progress`/
+/// `## Open Issues`/`## Next Steps` shape.
+const SUMMARY_TEMPLATE: &str =
+    "Output exactly this Markdown structure and keep the section order unchanged:\n\
+---\n\
+## Goal\n\
+- [single-sentence task summary]\n\
+\n\
+## Constraints\n\
+- [hard rules: file paths to avoid, libraries required, coding conventions, or \"(none)\"]\n\
+\n\
+## Progress\n\
+- [what's been done so far in this session, or \"(none)\"]\n\
+\n\
+## Open Issues\n\
+- [known problems, incomplete work, errors encountered, or \"(none)\"]\n\
+\n\
+## Next Steps\n\
+- [what should happen next when work resumes, or \"(none)\"]\n\
+---\n\
+\n\
+Rules:\n\
+- Keep every section, even when empty.\n\
+- Cap each section at roughly 200 words; use terse bullets, not prose paragraphs.\n\
+- Preserve exact file paths, commands, error strings, and identifiers when known.\n\
+- Drop verbatim tool I/O, intermediate reasoning, and stylistic chatter.\n\
+- Do not mention the summary process or that context was compacted.\n\
+- Do NOT call any tools.";
+
+/// Section headers we expect the model to emit. `validate_sections`
+/// warns (non-fatal) when any are missing — Bun is similarly lenient.
+const REQUIRED_SECTIONS: &[&str] = &[
+    "## Goal",
+    "## Constraints",
+    "## Progress",
+    "## Open Issues",
+    "## Next Steps",
+];
 
 /// Hard cap on consecutive compaction attempts within a single turn.
 /// Mirrors Bun's `KiloSessionPrompt.guardCompactionAttempt` behavior
@@ -66,19 +103,21 @@ pub(crate) async fn compact_session(
     // and bail before the (much more expensive) provider call.
     let st = state.clone();
     let sid_owned = sid.to_string();
-    let history = tokio::task::spawn_blocking(move || collect_history(&st, &sid_owned))
-        .await
-        .map_err(|err| CompactionError::Provider(ProviderError::Http(err.to_string())))?;
+    let snapshot =
+        tokio::task::spawn_blocking(move || collect_session_snapshot(&st.store, &sid_owned))
+            .await
+            .map_err(|err| CompactionError::Provider(ProviderError::Http(err.to_string())))?;
     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(CompactionError::Cancelled);
     }
-    if history.is_empty() {
+    if snapshot.history.is_empty() {
         return Err(CompactionError::EmptyHistory);
     }
     let cfg = state.store.config();
+    let prompt = build_summary_prompt(snapshot.prior_summary.as_deref());
     let messages = vec![ChatMessage {
         role: "user".to_string(),
-        content: format_history_for_summary(&history),
+        content: format_history_for_summary(&snapshot.history),
         responses: Vec::new(),
         attachments: Vec::new(),
     }];
@@ -86,7 +125,7 @@ pub(crate) async fn compact_session(
         &cfg,
         auths,
         model,
-        Some(SUMMARY_PROMPT.to_string()),
+        Some(prompt),
         messages,
         Vec::<ChatTool>::new(),
         cancel,
@@ -100,6 +139,7 @@ pub(crate) async fn compact_session(
     if out.text.is_empty() {
         return Err(CompactionError::EmptyResult);
     }
+    validate_sections(sid, &out.text);
     record_summary(state, sid, &out.text).map_err(CompactionError::Store)?;
     sse::publish(
         state,
@@ -137,41 +177,91 @@ pub(crate) fn record_summary(state: &AppState, sid: &str, text: &str) -> rusqlit
     Ok(())
 }
 
-/// Pull all messages, drop tool internals (calls + outputs), and produce
-/// a `Vec<(role, text)>` suitable for prompt-summarization. Tool I/O is
-/// elided per the SUMMARY_PROMPT contract — they're rarely worth
-/// preserving across a context-window boundary and they're the largest
-/// source of noise.
-fn collect_history(state: &AppState, sid: &str) -> Vec<(String, String)> {
-    state
-        .store
+/// History snapshot used by the summarizer: the conversation excerpt
+/// (sans summary anchors / system msgs / empty parts) plus the most
+/// recent prior summary if one exists. The latter is the anchor Bun's
+/// `buildPrompt` weaves into the system prompt so successive
+/// compactions chain coherently
+/// (`packages/opencode/src/session/compaction.ts:121-131`).
+struct SessionSnapshot {
+    history: Vec<(String, String)>,
+    prior_summary: Option<String>,
+}
+
+/// Pull all messages once, partition into `(history, prior_summary)`.
+/// Tool I/O is elided per the `SUMMARY_TEMPLATE` contract — it's rarely
+/// worth preserving across a context-window boundary and it's the
+/// largest source of noise.
+fn collect_session_snapshot(store: &Store, sid: &str) -> SessionSnapshot {
+    let raw = store
         .messages(sid, None, None)
-        .map(|page| {
-            page.items
-                .into_iter()
-                .filter_map(|msg| {
-                    let role = msg.info.get("role").and_then(Value::as_str)?;
-                    if role == "system" {
-                        return None;
-                    }
-                    if msg.info.get("summary").and_then(Value::as_bool) == Some(true) {
-                        return None;
-                    }
-                    let text = msg
-                        .parts
-                        .iter()
-                        .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
-                        .filter_map(|p| p.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if text.trim().is_empty() {
-                        return None;
-                    }
-                    Some((role.to_string(), text))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+        .map(|page| page.items)
+        .unwrap_or_default();
+    let mut prior_summary: Option<String> = None;
+    let mut history: Vec<(String, String)> = Vec::with_capacity(raw.len());
+    for msg in raw {
+        let Some(role) = msg.info.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        if role == "system" {
+            continue;
+        }
+        let text = msg
+            .parts
+            .iter()
+            .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if msg.info.get("summary").and_then(Value::as_bool) == Some(true) {
+            // Latest summary wins — `parts.rs::real_messages` uses
+            // `rposition` on the same flag, keep the semantics aligned.
+            if !text.trim().is_empty() {
+                prior_summary = Some(text);
+            }
+            continue;
+        }
+        if text.trim().is_empty() {
+            continue;
+        }
+        history.push((role.to_string(), text));
+    }
+    SessionSnapshot {
+        history,
+        prior_summary,
+    }
+}
+
+/// Build the system prompt for the summarizer call. When `prior` is
+/// `Some`, prepend an anchored-update preamble so the model refines the
+/// existing summary instead of starting from scratch — Bun parity with
+/// `compaction.ts:121-131` (`buildPrompt`).
+pub(crate) fn build_summary_prompt(prior: Option<&str>) -> String {
+    match prior {
+        Some(text) if !text.trim().is_empty() => format!(
+            "## Previous summary\n\n{text}\n\n## Update instructions\n\
+             Incorporate the previous summary above. Add new progress, \
+             mark items as resolved, update next steps. Preserve still-true \
+             details, drop stale ones, and merge in new facts from the \
+             conversation history.\n\n{SUMMARY_TEMPLATE}"
+        ),
+        _ => SUMMARY_TEMPLATE.to_string(),
+    }
+}
+
+/// Non-fatal section check. Bun's compaction is also lenient: a missing
+/// header is logged but the summary still persists. The agent-loop test
+/// suite exercises the happy-path content; this guard catches drift in
+/// the fake provider output without blocking real turns.
+fn validate_sections(sid: &str, text: &str) {
+    let missing: Vec<&str> = REQUIRED_SECTIONS
+        .iter()
+        .copied()
+        .filter(|hdr| !text.contains(hdr))
+        .collect();
+    if !missing.is_empty() {
+        eprintln!("[kilo-server] compaction summary for {sid} missing sections: {missing:?}");
+    }
 }
 
 /// Render the (role, text) pairs as a single user message body for the
@@ -219,4 +309,200 @@ pub(crate) fn compaction_error_envelope(err: &CompactionError) -> Value {
             "metadata": { "source": "rust-compaction" }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kilo_protocol::SessionCreateInput;
+
+    fn unique_root() -> std::path::PathBuf {
+        static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("kilo-compaction-test-{}-{seq}", std::process::id()))
+    }
+
+    fn store_at(root: &std::path::Path) -> Store {
+        Store::for_test(root)
+    }
+
+    /// Bun parity: the system prompt must carry the `## Goal` and
+    /// `## Constraints` headers (and the rest of the structured skeleton).
+    /// Locks the prompt against accidental drift back to freeform prose.
+    #[test]
+    fn compaction_uses_structured_template() {
+        let prompt = build_summary_prompt(None);
+        assert!(
+            prompt.contains("## Goal"),
+            "missing `## Goal` header in:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("## Constraints"),
+            "missing `## Constraints` header in:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("## Progress"),
+            "missing `## Progress` header in:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("## Open Issues"),
+            "missing `## Open Issues` header in:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("## Next Steps"),
+            "missing `## Next Steps` header in:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("Previous summary"),
+            "fresh prompt must not reference a prior anchor"
+        );
+    }
+
+    /// When a session already carries an `info.summary == true` message
+    /// the new compaction's system prompt prepends a "Previous summary"
+    /// block so the model updates the anchor instead of starting from
+    /// scratch (Bun parity: `compaction.ts:121-131`).
+    #[test]
+    fn compaction_anchors_prior_summary_when_present() {
+        let root = unique_root();
+        let store = store_at(&root);
+        let sid = store
+            .create_session(SessionCreateInput::default())
+            .expect("create session")
+            .id;
+        // Seed a real user turn so history isn't empty.
+        store
+            .append_message_record(
+                &sid,
+                MessageAppendInput {
+                    info: json!({
+                        "id": "msg_user_1",
+                        "role": "user",
+                        "sessionID": sid,
+                        "time": { "created": 1, "updated": 1, "completed": 1 },
+                    }),
+                    parts: vec![json!({
+                        "id": "p_user_1", "type": "text", "text": "do the thing"
+                    })],
+                },
+            )
+            .unwrap();
+        // Seed a prior summary anchor (assistant role + summary: true).
+        let anchor_text = "## Goal\n- Old goal text\n\n## Next Steps\n- Old next steps";
+        store
+            .append_message_record(
+                &sid,
+                MessageAppendInput {
+                    info: json!({
+                        "id": "msg_summary_old",
+                        "role": "assistant",
+                        "sessionID": sid,
+                        "summary": true,
+                        "time": { "created": 2, "updated": 2, "completed": 2 },
+                    }),
+                    parts: vec![json!({
+                        "id": "p_summary_old", "type": "text", "text": anchor_text
+                    })],
+                },
+            )
+            .unwrap();
+        // Seed a follow-up user turn after the anchor.
+        store
+            .append_message_record(
+                &sid,
+                MessageAppendInput {
+                    info: json!({
+                        "id": "msg_user_2",
+                        "role": "user",
+                        "sessionID": sid,
+                        "time": { "created": 3, "updated": 3, "completed": 3 },
+                    }),
+                    parts: vec![json!({
+                        "id": "p_user_2", "type": "text", "text": "follow up work"
+                    })],
+                },
+            )
+            .unwrap();
+
+        let snap = collect_session_snapshot(&store, &sid);
+        assert_eq!(
+            snap.prior_summary.as_deref(),
+            Some(anchor_text),
+            "snapshot must surface the prior summary text"
+        );
+        // History excludes the anchor itself but keeps both user turns.
+        assert_eq!(
+            snap.history.len(),
+            2,
+            "history should hold the two user turns, got: {:?}",
+            snap.history
+        );
+
+        let prompt = build_summary_prompt(snap.prior_summary.as_deref());
+        assert!(
+            prompt.contains("## Previous summary"),
+            "anchored prompt missing `## Previous summary`:\n{prompt}"
+        );
+        assert!(
+            prompt.contains(anchor_text),
+            "anchored prompt missing prior summary body:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("## Update instructions"),
+            "anchored prompt missing update instructions:\n{prompt}"
+        );
+        // Template still appended after the anchor block.
+        assert!(prompt.contains("## Goal"));
+        assert!(prompt.contains("## Constraints"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Fresh session — no prior summary — must produce the bare
+    /// `SUMMARY_TEMPLATE` with no anchor preamble.
+    #[test]
+    fn compaction_skips_anchor_when_no_prior_summary() {
+        let root = unique_root();
+        let store = store_at(&root);
+        let sid = store
+            .create_session(SessionCreateInput::default())
+            .expect("create session")
+            .id;
+        store
+            .append_message_record(
+                &sid,
+                MessageAppendInput {
+                    info: json!({
+                        "id": "msg_user_1",
+                        "role": "user",
+                        "sessionID": sid,
+                        "time": { "created": 1, "updated": 1, "completed": 1 },
+                    }),
+                    parts: vec![json!({
+                        "id": "p_user_1", "type": "text", "text": "fresh task"
+                    })],
+                },
+            )
+            .unwrap();
+
+        let snap = collect_session_snapshot(&store, &sid);
+        assert!(
+            snap.prior_summary.is_none(),
+            "fresh session must have no prior summary, got: {:?}",
+            snap.prior_summary
+        );
+
+        let prompt = build_summary_prompt(snap.prior_summary.as_deref());
+        assert!(
+            !prompt.contains("Previous summary"),
+            "prompt must not include `Previous summary` block:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("Update instructions"),
+            "prompt must not include update instructions:\n{prompt}"
+        );
+        assert_eq!(prompt, SUMMARY_TEMPLATE, "prompt must be the bare template");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
