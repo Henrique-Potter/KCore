@@ -2,11 +2,11 @@
 
 Living document. Snapshot date: 2026-05-09. Generated from two parallel deep-inspection sweeps and then reconciled after the Wave 1/2 Rust fixes. Round 1: 8 domains (routes, tools, providers, storage/auth, MCP/permissions/bus, kilocode features, CLI/infra/PTY, agent turn loop). Round 2: 5 domains (VS Code extension client, oracle/test coverage, SDK wire-shape, webview SSE consumers, subagent task tool deep dive). Round-2 additions are appended at the end.
 
-## Final status (post-wave-11)
+## Final status (post-wave-13)
 
-The lean OpenAI-Pro VS Code Rust sidecar is functionally feature-complete with parity to Bun across every documented user-visible flow. 11 parallel coder waves closed all P0 visible UX bugs and ~45 fix groups. Test count: 517 (was 229 at the start of this push).
+The lean OpenAI-Pro VS Code Rust sidecar is functionally feature-complete with parity to Bun across every documented user-visible flow. 13 parallel coder waves closed all P0 visible UX bugs and ~50 fix groups. Test count: 532 (was 229 at the start of this push).
 
-Remaining items are either testing infrastructure (PTY browser smoke) or explicitly out of scope (LSP, indexing, sync, experimental workspaces). See "## 2026-05-10 reconciliation" below for the wave-by-wave closure log.
+Remaining items are either testing infrastructure (PTY browser smoke) or explicitly out of scope (LSP, indexing, sync, experimental workspaces). The last in-scope tractable item is the bash tree-sitter parser for full per-arg permission classification (in flight as wave 14 CCC). See the reconciliation logs below for the wave-by-wave closure log.
 
 ## 2026-05-09 reconciliation
 
@@ -62,16 +62,28 @@ Additional rows closed since the 2026-05-09 snapshot:
 - Periodic GC scheduler — hourly tokio interval running `cleanup_old_snapshots(30)` + `cleanup_orphaned_plans(30)`.
 - Mid-stream retry safe replay — `Runner.mid_stream_retries` cap 3; partial assistant content replayed via synthetic `ChatMessage` in next request `input[]`; resets on success.
 
+## 2026-05-10 (afternoon) reconciliation
+
+Additional rows closed since the morning snapshot:
+
+- Proactive compaction trigger — checks `total_usage` against `model.limit.context * 0.85` after every step-finish; capped at `MAX_COMPACTION_ATTEMPTS`; respects `compaction.auto = false` opt-out; resets `total_usage` after success so threshold doesn't re-fire on summarized tokens (matches Bun `prompt.ts:1493-1516` re-entry).
+- Structured compaction summary template — Goal/Constraints/Progress/Open Issues/Next Steps markdown sections; anchored update when prior summary exists; non-fatal section validation.
+- `bad_request_named` registry migration — 12 call sites in `routes/config.rs` migrated to the canonical `crate::error::bad_request_named` helper that enforces `ALLOWED_INTERNAL_ERROR_NAMES` `debug_assert!`. Local duplicate removed.
+- API-key OpenAI requests routed through `/responses` — `post()` and `post_cancel()` now match Bun parity (all OpenAI through Responses regardless of auth). Flat tools envelope. Reasoning models work via api-key auth. Non-OpenAI providers retain `/chat/completions`.
+- MCP resource resolver — `agent::mcp_dispatch::read_resource(state, server, uri)` added; `agent::parts::resolve_user_multimodal` handles `type: "resource"` parts with `mcp://server/path` URIs. Text contents inlined; blob contents become base64 data URL attachments; errors fall back to `[unavailable]` stub.
+
 Still open after reconciliation (final state):
 
 | Area | Current status |
 |---|---|
+| Bash tree-sitter parser for permission scope | First-word heuristic landed in wave 2 K covers common cases (`git push *`, `npm install *`, etc.). Tree-sitter-bash port for full per-arg classification not yet landed (in flight as wave 14 CCC). |
+| API-key OpenAI streaming | Wave 13 XX migrated POST/cancel to `/responses`; streaming path (`post_stream`) still rejects `ChatAuth::Api` with `MissingKey` (in flight as wave 14 ZZ). |
 | PTY Agent Manager browser smoke | Testing infrastructure only — Rust transport implemented; no end-to-end browser smoke harness yet. |
 | `/sync/*`, most `/experimental/*` routes | Explicitly out of scope for the OpenAI-Pro narrow target. |
 | Real LSP client / file watcher / `@parcel/watcher` | Explicitly out of scope. |
 | Indexing pipeline / Lance DB | Explicitly out of scope. |
 
-Test count growth: from 229 baseline → 517 across 11 waves.
+Test count growth: from 229 baseline → 532 across 13 waves.
 
 Conventions:
 - **Severity**: H = visible UX or data-loss bug; M = degraded behavior or compat-only stub; L = cosmetic, deferred, or out-of-scope shim.
@@ -82,7 +94,7 @@ Conventions:
 
 ## P0 — User-visible bugs blocking even narrow OpenAI-Pro VS Code use
 
-> **Status reconciled through wave 12.** Rows showing `closed` are landed; see the reconciliation logs above for landing details.
+> **Status reconciled through wave 13.** Rows showing `closed` are landed; see the reconciliation logs above for landing details.
 
 | Area | Gap | Bun ref | Rust ref | Status | Sev |
 |---|---|---|---|---|---|
@@ -97,11 +109,11 @@ Conventions:
 | `auth.json` chmod | closed: Wave 1 C — POSIX 0600 mode set on auth file. | `packages/opencode/src/auth/index.ts:81,90` | `crates/kilo-store/src/lib.rs:1453-1482` | closed | H |
 | MCP tools-changed event | closed: Wave 1 A — `mcp.tools.changed` SSE publish on `tools/list_changed`. | `packages/opencode/src/mcp/index.ts:72-77,510` | `crates/kilo-server/src/routes/mcp.rs` | closed | M |
 | `/permission/allow-everything` | closed: Wave 1 B — route registered. | `packages/opencode/src/kilocode/permission/routes.ts:14-86` | `crates/kilo-server/src/routes/permissions.rs` | closed | H |
-| API-key OpenAI path uses `/chat/completions` | Bun routes ALL OpenAI through `/responses`. Rust falls back to `/chat/completions` for ChatAuth::Api with the wrong tools envelope (`function:{name,...}` vs flat). Reasoning models would fail. | `packages/opencode/src/provider/provider.ts:190-205` | `crates/kilo-provider/src/lib.rs:557-569,849-863` | partial | M (only matters if api-key flow is exercised) |
-| Image / multimodal input dropped | mostly closed: Wave 4 P — data-URL attachments + `file://` + directories + `@`-mentions wired through to Responses content. Note: MCP resource resolver still open. | `packages/opencode/src/provider/transform.ts:297-333` | `crates/kilo-provider/src/lib.rs:responses_input`, `crates/kilo-server/src/agent/parts.rs:real_messages` | partial | H |
+| API-key OpenAI path uses `/chat/completions` | closed: wave 13 XX (POST/cancel on /responses; streaming in flight wave 14 ZZ). | `packages/opencode/src/provider/provider.ts:190-205` | `crates/kilo-provider/src/lib.rs:557-569,849-863` | closed | M |
+| Image / multimodal input dropped | closed: wave 13 YY (MCP resource resolver added). | `packages/opencode/src/provider/transform.ts:297-333` | `crates/kilo-provider/src/lib.rs:responses_input`, `crates/kilo-server/src/agent/parts.rs:real_messages`, `crates/kilo-server/src/agent/mcp_dispatch.rs` | closed | H |
 | Retry layer partial | mostly closed: pre-stream + mid-stream safe replay + offline detection (Wave 5/wave 11). Note: automatic `session.network.restored` probe still partial. | `packages/opencode/src/session/retry.ts:23-160` | `crates/kilo-server/src/agent/retry.rs`, `crates/kilo-server/src/agent/openai_stream.rs`, `crates/kilo-provider/src/lib.rs` | partial | H |
-| Compaction is reactive-only | partial: proactive trigger landing in wave 12 (Wave 12 TT in flight). | `packages/opencode/src/session/prompt.ts:1493-1516,1654-1675` | `crates/kilo-server/src/agent/openai_stream.rs:436-502` | partial | M |
-| Compaction quality | partial: structured Goal/Constraints/Progress template landing in wave 12 (Wave 12 UU in flight). | `packages/opencode/src/session/compaction.ts:40-75,121-131` | `crates/kilo-server/src/agent/compaction.rs` | partial | M |
+| Compaction is reactive-only | closed: wave 12 TT (proactive trigger after step-finish). | `packages/opencode/src/session/prompt.ts:1493-1516,1654-1675` | `crates/kilo-server/src/agent/openai_stream.rs:436-502` | closed | M |
+| Compaction quality | closed: wave 12 UU (structured Goal/Constraints/Progress template). | `packages/opencode/src/session/compaction.ts:40-75,121-131` | `crates/kilo-server/src/agent/compaction.rs` | closed | M |
 | `task` subagent cost propagation | Closed for task subagents: Rust sums child assistant costs and serializes parent assistant cost updates so parallel task completions do not lose child spend. | `packages/opencode/src/kilocode/session/cost-propagation.ts:7-69` | `crates/kilo-store/src/lib.rs:add_message_cost_record`, `crates/kilo-server/src/agent/parts.rs:execute_task_tool` | closed | M |
 | `task` subagent permission inheritance | closed: Wave 5 T — agent.permission + guardPermissions + hard ruleset + MCP-server-specific denies merged. | `packages/opencode/src/tool/task.ts:71-72,108` | `crates/kilo-server/src/agent/parts.rs` | closed | M |
 | PTY shell selection on Windows | closed: Wave 2 J — pwsh > powershell > git-bash > COMSPEC priority + `KILO_GIT_BASH_PATH` honored. | `packages/opencode/src/shell/shell.ts:55-91` | `crates/kilo-server/src/routes/pty.rs` | closed | H |
@@ -116,8 +128,8 @@ Conventions:
 | `assertExternalDirectoryEffect` | closed: Wave 8 DD + Wave 9 GG — gated wrappers (`fake_*_gated`) + `parts.rs::real_tool_part` wiring. | `packages/opencode/src/tool/external-directory.ts:25-56` | `crates/kilo-server/src/agent/permissions`, `crates/kilo-server/src/agent/parts.rs` | closed | H |
 | `Truncate.Service` for tool outputs | closed: Wave 8 CC — 50KB / 2000-line caps, `<state_dir>/kilo/truncate/`, preview + `outputPath` metadata. | `packages/opencode/src/tool/tool.ts:91-130` | `crates/kilo-server/src/agent/tools` (Truncate service) | closed | H |
 | `summarize_session` body shape | closed: Wave 8 EE (+ Wave 10 PP for auto) — accepts `{providerID, modelID, auto}` and returns boolean. | `packages/opencode/src/server/routes/instance/session.ts:532` | `crates/kilo-server/src/routes/sessions.rs` | closed | M |
-| `bad_request_named` bypasses error registry | partial: canonical helper exists (Wave 12 VV), migration in flight (Wave 12 WW). | n/a | `crates/kilo-server/src/error.rs`, `routes/config.rs`, `agent/compaction.rs` | partial | M |
-| `event` table writes are unconditional | closed: Wave 8 FF — `KILO_EXPERIMENTAL_WORKSPACES` env flag gates SQLite inserts. | `packages/opencode/src/sync/index.ts:138-158` | `crates/kilo-store/src/lib.rs` | closed | M |
+| `bad_request_named` bypasses error registry | closed: wave 12 VV (12 call sites migrated to canonical helper). | n/a | `crates/kilo-server/src/error.rs`, `routes/config.rs`, `agent/compaction.rs` | closed | M |
+| `event` table writes are unconditional | closed: wave 8 FF (KILO_EXPERIMENTAL_WORKSPACES gate). | `packages/opencode/src/sync/index.ts:138-158` | `crates/kilo-store/src/lib.rs` | closed | M |
 
 ## P1 — Major missing routes / features (lean target may still need)
 

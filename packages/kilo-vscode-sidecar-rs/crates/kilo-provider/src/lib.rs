@@ -813,20 +813,36 @@ async fn post_stream(
     emit: &mut impl FnMut(StreamEvent),
 ) -> Result<ChatParsed, ProviderError> {
     let client = http()?;
-    let ChatAuth::Oauth { access, account } = &req.auth else {
+    // Wave 13: enable streaming on the API-key path for OpenAI so reasoning
+    // models (gpt-5.1, o1) work without OAuth. Bun parity: ALL OpenAI
+    // requests go through `/responses` (provider.ts:253-260 — `openai`
+    // loader returns `sdk.responses(modelID)` regardless of auth method).
+    // OAuth-only headers (User-Agent, originator, session_id) and the
+    // ChatGPT-Account-Id JWT-derived header are skipped on the api-key
+    // path — Bun does the same.
+    if req.provider != "openai" {
         return Err(ProviderError::MissingKey {
             provider: req.provider.clone(),
         });
-    };
-    let url = format!("{}/responses", req.base.trim_end_matches('/'));
-    let mut call = client
-        .post(url)
-        .bearer_auth(access)
-        .json(&responses_body(req, true));
-    call = openai_oauth_headers(call, req.session_id.as_deref());
-    if let Some(account) = account {
-        call = call.header("ChatGPT-Account-Id", account);
     }
+    let url = format!("{}/responses", req.base.trim_end_matches('/'));
+    let call = match &req.auth {
+        ChatAuth::Oauth { access, account } => {
+            let mut call = client
+                .post(&url)
+                .bearer_auth(access)
+                .json(&responses_body(req, true));
+            call = openai_oauth_headers(call, req.session_id.as_deref());
+            if let Some(account) = account {
+                call = call.header("ChatGPT-Account-Id", account);
+            }
+            call
+        }
+        ChatAuth::Api { key } => client
+            .post(&url)
+            .bearer_auth(key)
+            .json(&responses_body(req, true)),
+    };
     // M7 Fix 4 (a): cancel must interrupt the HTTP connect/headers wait,
     // not just the post-headers byte loop. Race the send against
     // `until_cancel` so an abort during DNS/TLS/headers returns Aborted
@@ -2149,6 +2165,136 @@ mod tests {
             "must not nest under `function:` (chat-completions shape)"
         );
         assert_eq!(parsed["tool_choice"], "auto");
+    }
+
+    /// Mirror of [`header_server`] for SSE streaming responses. Responds
+    /// once with a small `text/event-stream` body terminated by `[DONE]`,
+    /// returns the captured request bytes so the test can assert on
+    /// method, path, headers, and body shape. Used by the api-key
+    /// streaming test below — `post_stream` needs the upstream to look
+    /// like a Responses-API SSE feed.
+    fn sse_server() -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0; 8192];
+            let got = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..got]).to_string();
+            let body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+                        data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n\
+                        data: [DONE]\n\n";
+            let res = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(res.as_bytes()).unwrap();
+            req
+        });
+        (url, handle)
+    }
+
+    #[tokio::test]
+    async fn api_key_openai_streams_via_responses_endpoint() {
+        // Wave 13: API-key streaming was previously rejected with
+        // `MissingKey` (only OAuth got `/responses` streaming). This test
+        // pins the parity fix: api-key auth must hit `/responses` with
+        // `Authorization: Bearer <key>`, send `stream: true`, and use the
+        // FLAT tools envelope (no `function: {…}` nesting). OAuth-only
+        // headers (User-Agent, originator, session_id, ChatGPT-Account-Id)
+        // must be absent — Bun's `openai` loader passes the same plain
+        // SDK call regardless of auth method.
+        let (url, handle) = sse_server();
+        let req = ChatRequest {
+            provider: "openai".to_string(),
+            model: "gpt-5.1".to_string(),
+            base: url,
+            auth: ChatAuth::Api {
+                key: "sk-stream".to_string(),
+            },
+            session_id: None,
+            instructions: Some("be brief".to_string()),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                responses: Vec::new(),
+                attachments: Vec::new(),
+            }],
+            tools: vec![ChatTool {
+                name: "read".to_string(),
+                description: "read a file".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "filePath": { "type": "string" } },
+                    "required": ["filePath"]
+                }),
+            }],
+        };
+
+        let cancel = AtomicBool::new(false);
+        let mut events: Vec<StreamEvent> = Vec::new();
+        let out = post_stream(&req, &cancel, &mut |event| events.push(event))
+            .await
+            .expect("api-key streaming must succeed");
+        let raw = handle.join().unwrap();
+
+        // The SSE feed delivered a text delta and a finish; the parsed
+        // result should reflect them.
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::TextDelta(delta) if delta == "hi")));
+        assert_eq!(out.text, "hi");
+
+        // Endpoint: /responses, never /chat/completions.
+        assert!(
+            raw.contains("POST /responses"),
+            "expected POST to /responses, got:\n{raw}"
+        );
+        assert!(
+            !raw.contains("/chat/completions"),
+            "must not hit /chat/completions for OpenAI api-key streaming"
+        );
+        // Bearer auth is the api key.
+        assert!(
+            raw.contains("authorization: Bearer sk-stream"),
+            "expected api-key bearer auth, got:\n{raw}"
+        );
+        // OAuth-only headers must NOT appear on the api-key path.
+        let lower = raw.to_ascii_lowercase();
+        assert!(
+            !lower.contains("originator: opencode"),
+            "originator header must be OAuth-only"
+        );
+        assert!(
+            !lower.contains("user-agent: opencode/"),
+            "Codex User-Agent must be OAuth-only"
+        );
+        assert!(
+            !lower.contains("chatgpt-account-id"),
+            "ChatGPT-Account-Id header must be OAuth-only"
+        );
+
+        // Body: stream:true plus the flat tools envelope.
+        let body_start = raw.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+        let body = &raw[body_start..];
+        let parsed: Value = serde_json::from_str(body).expect("body is JSON");
+        assert_eq!(parsed["model"], "gpt-5.1");
+        assert_eq!(parsed["instructions"], "be brief");
+        assert_eq!(parsed["stream"], true);
+        assert_eq!(parsed["store"], false);
+        assert!(parsed["input"].is_array(), "expected Responses input[]");
+        assert!(
+            parsed.get("messages").is_none(),
+            "must not send chat-completions messages array"
+        );
+        let tool = &parsed["tools"][0];
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["name"], "read");
+        assert!(
+            tool.get("function").is_none(),
+            "must not nest under `function:` (chat-completions shape)"
+        );
     }
 
     #[tokio::test]

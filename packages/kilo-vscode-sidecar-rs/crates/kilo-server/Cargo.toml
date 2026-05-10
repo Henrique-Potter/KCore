@@ -24,6 +24,8 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+tree-sitter = "0.22"
+tree-sitter-bash = "0.21"
 
 [dev-dependencies]
 http-body-util = "0.1"

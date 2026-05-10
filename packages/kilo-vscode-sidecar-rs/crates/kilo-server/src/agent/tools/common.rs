@@ -11,6 +11,7 @@
 use std::path::Path as FsPath;
 
 use serde_json::Value;
+use tree_sitter::{Node, Parser};
 
 use crate::agent::tools::patch::parse_apply_patch;
 use crate::util::paths::slash;
@@ -108,31 +109,290 @@ pub(crate) fn patch_patterns(input: &Value) -> Option<Vec<String>> {
     Some(sections.into_iter().map(|item| item.path).collect())
 }
 
-/// First-word-extraction heuristic mirroring Bun's `BashArity.prefix`
-/// for the common cases. Returns most-specific to least-specific
-/// patterns terminating in `"*"`. Stays ASCII / no regex.
+/// Tree-sitter-backed permission pattern extractor for bash commands.
 ///
-/// We intentionally don't reproduce the full ARITY table from
-/// `packages/opencode/src/permission/arity.ts` — just the verbs that
-/// users typically write deny rules against. Verbs not in the table
-/// fall back to `["<v1> *", "*"]`.
+/// Mirrors the Bun implementation in `packages/opencode/src/tool/bash.ts`
+/// (`collect` + `BashArity.prefix`). For each `command` node in the parse
+/// tree (recursing through pipelines, subshells `(...)`, command
+/// substitutions `$(...)`, and skipping heredoc bodies), we extract the
+/// command's leading verb tokens and apply the arity table from
+/// `packages/opencode/src/permission/arity.ts`.
+///
+/// Output: most-specific to least-specific patterns terminating in `"*"`,
+/// deduplicated, with `*` always last. For example:
+///   `cat foo | grep bar`     -> ["cat *", "grep *", "*"]
+///   `aws s3 ls bucket`       -> ["aws s3 ls *", "aws s3 *", "aws *", "*"]
+///   `(cd /tmp && rm foo)`    -> ["rm *", "*"]            (cd is filtered)
+///   `echo $(rm -rf /)`       -> ["echo *", "rm *", "*"]
+///
+/// Falls back to the wave 2 K first-word heuristic on parser failure.
 pub(crate) fn bash_command_patterns(command: &str) -> Vec<String> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return vec!["*".to_string()];
     }
 
-    // Stop at the first shell pipe / chain separator so `a | b` matches
-    // on `a` only. Heredoc bodies likewise cap at the first `<<`.
+    match parse_bash(command) {
+        Some(patterns) if !patterns.is_empty() => patterns,
+        _ => fallback_patterns(trimmed),
+    }
+}
+
+/// Run the tree-sitter-bash parser and walk the AST. Returns `None` if
+/// the parser cannot be initialised; returns `Some(empty)` when the parse
+/// succeeded but yielded no usable command nodes (caller falls back).
+fn parse_bash(command: &str) -> Option<Vec<String>> {
+    let mut parser = Parser::new();
+    let language = tree_sitter_bash::language();
+    parser.set_language(&language).ok()?;
+    let tree = parser.parse(command, None)?;
+    let root = tree.root_node();
+
+    // A parse error at the top level (e.g. `if then else`) means the
+    // grammar bailed; let the caller fall back to the heuristic. We
+    // intentionally don't reject *any* error in the tree — most real
+    // commands tolerate minor parse warnings while still extracting
+    // sensible command nodes.
+    if root.has_error() && root.child_count() == 0 {
+        return None;
+    }
+    if root.kind() == "ERROR" {
+        return None;
+    }
+
+    let bytes = command.as_bytes();
+    let mut commands: Vec<Vec<String>> = Vec::new();
+    walk(root, bytes, &mut commands);
+
+    if commands.is_empty() && root.has_error() {
+        // Parse produced no commands and the tree has errors -> the
+        // input is malformed enough that fallback is safer.
+        return None;
+    }
+
+    let mut patterns: Vec<String> = Vec::new();
+    for tokens in commands {
+        for prefix in arity_prefixes(&tokens) {
+            let value = format!("{prefix} *");
+            if !patterns.contains(&value) {
+                patterns.push(value);
+            }
+        }
+    }
+    if !patterns.contains(&"*".to_string()) {
+        patterns.push("*".to_string());
+    }
+    Some(patterns)
+}
+
+/// Recursively visit nodes, collecting tokens for each `command` node.
+/// Skips heredoc bodies (their contents are data, not commands) and
+/// recurses into subshells / command substitutions naturally because
+/// tree-sitter exposes their inner programs as descendants.
+fn walk(node: Node, bytes: &[u8], out: &mut Vec<Vec<String>>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        // `heredoc_body` is the literal text between `<<EOF` and `EOF`.
+        // tree-sitter-bash sometimes re-parses it as commands; we never
+        // want to treat that as executable.
+        if child.kind() == "heredoc_body" {
+            continue;
+        }
+        if child.kind() == "command" {
+            if let Some(tokens) = command_tokens(child, bytes) {
+                out.push(tokens);
+            }
+            // A command can still contain a command_substitution argument
+            // that holds nested commands -> keep descending.
+        }
+        walk(child, bytes, out);
+    }
+}
+
+/// Extract the meaningful tokens (`command_name` + non-flag word args)
+/// from a `command` node. Returns `None` if no command name is present.
+fn command_tokens(node: Node, bytes: &[u8]) -> Option<Vec<String>> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "command_name" => {
+                let text = node_text(child, bytes);
+                let stripped = strip_dot_slash(text.trim());
+                if !stripped.is_empty() {
+                    tokens.push(stripped.to_string());
+                }
+            }
+            // Skip command substitutions, expansions, redirections, etc.
+            // BashArity only consumes literal subcommand verbs.
+            "word" | "string" | "raw_string" | "concatenation" | "number" => {
+                let text = node_text(child, bytes).trim().to_string();
+                if !text.is_empty() {
+                    tokens.push(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    if tokens.is_empty() {
+        return None;
+    }
+    Some(tokens)
+}
+
+fn node_text<'a>(node: Node<'a>, bytes: &'a [u8]) -> &'a str {
+    std::str::from_utf8(&bytes[node.start_byte()..node.end_byte()]).unwrap_or("")
+}
+
+/// Apply the arity table to a token list and emit every nested prefix
+/// from longest-meaningful-down to single-word, e.g.
+///   ["aws", "s3", "ls", "bucket"] -> ["aws s3 ls", "aws s3", "aws"].
+/// The wildcard `*` is appended by the caller.
+fn arity_prefixes(tokens: &[String]) -> Vec<String> {
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    // `bash -c "rm -rf /"`: re-tokenise the inner string and recurse.
+    // Bun does this implicitly via the parse tree, but since the inner
+    // command is a single quoted string the tree-sitter `command` node
+    // sees it as one token — handle it here.
+    if matches!(tokens[0].as_str(), "bash" | "sh")
+        && tokens.get(1).map(String::as_str) == Some("-c")
+    {
+        if let Some(inner) = tokens.get(2) {
+            let inner = inner.trim_matches(|c: char| c == '\'' || c == '"');
+            let inner_tokens: Vec<String> = inner.split_whitespace().map(str::to_string).collect();
+            if !inner_tokens.is_empty() {
+                return arity_prefixes(&inner_tokens);
+            }
+        }
+        return vec![tokens[0].clone()];
+    }
+
+    // Drop flags before computing meaningful prefix length: `git --version`
+    // is arity 1 because `--version` isn't a subcommand. Mirrors Bun's
+    // `BashArity.prefix(tokens)` -> ARITY[prefix] lookup which iterates
+    // joined non-flag prefixes.
+    let meaningful: Vec<&str> = tokens
+        .iter()
+        .map(String::as_str)
+        .filter(|t| !t.starts_with('-'))
+        .collect();
+
+    let arity_len = compute_arity(&meaningful);
+
+    let mut out: Vec<String> = Vec::new();
+    // Walk from `arity_len` down to 1 emitting nested prefixes.
+    for len in (1..=arity_len).rev() {
+        let slice = &meaningful[..len];
+        let value = slice.join(" ");
+        if !value.is_empty() && !out.contains(&value) {
+            out.push(value);
+        }
+    }
+    out
+}
+
+/// Bun arity table from `packages/opencode/src/permission/arity.ts`.
+/// Entries map a literal command prefix to the number of meaningful
+/// (non-flag) tokens that constitute the "human-understandable command".
+/// Longest matching prefix wins. Verbs not in the table degrade to
+/// arity 1, matching Bun's `prefix()` fallback at `arity.ts:8`.
+fn compute_arity(tokens: &[&str]) -> usize {
+    if tokens.is_empty() {
+        return 0;
+    }
+    for len in (1..=tokens.len()).rev() {
+        let key = tokens[..len].join(" ");
+        if let Some(arity) = arity_lookup(&key) {
+            // Clamp to the available token count -- a 3-arity command
+            // like `aws s3 ls` with only 2 tokens collapses to 2.
+            return arity.min(tokens.len());
+        }
+    }
+    1
+}
+
+fn arity_lookup(key: &str) -> Option<usize> {
+    Some(match key {
+        // arity 1 - explicit so longer prefixes don't accidentally win
+        "cat" | "cd" | "chmod" | "chown" | "cp" | "echo" | "env" | "export" | "grep" | "kill"
+        | "killall" | "ln" | "ls" | "mkdir" | "mv" | "ps" | "pwd" | "rm" | "rmdir" | "sleep"
+        | "source" | "tail" | "touch" | "unset" | "which" => 1,
+
+        // arity 2 - common verb + subcommand
+        "bazel" | "brew" | "bun" | "cargo" | "cdk" | "cf" | "cmake" | "composer" | "consul"
+        | "crictl" | "deno" | "docker" | "eksctl" | "firebase" | "flyctl" | "git" | "go"
+        | "gradle" | "helm" | "heroku" | "hugo" | "ip" | "kind" | "kubectl" | "kustomize"
+        | "make" | "mc" | "minikube" | "mongosh" | "mvn" | "mysql" | "ng" | "npm" | "nvm"
+        | "nx" | "openssl" | "pip" | "pipenv" | "pnpm" | "podman" | "poetry" | "psql"
+        | "pulumi" | "pyenv" | "python" | "rake" | "rbenv" | "redis-cli" | "rustup"
+        | "serverless" | "skaffold" | "sls" | "sst" | "swift" | "systemctl" | "terraform"
+        | "tmux" | "turbo" | "ufw" | "vault" | "vercel" | "volta" | "wp" | "yarn" => 2,
+
+        // arity 3 - service / subgroup-scoped CLIs
+        "aws" | "az" | "doctl" | "gcloud" | "gh" | "sfdx" => 3,
+
+        // arity 3 - explicit two-word verbs whose third token carries meaning
+        "bun run"
+        | "bun x"
+        | "cargo add"
+        | "cargo run"
+        | "consul kv"
+        | "deno task"
+        | "docker builder"
+        | "docker compose"
+        | "docker container"
+        | "docker image"
+        | "docker network"
+        | "docker volume"
+        | "eksctl create"
+        | "git config"
+        | "git remote"
+        | "git stash"
+        | "ip addr"
+        | "ip link"
+        | "ip netns"
+        | "ip route"
+        | "kind create"
+        | "kubectl kustomize"
+        | "kubectl rollout"
+        | "mc admin"
+        | "npm exec"
+        | "npm init"
+        | "npm run"
+        | "npm view"
+        | "openssl req"
+        | "openssl x509"
+        | "pnpm dlx"
+        | "pnpm exec"
+        | "pnpm run"
+        | "podman container"
+        | "podman image"
+        | "pulumi stack"
+        | "terraform workspace"
+        | "vault auth"
+        | "vault kv"
+        | "yarn dlx"
+        | "yarn run" => 3,
+
+        _ => return None,
+    })
+}
+
+fn strip_dot_slash(token: &str) -> &str {
+    token.strip_prefix("./").unwrap_or(token)
+}
+
+/// First-word heuristic from wave 2 K, retained as the parser-failure
+/// fallback. Stays ASCII / no regex.
+fn fallback_patterns(trimmed: &str) -> Vec<String> {
     let head = first_segment(trimmed);
     let tokens: Vec<&str> = head.split_whitespace().collect();
     if tokens.is_empty() {
         return vec!["*".to_string()];
     }
 
-    // `bash -c "rm -rf /"` / `sh -c "..."`: try to extract the inner
-    // command's first word. On any parse failure fall back to a
-    // shell-flavored pattern.
     if matches!(tokens[0], "bash" | "sh") && tokens.get(1).copied() == Some("-c") {
         if let Some(inner) = tokens.get(2).copied() {
             let inner = inner.trim_matches(|c: char| c == '\'' || c == '"');
@@ -151,10 +411,8 @@ pub(crate) fn bash_command_patterns(command: &str) -> Vec<String> {
         return vec!["*".to_string()];
     }
 
-    if is_multi_word_verb(v1) {
+    if arity_lookup(v1).map(|a| a >= 2).unwrap_or(false) {
         if let Some(v2) = tokens.get(1).copied() {
-            // Skip flags as the second token — they don't define a
-            // subcommand. Use a single-word pattern instead.
             if !v2.starts_with('-') && !v2.is_empty() {
                 return vec![format!("{v1} {v2} *"), format!("{v1} *"), "*".to_string()];
             }
@@ -169,9 +427,6 @@ fn one_word_patterns(v1: &str) -> Vec<String> {
 }
 
 fn first_segment(command: &str) -> &str {
-    // Cap at any of: `|`, `&`, `;`, `<<`. We don't try to be a real
-    // shell parser — the goal is "match what the user typed at the
-    // start", not full lexing.
     let bytes = command.as_bytes();
     let mut end = bytes.len();
     for (i, &b) in bytes.iter().enumerate() {
@@ -187,35 +442,11 @@ fn first_segment(command: &str) -> &str {
     command[..end].trim()
 }
 
-fn strip_dot_slash(token: &str) -> &str {
-    token.strip_prefix("./").unwrap_or(token)
-}
-
-/// Common multi-word verbs whose first subcommand carries the meaning
-/// (e.g. `git push`, `npm install`, `docker compose`). Mirrors the
-/// arity-2/3 entries in Bun's `ARITY` table that practitioners write
-/// rules against. Not exhaustive; unknown verbs degrade to one-word.
-fn is_multi_word_verb(v1: &str) -> bool {
-    matches!(
-        v1,
-        "git"
-            | "npm"
-            | "yarn"
-            | "pnpm"
-            | "bun"
-            | "cargo"
-            | "docker"
-            | "kubectl"
-            | "aws"
-            | "gcloud"
-            | "az"
-            | "gh"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Wave 2 K tests (must continue to pass) ----
 
     #[test]
     fn git_push_origin_main_expands_two_words() {
@@ -274,9 +505,12 @@ mod tests {
 
     #[test]
     fn pipe_caps_at_first_command() {
+        // Wave 2 K capped at the first segment; tree-sitter now emits
+        // patterns for every segment. Ensure the original `cat *`
+        // assertion still holds (the additional `grep *` is verified by
+        // the dedicated pipeline test below).
         let p = bash_command_patterns("cat /etc/passwd | grep root");
         assert!(p.contains(&"cat *".to_string()), "{p:?}");
-        assert!(!p.iter().any(|v| v.contains("grep")), "{p:?}");
     }
 
     #[test]
@@ -288,7 +522,6 @@ mod tests {
 
     #[test]
     fn git_with_only_flag_falls_back_to_one_word() {
-        // `git --version` — second token is a flag, not a subcommand.
         let p = bash_command_patterns("git --version");
         assert!(p.contains(&"git *".to_string()), "{p:?}");
         assert!(p.contains(&"*".to_string()), "{p:?}");
@@ -301,5 +534,59 @@ mod tests {
         let i_mid = p.iter().position(|v| v == "git *").unwrap();
         let i_wild = p.iter().position(|v| v == "*").unwrap();
         assert!(i_specific < i_mid && i_mid < i_wild);
+    }
+
+    // ---- Tree-sitter-only tests (cases the heuristic could not handle) ----
+
+    #[test]
+    fn pipeline_emits_patterns_for_each_segment() {
+        let p = bash_command_patterns("cat foo | grep bar | tail");
+        assert!(p.contains(&"cat *".to_string()), "{p:?}");
+        assert!(p.contains(&"grep *".to_string()), "{p:?}");
+        assert!(p.contains(&"tail *".to_string()), "{p:?}");
+        assert!(p.contains(&"*".to_string()), "{p:?}");
+    }
+
+    #[test]
+    fn command_substitution_extracts_inner_command() {
+        let p = bash_command_patterns("echo $(rm -rf /)");
+        assert!(p.contains(&"echo *".to_string()), "{p:?}");
+        assert!(p.contains(&"rm *".to_string()), "{p:?}");
+        assert!(p.contains(&"*".to_string()), "{p:?}");
+    }
+
+    #[test]
+    fn subshell_extracts_inner() {
+        let p = bash_command_patterns("(cd /tmp && rm foo)");
+        assert!(p.contains(&"rm *".to_string()), "{p:?}");
+        assert!(p.contains(&"*".to_string()), "{p:?}");
+    }
+
+    #[test]
+    fn aws_three_word_arity() {
+        let p = bash_command_patterns("aws s3 ls bucket");
+        assert!(p.contains(&"aws s3 ls *".to_string()), "{p:?}");
+        assert!(p.contains(&"aws s3 *".to_string()), "{p:?}");
+        assert!(p.contains(&"aws *".to_string()), "{p:?}");
+        assert!(p.contains(&"*".to_string()), "{p:?}");
+    }
+
+    #[test]
+    fn heredoc_body_ignored() {
+        // The `rm /` line is the heredoc body of `cat <<EOF` and must
+        // not produce a `rm *` permission pattern.
+        let p = bash_command_patterns("cat <<EOF\nrm /\nEOF\n");
+        assert!(p.contains(&"cat *".to_string()), "{p:?}");
+        assert!(p.contains(&"*".to_string()), "{p:?}");
+        assert!(!p.contains(&"rm *".to_string()), "{p:?}");
+    }
+
+    #[test]
+    fn malformed_bash_falls_back_to_heuristic() {
+        // Incomplete `if` / `then` / `else` -- tree-sitter still
+        // produces a partial tree, but should not panic and should at
+        // minimum return something containing `*`.
+        let p = bash_command_patterns("if then else");
+        assert!(p.contains(&"*".to_string()), "{p:?}");
     }
 }
