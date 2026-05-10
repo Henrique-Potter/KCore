@@ -337,6 +337,16 @@ pub(crate) async fn prompt_openai_stream(
         let mut iter_messages = base_messages.clone();
         iter_messages.extend(history_extension.iter().cloned());
 
+        // Tracks how much of `iter_text` / `iter_reasoning_encrypted` we
+        // have already spliced into `iter_messages` as synthetic
+        // assistant context on a previous mid-stream retry. Each retry
+        // round pushes ONLY the delta since the last splice so we don't
+        // double-bill the prefix the model already saw. `iter_text` is
+        // append-only within an iteration; reasoning items are appended
+        // (deduped by id), so a count works equally for both.
+        let mut pushed_iter_text_len: usize = 0;
+        let mut pushed_reasoning_count: usize = 0;
+
         let out = loop {
             let before_delta_len = deltas.len();
             let before_pending_len = pending_tools.lock().map(|items| items.len()).unwrap_or(0);
@@ -553,15 +563,52 @@ pub(crate) async fn prompt_openai_stream(
                                 "next": next_at,
                             }),
                         );
-                        // Abort any in-flight tool tasks; the retry's
-                        // model output will re-issue them. The
-                        // `pending_tools` slate gets cleared so the
-                        // doom-loop / missing-output bookkeeping
-                        // doesn't double-count.
-                        {
+                        // Abort in-flight tool tasks then DRAIN the
+                        // JoinSet. `abort_all` doesn't cancel tasks
+                        // that already finished — those still yield
+                        // `Ok(result)` from `join_next`. We harvest
+                        // their completed parts so:
+                        //   1. Side-effecting tools (bash/edit/write)
+                        //      that already ran get their results
+                        //      persisted exactly once.
+                        //   2. The retry's outbound `iter_messages`
+                        //      includes `function_call` +
+                        //      `function_call_output` items for those
+                        //      tools so the model doesn't re-issue
+                        //      them in the continuation (double-fire).
+                        let mut owned_retry = {
                             let mut guard = join_set.lock().unwrap();
                             guard.abort_all();
+                            std::mem::take(&mut *guard)
+                        };
+                        let mut completed_parts: Vec<Value> = Vec::new();
+                        while let Some(task) = owned_retry.join_next().await {
+                            if let Ok((_, part)) = task {
+                                completed_parts.push(part);
+                            }
                         }
+                        // Persist each harvested tool part so it shows
+                        // up on the assistant record + UI; also push
+                        // into the running `tool_parts` accumulator so
+                        // the post-loop finalize sees them.
+                        for part in &completed_parts {
+                            if let Ok(record) = state.store.append_message_record(
+                                id,
+                                MessageAppendInput {
+                                    info: start.result.info.clone(),
+                                    parts: vec![part.clone()],
+                                },
+                            ) {
+                                publish_events(&state, dir.clone(), project.clone(), record.events);
+                            }
+                        }
+                        tool_parts.extend(completed_parts.iter().cloned());
+                        // The pending-tools slate was the spawn record
+                        // for both the harvested and the aborted
+                        // tasks; clear it so doom-loop /
+                        // missing-output bookkeeping doesn't
+                        // double-count when the retry round spawns
+                        // fresh tasks.
                         if let Ok(mut pending) = pending_tools.lock() {
                             pending.clear();
                         }
@@ -572,27 +619,82 @@ pub(crate) async fn prompt_openai_stream(
                         // continues from where the failure cut the
                         // stream — no `previous_response_id` needed,
                         // works regardless of the upstream `store`
-                        // flag.
-                        let partial_text = iter_text
+                        // flag. Track per-iteration push offsets so
+                        // a SECOND retry only sends the delta since
+                        // the first retry's splice (no double-billing
+                        // the same prefix).
+                        let partial_text_full = iter_text
                             .lock()
                             .map(|guard| guard.clone())
                             .unwrap_or_default();
-                        let partial_reasoning: Vec<ReasoningItem> = iter_reasoning_encrypted
+                        let partial_reasoning_full: Vec<ReasoningItem> = iter_reasoning_encrypted
                             .lock()
                             .map(|items| items.clone())
                             .unwrap_or_default();
-                        if !partial_text.is_empty() || !partial_reasoning.is_empty() {
-                            let responses: Vec<ChatResponseItem> = partial_reasoning
+                        let new_text = partial_text_full
+                            .get(pushed_iter_text_len..)
+                            .unwrap_or("")
+                            .to_string();
+                        let new_reasoning: Vec<ReasoningItem> = partial_reasoning_full
+                            .iter()
+                            .skip(pushed_reasoning_count)
+                            .cloned()
+                            .collect();
+                        let next_pushed_text_len = partial_text_full.len();
+                        let next_pushed_reasoning_count = partial_reasoning_full.len();
+                        // Order: harvested completed tools FIRST (so
+                        // the model sees their `function_call_output`
+                        // before the synthetic continuation prompt),
+                        // then the assistant partial text/reasoning.
+                        if !completed_parts.is_empty() {
+                            let calls: Vec<ChatResponseItem> = completed_parts
+                                .iter()
+                                .filter(|p| p.get("type").and_then(Value::as_str) == Some("tool"))
+                                .filter_map(|p| {
+                                    Some(ChatResponseItem::FunctionCall(
+                                        kilo_provider::ChatToolCall {
+                                            id: p.get("callID")?.as_str()?.to_string(),
+                                            name: p.get("tool")?.as_str()?.to_string(),
+                                            input: p.get("state")?.get("input")?.clone(),
+                                        },
+                                    ))
+                                })
+                                .collect();
+                            let outputs: Vec<ChatResponseItem> = completed_parts
+                                .iter()
+                                .filter_map(tool_part_response)
+                                .collect();
+                            if !calls.is_empty() {
+                                iter_messages.push(ChatMessage {
+                                    role: "assistant".to_string(),
+                                    content: String::new(),
+                                    responses: calls,
+                                    attachments: Vec::new(),
+                                });
+                            }
+                            if !outputs.is_empty() {
+                                iter_messages.push(ChatMessage {
+                                    role: "tool".to_string(),
+                                    content: String::new(),
+                                    responses: outputs,
+                                    attachments: Vec::new(),
+                                });
+                            }
+                        }
+                        if !new_text.is_empty() || !new_reasoning.is_empty() {
+                            let responses: Vec<ChatResponseItem> = new_reasoning
                                 .into_iter()
                                 .map(ChatResponseItem::Reasoning)
                                 .collect();
                             iter_messages.push(ChatMessage {
                                 role: "assistant".to_string(),
-                                content: partial_text,
+                                content: new_text,
                                 responses,
                                 attachments: Vec::new(),
                             });
                         }
+                        pushed_iter_text_len = next_pushed_text_len;
+                        pushed_reasoning_count = next_pushed_reasoning_count;
                         if sleep_or_cancel(&cancel, delay).await {
                             break Err(ProviderError::Aborted);
                         }
@@ -815,13 +917,25 @@ pub(crate) async fn prompt_openai_stream(
                 {
                     Ok(_) => {
                         // History is now anchored on the new summary
-                        // record. Re-enter the loop from the same
-                        // iteration index — the next pass calls
-                        // `real_messages` again and gets the compacted
-                        // view. We DON'T re-push step-start/finish for
-                        // this retried iter; the overhead is one wasted
-                        // step-start emission per retry.
+                        // record. Re-bind `base_messages` against the
+                        // compacted view and drop per-turn state that
+                        // referenced the pre-compaction transcript so
+                        // the next iteration's outbound `iter_messages`
+                        // reflects the new context floor. Without this,
+                        // the retry would resend the same overflowing
+                        // transcript and the model would 400 again,
+                        // exhausting `MAX_COMPACTION_ATTEMPTS` and
+                        // killing the turn with `EmptyResult` — mirror
+                        // the proactive arm's behavior verbatim (Bun:
+                        // `prompt.ts:1493-1516`). We DON'T re-push
+                        // step-start/finish for this retried iter; the
+                        // overhead is one wasted step-start emission
+                        // per retry.
                         let _ = detail;
+                        base_messages = real_messages(&state, id, &text).await;
+                        history_extension.clear();
+                        total_usage = ChatUsage::default();
+                        last_iter_usage = None;
                         continue;
                     }
                     Err(err) => {

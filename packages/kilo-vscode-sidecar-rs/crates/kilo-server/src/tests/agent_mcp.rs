@@ -95,9 +95,67 @@ fn mcp_chat_tools_skips_disabled_and_failed_servers() {
 fn agent_hard_rules_returns_empty_for_unconstrained_modes() {
     let root = unique_root();
     let state = state_at(&root);
-    // No agent config + non-constrained agent name => no hard rules.
+    // Non-constrained agents never get a hard veto layer, even when the
+    // catalog ships default rules for them.
     assert!(state.agent_hard_rules("build").is_empty());
-    assert!(state.agent_hard_rules("ask").is_empty());
+    assert!(state.agent_hard_rules("code").is_empty());
+    assert!(state.agent_hard_rules("orchestrator").is_empty());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn is_protected_request_gates_bash_redirection_and_mutators() {
+    use crate::agent::permission::is_protected_request;
+    let root = unique_root();
+    let state = state_at(&root);
+
+    // Shell redirection into a config dir downgrades always->once.
+    let meta = json!({ "command": "echo hi > .kilo/x.json" });
+    assert!(is_protected_request(&state, "bash", &[], &meta));
+    // Mutating utility targeting a root-level config file.
+    let meta = json!({ "command": "rm -rf kilo.json" });
+    assert!(is_protected_request(&state, "bash", &[], &meta));
+    // Unrelated bash command is not protected.
+    let meta = json!({ "command": "echo hello world" });
+    assert!(!is_protected_request(&state, "bash", &[], &meta));
+    // Non-edit, non-bash permission keys remain unaffected.
+    let meta = json!({ "command": "echo hi > .kilo/x.json" });
+    assert!(!is_protected_request(&state, "read", &[], &meta));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn agent_hard_rules_emits_builtin_denies_for_ask_and_plan() {
+    // Bun parity: with no user config, the constraint modes ship hard
+    // deny rules for write/edit/apply_patch/bash (and plan_exit allow
+    // for plan). Mirrors `kilocode/agent/index.ts:{askGuard,planGuard}`.
+    let root = unique_root();
+    let state = state_at(&root);
+
+    let ask = state.agent_hard_rules("ask");
+    for key in ["edit", "bash", "apply_patch", "write"] {
+        assert!(
+            ask.iter()
+                .any(|r| r.permission == key && r.pattern == "*" && r.action == "deny"),
+            "ask missing default {key}:* deny: {ask:?}"
+        );
+    }
+
+    let plan = state.agent_hard_rules("plan");
+    for key in ["edit", "bash", "apply_patch", "write"] {
+        assert!(
+            plan.iter()
+                .any(|r| r.permission == key && r.pattern == "*" && r.action == "deny"),
+            "plan missing default {key}:* deny: {plan:?}"
+        );
+    }
+    assert!(
+        plan.iter()
+            .any(|r| r.permission == "plan_exit" && r.pattern == "*" && r.action == "allow"),
+        "plan missing plan_exit:* allow: {plan:?}"
+    );
 
     let _ = std::fs::remove_dir_all(root);
 }

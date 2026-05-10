@@ -55,13 +55,47 @@ struct Ctx {
     root: PathBuf,
 }
 
-pub(crate) fn track(store: &Store, project: &str) -> Result<String, SnapshotError> {
+pub(crate) fn track(
+    store: &Store,
+    project: &str,
+    session_id: &str,
+) -> Result<String, SnapshotError> {
     let _lock = SNAPSHOT_LOCK
         .lock()
         .map_err(|_| fail("snapshot lock poisoned".to_string()))?;
     let ctx = ctx(store, project)?;
     stage(&ctx)?;
-    text(&ctx, &["write-tree"]).map(|value| value.trim().to_string())
+    let hash = text(&ctx, &["write-tree"])?.trim().to_string();
+    // The tree object from `write-tree` is unreachable until something points
+    // at it. Without a ref, `git gc --prune=now` (run on session delete)
+    // deletes every loose tree in the snapshot dir — including ones still
+    // referenced from OTHER sessions' `message.info["snapshot"]` and
+    // `session.revert.snapshot`. Pin the tree behind a per-session ref so
+    // `on_session_deleted(this_session)` can drop only the refs for THIS
+    // session, leaving siblings reachable. Bun avoids this trap differently:
+    // it uses `gc --prune=7.days` (see `opencode/src/snapshot/index.ts:44`)
+    // so unreachable objects survive the grace window; we keep `--prune=now`
+    // but make reachability explicit.
+    let _ = run(
+        &ctx,
+        &["update-ref", &snapshot_ref(session_id, &hash), &hash],
+    );
+    Ok(hash)
+}
+
+/// Per-session-per-tree ref keeping snapshot trees reachable across
+/// `git gc --prune=now`. Layout: `refs/kilo-snapshots/<slug(session_id)>/<hash>`.
+/// `slug()` defends against any session id that would be rejected by git's
+/// ref-name rules (`refname-format(7)`); session ids are normally
+/// `ses_<alnum>` so this is belt-and-braces.
+fn snapshot_ref(session_id: &str, hash: &str) -> String {
+    format!("refs/kilo-snapshots/{}/{hash}", slug(session_id))
+}
+
+/// Prefix of refs owned by a single session — used by `on_session_deleted` to
+/// drop only that session's refs.
+fn snapshot_ref_prefix(session_id: &str) -> String {
+    format!("refs/kilo-snapshots/{}", slug(session_id))
 }
 
 pub(crate) fn patch(store: &Store, project: &str, base: &str) -> Result<Patch, SnapshotError> {
@@ -655,20 +689,22 @@ pub(crate) fn summary_from_diff_full(diff: &SnapshotDiffFull) -> Value {
 
 fn show_capped(ctx: &Ctx, rev: &str, file: &str) -> Result<String, SnapshotError> {
     let spec = format!("{rev}:{file}");
-    let out = command(ctx, &["show", spec.as_str()])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|err| fail(format!("git show {spec}: {err}")))?;
-    if !out.status.success() {
+    // Stream through `text_capped` instead of buffering the whole blob with
+    // `.output()`. A 50 MB file is now bounded to `MAX_DIFF_SIZE + 64 KiB`
+    // (stdout + stderr buffers) rather than fully read before being thrown
+    // away by the cap check (audit F-A9).
+    match text_capped(ctx, &["show", spec.as_str()], MAX_DIFF_SIZE) {
+        Ok((body, truncated)) => {
+            if truncated {
+                Ok(TRUNCATED.to_string())
+            } else {
+                Ok(body)
+            }
+        }
         // `git show <rev>:<missing>` returns non-zero — treat as "no content"
         // so added/deleted-side handling stays the same as Bun's fail-soft.
-        return Ok(String::new());
+        Err(_) => Ok(String::new()),
     }
-    if out.stdout.len() > MAX_DIFF_SIZE {
-        return Ok(TRUNCATED.to_string());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 /// Split a multi-file `git diff` output into `path -> patch text` entries.
@@ -761,17 +797,24 @@ pub(crate) fn snapshot_root(store: &Store) -> PathBuf {
 
 /// Hook to be invoked when a session is deleted. The current Rust snapshot
 /// layout (`<root>/<project>/<hash(worktree)>.git`) is shared per worktree
-/// across every session in the project, so deleting an individual session does
-/// NOT remove its directory — other live sessions may still reference the
-/// tree hashes captured there. Instead, we run `git gc --prune=now` on the
-/// project's snapshot dir(s) so unreferenced loose objects are reclaimed. If
-/// no snapshot dir exists for the project (the session never ran a turn),
-/// this is a no-op.
+/// across every session in the project, so deleting an individual session
+/// does NOT remove its directory — other live sessions may still reference
+/// the tree hashes captured there. Instead, we drop every
+/// `refs/kilo-snapshots/<session>/*` ref for THIS session (created by
+/// `track()` to keep its trees reachable across `gc`) and then run
+/// `git gc --prune=now`. Trees referenced by OTHER sessions' refs survive;
+/// trees only this session held are reclaimed. If no snapshot dir exists
+/// for the project (the session never ran a turn), this is a no-op.
 ///
-/// Future work: if Bun ever switches to per-session snapshot dirs, swap this
-/// out for `fs::remove_dir_all(snapshot_root.join(project).join(<sid>))` with
-/// the same `inside()` guard `cleanup_old_snapshots` uses.
-pub(crate) fn on_session_deleted(store: &Store, project: &str) -> Result<(), SnapshotError> {
+/// Future work: if Bun ever switches to per-session snapshot dirs, swap
+/// this out for
+/// `fs::remove_dir_all(snapshot_root.join(project).join(<sid>))` with the
+/// same `inside()` guard `cleanup_old_snapshots` uses.
+pub(crate) fn on_session_deleted(
+    store: &Store,
+    project: &str,
+    session_id: &str,
+) -> Result<(), SnapshotError> {
     let _lock = SNAPSHOT_LOCK
         .lock()
         .map_err(|_| fail("snapshot lock poisoned".to_string()))?;
@@ -784,6 +827,7 @@ pub(crate) fn on_session_deleted(store: &Store, project: &str) -> Result<(), Sna
         Err(_) => return Ok(()),
     };
     let root = store.paths().worktree;
+    let prefix = snapshot_ref_prefix(session_id);
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -793,7 +837,27 @@ pub(crate) fn on_session_deleted(store: &Store, project: &str) -> Result<(), Sna
             git: path,
             root: PathBuf::from(&root),
         };
-        // Best-effort GC; ignore errors so a stale dir doesn't break delete.
+        // 1) Drop refs owned by this session so their trees become
+        //    candidates for `gc --prune=now`. `for-each-ref` lists
+        //    `<refname> <SP> <hash>` so we can pair the delete with its
+        //    expected value (safer than a bare `update-ref -d`).
+        if let Ok(refs) = text(
+            &ctx,
+            &["for-each-ref", "--format=%(refname) %(objectname)", &prefix],
+        ) {
+            for line in refs.lines() {
+                let mut parts = line.splitn(2, ' ');
+                let Some(name) = parts.next() else { continue };
+                let Some(hash) = parts.next() else { continue };
+                if name.is_empty() || hash.is_empty() {
+                    continue;
+                }
+                let _ = run(&ctx, &["update-ref", "-d", name, hash]);
+            }
+        }
+        // 2) Best-effort GC; ignore errors so a stale dir doesn't break
+        //    delete. Trees still referenced by sibling sessions' refs
+        //    remain reachable.
         let _ = run(&ctx, &["gc", "--prune=now", "--quiet"]);
     }
     Ok(())
@@ -810,10 +874,11 @@ pub(crate) fn cleanup_old_snapshots(store: &Store, max_age_days: u64) -> usize {
 }
 
 fn cleanup_old_snapshots_at(root: &FsPath, max_age_days: u64) -> usize {
-    let _lock = match SNAPSHOT_LOCK.lock() {
-        Ok(guard) => guard,
-        Err(_) => return 0,
-    };
+    // Phase 1: walk WITHOUT holding `SNAPSHOT_LOCK`. The original impl held
+    // the process-global lock across the entire FS walk + per-dir
+    // `fs::remove_dir_all`, blocking every live `track()`/`patch()`/`revert()`
+    // for as long as the sweep took (audit B-B1). The walk only reads
+    // metadata — it doesn't touch git state — so it's safe to do lock-free.
     if !root.is_dir() {
         return 0;
     }
@@ -824,7 +889,7 @@ fn cleanup_old_snapshots_at(root: &FsPath, max_age_days: u64) -> usize {
         Ok(value) => value,
         Err(_) => return 0,
     };
-    let mut removed = 0usize;
+    let mut candidates: Vec<(PathBuf, PathBuf)> = Vec::new();
     let projects = match fs::read_dir(root) {
         Ok(iter) => iter,
         Err(_) => return 0,
@@ -855,11 +920,34 @@ fn cleanup_old_snapshots_at(root: &FsPath, max_age_days: u64) -> usize {
             if !age_ok {
                 continue;
             }
-            if fs::remove_dir_all(&path).is_ok() {
-                removed += 1;
-            }
+            candidates.push((path, project_path.clone()));
         }
-        // Drop empty project dirs after pruning; ignore errors.
+    }
+
+    // Phase 2: reacquire the lock briefly per removal. `try_lock` keeps the
+    // cleanup yielding to a hot live turn — if a `track()` is mid-flight we
+    // skip this candidate and let the next sweep pick it up. The lock guards
+    // `Ctx` / `command()` invariants; we still take it for the FS removal so
+    // we don't race a concurrent `git gc` reading the same dir.
+    let mut removed = 0usize;
+    let mut emptied: Vec<PathBuf> = Vec::new();
+    for (path, project_path) in candidates {
+        let guard = match SNAPSHOT_LOCK.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => continue,
+        };
+        if fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+            emptied.push(project_path);
+        }
+        drop(guard);
+    }
+    // Drop now-empty project dirs after pruning; ignore errors. `remove_dir`
+    // only succeeds when the directory is empty, so unrelated siblings are
+    // safe.
+    emptied.sort();
+    emptied.dedup();
+    for project_path in emptied {
         let _ = fs::remove_dir(&project_path);
     }
     removed
@@ -1304,4 +1392,154 @@ mod tests {
 
     #[cfg(not(any(unix, windows)))]
     fn backdate(_path: &FsPath, _when: SystemTime) {}
+
+    /// Build a `Store` backed by `root` with `<root>/repo` as the worktree
+    /// and a real git repo already initialized inside it. The data dir
+    /// (`<root>/data/kilo`) is created on demand by `track()`.
+    fn store_fixture(label: &str) -> (kilo_store::Store, PathBuf) {
+        let root = unique_dir(label);
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "--quiet", "--initial-branch=main"]);
+        run_git(&repo, &["config", "core.autocrlf", "false"]);
+        let store = kilo_store::Store::for_test(&root);
+        (store, root)
+    }
+
+    /// Read the snapshot dir for `(project, worktree)` so tests can poke at
+    /// the shadow git directly. Mirrors `snapshot::ctx()` layout.
+    fn snapshot_git_dir(store: &kilo_store::Store, project: &str) -> PathBuf {
+        let worktree = PathBuf::from(store.paths().worktree);
+        store
+            .data_dir()
+            .join("snapshot")
+            .join(slug(project))
+            .join(format!("{}.git", hash_path(&worktree)))
+    }
+
+    /// Verify that `track()` creates `refs/kilo-snapshots/<session>/<hash>`
+    /// keeping the tree reachable, and that `on_session_deleted(A)` does NOT
+    /// destroy session B's tree (the previous bug — `git gc --prune=now`
+    /// reclaimed every loose tree).
+    #[test]
+    fn snapshot_track_creates_ref_so_tree_survives_gc() {
+        let (store, root) = store_fixture("track-ref-survives");
+        let repo = root.join("repo");
+        let project = "proj_a";
+
+        // Session A snapshot.
+        write(&repo, "file.txt", "session A body\n");
+        let hash_a = match track(&store, project, "ses_A") {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = fs::remove_dir_all(&root);
+                return; // host without git
+            }
+        };
+
+        // Session B snapshot, distinct tree.
+        write(&repo, "file.txt", "session B body\n");
+        let hash_b = match track(&store, project, "ses_B") {
+            Ok(value) => value,
+            Err(err) => panic!("track B: {err}"),
+        };
+        assert_ne!(hash_a, hash_b, "expected distinct trees per session");
+
+        let git_dir = snapshot_git_dir(&store, project);
+        let worktree = repo.clone();
+
+        // Sanity: both refs exist under refs/kilo-snapshots/.
+        let assert_ref = |session: &str, hash: &str, expect: bool| {
+            let name = snapshot_ref(session, hash);
+            let out = Command::new(GIT)
+                .arg("--git-dir")
+                .arg(&git_dir)
+                .arg("--work-tree")
+                .arg(&worktree)
+                .args(["rev-parse", "--verify", &name])
+                .output()
+                .expect("git rev-parse");
+            assert_eq!(
+                out.status.success(),
+                expect,
+                "ref {name} presence mismatch (expected {expect}): {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        assert_ref("ses_A", &hash_a, true);
+        assert_ref("ses_B", &hash_b, true);
+
+        // Delete session A. After this, ref A must be gone but B's tree
+        // must still be readable (the previous bug: `gc --prune=now`
+        // collected every loose tree, including B's).
+        on_session_deleted(&store, project, "ses_A").expect("on_session_deleted");
+
+        assert_ref("ses_A", &hash_a, false);
+        assert_ref("ses_B", &hash_b, true);
+
+        // The decisive check: B's tree object must still be reachable via
+        // `cat-file -t` even after `--prune=now`. If the ref hadn't
+        // survived, this would fail because the loose tree would be
+        // reclaimed.
+        let out = Command::new(GIT)
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .arg("--work-tree")
+            .arg(&worktree)
+            .args(["cat-file", "-t", &hash_b])
+            .output()
+            .expect("git cat-file");
+        assert!(
+            out.status.success(),
+            "B's tree {hash_b} must survive A's deletion: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "tree",
+            "expected tree object, got {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `cleanup_old_snapshots_at` used to hold `SNAPSHOT_LOCK` across the
+    /// entire FS walk, blocking concurrent `track()` calls. With the fix,
+    /// the walk runs lock-free and the lock is only `try_lock`ed per
+    /// removal — a concurrent `track()` should return promptly even while
+    /// a cleanup pass is in flight (audit B-B1).
+    #[test]
+    fn cleanup_old_snapshots_does_not_block_concurrent_snapshot() {
+        let (store, root) = store_fixture("cleanup-no-block");
+        let repo = root.join("repo");
+        write(&repo, "marker.txt", "x\n");
+
+        // Pre-flight: must be able to `track()` at all on this host.
+        if track(&store, "proj_a", "ses_pre").is_err() {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let snapshot_root_path = snapshot_root(&store);
+        let cleanup_handle = std::thread::spawn(move || {
+            // Concurrent cleanup pass — must NOT hold the lock during walk.
+            cleanup_old_snapshots_at(&snapshot_root_path, 365 * 100);
+        });
+
+        // Race a track() against the cleanup. With the lock-released-walk
+        // fix this returns promptly. With the old impl, cleanup would hold
+        // the lock for the duration of the walk and serialize this call.
+        let started = std::time::Instant::now();
+        let _ = track(&store, "proj_a", "ses_race");
+        let elapsed = started.elapsed();
+        cleanup_handle.join().unwrap();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "track() blocked behind cleanup walk ({:?}); cleanup must release the lock between candidates",
+            elapsed
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

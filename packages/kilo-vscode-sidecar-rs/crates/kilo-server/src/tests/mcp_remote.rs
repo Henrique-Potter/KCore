@@ -527,6 +527,176 @@ async fn mcp_oauth_callback_exchange_error_redacts_secrets() {
     assert!(!text.contains("client-secret"));
 }
 
+/// Fix 4: a failed OAuth token exchange must scrub the persisted
+/// `pending` blob so the PKCE verifier doesn't sit in mcp-auth.json
+/// across restarts.
+#[tokio::test]
+async fn mcp_pending_oauth_cleared_on_exchange_failure() {
+    let root = unique_root();
+    let st = state_at(&root);
+    let token = mcp_token_error_server().await;
+    mcp_add_remote_oauth_server(
+        &st,
+        "remote",
+        "http://127.0.0.1:1/mcp",
+        "http://auth.test/authorize",
+        &token.url,
+        "http://127.0.0.1:4099/mcp/remote/oauth/callback",
+    )
+    .await;
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp/remote/oauth/authorize")
+        .body(Body::empty())
+        .unwrap();
+    let res = app(st.clone()).oneshot(req).await.unwrap();
+    let data = response_to_value(res).await;
+    let state_value = data["state"].as_str().unwrap();
+
+    // Pre-condition: authorize wrote the pending blob with the verifier.
+    let auth = st.store.mcp_auth("remote").unwrap();
+    assert!(auth.get("pending").is_some());
+    assert!(auth["pending"]["codeVerifier"].is_string());
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/mcp/remote/oauth/callback?code=abc&state={state_value}"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let res = app(st.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // Post-condition: pending blob is gone even though the exchange failed.
+    let auth = st.store.mcp_auth("remote").unwrap_or_else(|| json!({}));
+    assert!(
+        auth.get("pending").is_none(),
+        "pending blob leaked after failed exchange: {auth:?}"
+    );
+}
+
+/// Fix 5: two callers that hit `mcp_token_for_request` concurrently with
+/// expired credentials must serialize through the per-server refresh
+/// mutex so only one IdP roundtrip fires. The second caller re-reads the
+/// store after the lock and uses the freshly persisted access token.
+#[tokio::test]
+async fn mcp_concurrent_refreshes_serialize_via_single_flight() {
+    let root = unique_root();
+    let st = state_at(&root);
+    let token_hits = StdArc::new(AtomicUsize::new(0));
+    let token = single_flight_token_server(token_hits.clone()).await;
+    let bearer_hits = StdArc::new(AtomicUsize::new(0));
+    // Provide enough responses for two concurrent tools/call hits. The
+    // mock server counts every request that arrives with `Authorization:
+    // Bearer fresh-access` so the asserts can confirm both tool calls
+    // forwarded the refreshed token.
+    let server = mcp_remote_token_server(
+        vec![
+            mcp_json_response(json!({
+                "jsonrpc": "2.0", "id": 100,
+                "result": { "content": [{ "type": "text", "text": "ok1" }] }
+            })),
+            mcp_json_response(json!({
+                "jsonrpc": "2.0", "id": 101,
+                "result": { "content": [{ "type": "text", "text": "ok2" }] }
+            })),
+        ],
+        "Bearer fresh-access",
+        bearer_hits.clone(),
+    )
+    .await;
+    mcp_add_remote_server(&st, "remote", &server.url, 1000).await;
+    // Seed an expired token + refresh credentials. Skip the connect
+    // handshake (the mock above only services tool calls); flip the
+    // status to Connected manually so `mcp_call_tool` doesn't bail on
+    // "not connected".
+    st.store
+        .set_mcp_auth(
+            "remote",
+            json!({
+                "accessToken": "stale",
+                "refreshToken": "stale-refresh",
+                "expiresAt": 1,
+                "tokenUrl": token.url,
+                "clientId": "client",
+            }),
+        )
+        .unwrap();
+    st.mcp.lock().unwrap().insert(
+        "remote".to_string(),
+        kilo_mcp::Status::Connected { tools: vec![] },
+    );
+
+    // Fire two concurrent tool calls. Both will reach
+    // `mcp_token_for_request`, find an expired token, and race the
+    // refresh. With single-flight, only ONE IdP roundtrip fires.
+    let st1 = st.clone();
+    let st2 = st.clone();
+    let call = |st: std::sync::Arc<crate::AppState>| async move {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp/remote/tool")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "name": "echo" }).to_string()))
+            .unwrap();
+        app(st).oneshot(req).await.unwrap()
+    };
+    let (r1, r2) = tokio::join!(call(st1), call(st2));
+    assert_eq!(r1.status(), StatusCode::OK);
+    assert_eq!(r2.status(), StatusCode::OK);
+
+    // Single-flight: exactly one IdP roundtrip even though two callers
+    // raced.
+    assert_eq!(
+        token_hits.load(Ordering::SeqCst),
+        1,
+        "concurrent refreshes both hit the IdP",
+    );
+    // Both tool calls used the refreshed token.
+    assert_eq!(bearer_hits.load(Ordering::SeqCst), 2);
+    let auth = st.store.mcp_auth("remote").unwrap();
+    assert_eq!(auth["accessToken"], "fresh-access");
+}
+
+/// Slow IdP-style token server: responds with a fresh access+refresh
+/// after a short delay so the second concurrent caller observes the
+/// in-flight refresh and serializes behind it. Counts every hit so the
+/// test can assert exactly one IdP roundtrip fired.
+async fn single_flight_token_server(hits: StdArc<AtomicUsize>) -> super::common::McpRemoteServer {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            hits.fetch_add(1, Ordering::SeqCst);
+            let mut buf = vec![0; 65536];
+            let _ = socket.read(&mut buf).await.unwrap();
+            // Hold the connection open briefly so the second concurrent
+            // caller is guaranteed to enter the lock wait path before
+            // the first one finishes.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let body = json!({
+                "access_token": "fresh-access",
+                "refresh_token": "fresh-refresh",
+                "expires_in": 3600,
+            })
+            .to_string();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+        }
+    });
+    super::common::McpRemoteServer {
+        url: format!("http://{addr}/token"),
+    }
+}
+
 #[tokio::test]
 async fn mcp_oauth_authorize_discovers_metadata_without_explicit_endpoints() {
     let root = unique_root();

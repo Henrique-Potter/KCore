@@ -82,6 +82,9 @@ pub(crate) struct AppState {
     /// — the verifier is server-side. We populate this map on
     /// `oauth_authorize` and consume it on `oauth_callback`.
     pub(crate) oauth_pending: Mutex<BTreeMap<String, PendingAuth>>,
+    /// Single-flight OpenAI OAuth refresh. Refresh tokens can rotate; parallel
+    /// turns/subagents must not all spend the same old refresh token.
+    pub(crate) oauth_refresh: tokio::sync::Mutex<()>,
     pub(crate) oauth_listener: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) oauth_listener_addr: SocketAddr,
     pub(crate) oauth_token_endpoint: String,
@@ -288,7 +291,6 @@ impl AppState {
     /// waits visible to `/network`. Returns the count cleared so the
     /// caller can decide whether to publish a `restored`/`rejected`
     /// event chain (the reply machinery handles its own events).
-    #[cfg(test)]
     pub(crate) fn clear_network_waits_for_session(&self, sid: &str) -> usize {
         let mut guard = self.network.lock().unwrap();
         let drained: Vec<String> = guard
@@ -398,23 +400,22 @@ pub(crate) struct Runner {
     /// plugin handler, etc.). The sync `prompt` path leaves this `None`
     /// — its future is owned by the calling task.
     pub(crate) abort: Mutex<Option<tokio::task::AbortHandle>>,
-    /// Plan-mode follow-up phase marker. Set by the plan-followup arm
-    /// of `prompt_turn` while the runner is suspended on the
-    /// "Continue with implementation?" question (Bun parity:
-    /// `kilocode/plan-followup.ts::ask`). Routes that fan out on cancel
-    /// (`reject_pending_for_sessions`, `abort_session`) can read this
-    /// to distinguish a runner blocked on a user prompt from one
-    /// actively producing tokens.
-    pub(crate) awaiting_plan_followup: Arc<AtomicBool>,
-    /// Mid-stream retry counter. Incremented when the OpenAI Responses
+    /// Maximum consecutive mid-stream retries within a single iteration
+    /// before terminal failure. Incremented when the OpenAI Responses
     /// stream errors AFTER content (text deltas / reasoning / tool
-    /// calls) has streamed within a single iteration. Reset to 0 on a
-    /// successful turn completion, on a user-driven abort (without
+    /// calls) has streamed within a single iteration. Resets to 0 on
+    /// every clean iteration completion (so each iteration's burst gets
+    /// its own budget), on a user-driven abort (without
     /// `follow_up_break`), and after exhausting the cap so the next
-    /// turn starts fresh. Capped at
+    /// iteration starts fresh. Capped at
     /// [`crate::agent::openai_stream::MID_STREAM_RETRY_CAP`]; beyond
     /// that the partial assistant message is finalized with a terminal
     /// error envelope.
+    ///
+    /// Note: The field name implies a per-turn cap, but the
+    /// implementation in `openai_stream.rs` resets per iteration.
+    /// Aligning to a per-turn cap would require moving the reset out
+    /// of the per-iteration success path.
     pub(crate) mid_stream_retries: Arc<AtomicU8>,
 }
 
@@ -427,6 +428,11 @@ pub(crate) struct RunnerGuard {
 impl Drop for RunnerGuard {
     fn drop(&mut self) {
         self.state.runners.lock().unwrap().remove(&self.id);
+        // Clear the per-session agent selection and resolved hard-rule
+        // veto layer so plan-mode hard rules don't leak into routes that
+        // run after the turn ends (e.g. a follow-up read tool on an
+        // already-finished session).
+        self.state.set_session_agent(&self.id, None);
         self.state.runner_notify.notify_waiters();
     }
 }
@@ -557,6 +563,7 @@ mod tests {
             session_hard_rules: Mutex::default(),
             broken_turn_anchors: Mutex::default(),
             oauth_pending: Mutex::default(),
+            oauth_refresh: tokio::sync::Mutex::new(()),
             oauth_listener: Mutex::default(),
             oauth_listener_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             oauth_token_endpoint: format!("{OPENAI_ISSUER}/oauth/token"),
@@ -593,5 +600,37 @@ mod tests {
         assert!(!state.has_network_wait_for_session("sid_b"));
         // Idempotent on an empty session.
         assert_eq!(state.clear_network_waits_for_session("sid_b"), 0);
+    }
+
+    /// `RunnerGuard::drop` must clear both `session_agents` and the
+    /// resolved `session_hard_rules` entry so plan-mode hard rules
+    /// don't leak past turn end (e.g. a follow-up read tool on the
+    /// finished session). Regression for the lifecycle gap where only
+    /// the runner-map entry was removed on drop.
+    #[test]
+    fn runner_guard_drop_clears_session_agent_and_hard_rules() {
+        let state = fixture();
+        let sid = "ses_a";
+        // Pre-load the agent state the way `prompt_turn` would.
+        state.set_session_agent(sid, Some("plan"));
+        assert!(state.session_agents.lock().unwrap().contains_key(sid));
+        // The `plan` agent intentionally yields no rules in the bare
+        // fixture (no config loaded), but the map entry exists with a
+        // (possibly empty) Vec — the leak check is about the entry's
+        // presence, not its contents.
+        assert!(state.session_hard_rules.lock().unwrap().contains_key(sid));
+
+        {
+            let _guard = RunnerGuard {
+                state: state.clone(),
+                id: sid.to_string(),
+                cancel: Arc::new(AtomicBool::new(false)),
+            };
+            // Guard still alive — entries remain.
+            assert!(state.session_agents.lock().unwrap().contains_key(sid));
+        }
+        // Drop fired — both maps cleared for this session.
+        assert!(!state.session_agents.lock().unwrap().contains_key(sid));
+        assert!(!state.session_hard_rules.lock().unwrap().contains_key(sid));
     }
 }

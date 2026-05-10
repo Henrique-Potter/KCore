@@ -49,13 +49,27 @@ pub fn replace(
         multi_occurrence,
     ];
 
+    // When a strategy reports MultipleMatches we fall through to the next
+    // (smarter) strategy — a more constrained anchor may disambiguate to
+    // a single hit. Only if every strategy gives up do we surface the
+    // multi-match error (keeping the highest count seen).
+    let mut multi: Option<ReplaceError> = None;
     for strategy in strategies {
-        if let Some(result) = strategy(&content_lf, &old_lf, &new_lf, replace_all) {
-            return result.map(|out| from_lf(&out, ending));
+        match strategy(&content_lf, &old_lf, &new_lf, replace_all) {
+            Some(Ok(out)) => return Ok(from_lf(&out, ending)),
+            Some(Err(ReplaceError::MultipleMatches { count })) => {
+                let keep = match multi {
+                    Some(ReplaceError::MultipleMatches { count: prev }) if prev >= count => prev,
+                    _ => count,
+                };
+                multi = Some(ReplaceError::MultipleMatches { count: keep });
+            }
+            Some(Err(err)) => return Err(err),
+            None => {}
         }
     }
 
-    Err(ReplaceError::NotFound)
+    Err(multi.unwrap_or(ReplaceError::NotFound))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +108,12 @@ fn detect_ending(text: &str) -> Ending {
 }
 
 fn to_lf(s: &str) -> String {
+    // Hot path: most files (and almost all model-authored `old`/`new`)
+    // are already LF. Skip both `replace` allocations when there is no
+    // `\r` to convert.
+    if !s.as_bytes().contains(&b'\r') {
+        return s.to_string();
+    }
     s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
@@ -677,5 +697,34 @@ mod tests {
         let new = "X\nY";
         let out = replace(content, old, new, false).unwrap();
         assert_eq!(out, "X\r\nY\r\nthree\r\n");
+    }
+
+    /// Audit ref: replacers.rs:40-58. Before the fix the dispatcher
+    /// returned `Err(MultipleMatches)` as soon as `simple` reported it,
+    /// even though a later, more constrained strategy could disambiguate
+    /// to a single hit. Here `simple` finds `foo` twice; `line_trimmed`
+    /// (strategy #2) only matches the line that trims to exactly `foo`.
+    #[test]
+    fn replacer_chain_falls_through_multi_match_to_smarter_strategy() {
+        let content = "foo\nfoo bar\n";
+        let out = replace(content, "foo", "BAZ", false)
+            .expect("smarter strategy should disambiguate the multi-match from `simple`");
+        assert_eq!(out, "BAZ\nfoo bar\n");
+    }
+
+    /// Audit ref: F-E2. `to_lf` used to do two full `replace` passes
+    /// (two allocations) even when the input was already LF. Verify the
+    /// short-circuit returns a string whose capacity matches the input
+    /// length exactly — `String::with_capacity(len)` is what
+    /// `str::to_string` produces, and `replace` would over-allocate.
+    #[test]
+    fn to_lf_short_circuits_when_no_carriage_return() {
+        let input = "alpha\nbeta\ngamma\n";
+        let out = to_lf(input);
+        assert_eq!(out, input);
+        // Heuristic single-allocation budget: capacity must equal length
+        // (the `to_string` fast path), not be inflated by a no-op
+        // `replace("\r\n", "\n")` pass that pre-grows the buffer.
+        assert_eq!(out.capacity(), input.len());
     }
 }

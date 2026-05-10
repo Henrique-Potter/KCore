@@ -1672,7 +1672,6 @@ async fn follow_up_break_finalizes_with_follow_up_finish_and_no_error_publish() 
             follow_up_break: follow_up_break.clone(),
             parent: None,
             abort: std::sync::Mutex::new(None),
-            awaiting_plan_followup: Arc::new(AtomicBool::new(false)),
             mid_stream_retries: Arc::new(AtomicU8::new(0)),
         },
     );
@@ -1793,7 +1792,6 @@ async fn regular_abort_still_publishes_error() {
             follow_up_break: follow_up_break.clone(),
             parent: None,
             abort: std::sync::Mutex::new(None),
-            awaiting_plan_followup: Arc::new(AtomicBool::new(false)),
             mid_stream_retries: Arc::new(AtomicU8::new(0)),
         },
     );
@@ -2624,7 +2622,6 @@ fn install_runner(state: &Arc<crate::AppState>, sid: &str) -> Arc<AtomicBool> {
             follow_up_break: Arc::new(AtomicBool::new(false)),
             parent: None,
             abort: std::sync::Mutex::new(None),
-            awaiting_plan_followup: Arc::new(AtomicBool::new(false)),
             mid_stream_retries: Arc::new(AtomicU8::new(0)),
         },
     );
@@ -2916,6 +2913,347 @@ data: [DONE]\n\n"
         bodies.len(),
         1,
         "pre-response error must not trigger a mid-stream retry round",
+    );
+
+    state.runners.lock().unwrap().remove(&session.id);
+    std::env::remove_var("KILO_MID_STREAM_RETRY_MS");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Fix 1 regression: when iter 1 hits the reactive ContextWindow path
+/// (HTTP 400 with `context_length_exceeded`), the compaction summary
+/// rewrites the persisted history but the in-memory `base_messages`
+/// must also be refreshed via `real_messages` so the retry sends the
+/// post-compaction transcript. Before the fix `base_messages` was
+/// bound once at turn entry and only the proactive arm re-bound it;
+/// the reactive arm fell back to the same overflowing transcript on
+/// each retry until `MAX_COMPACTION_ATTEMPTS` exhausted and the turn
+/// died with `CompactionError::EmptyResult`.
+#[tokio::test]
+async fn reactive_compaction_refreshes_base_messages_so_next_iteration_succeeds() {
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    std::fs::create_dir_all(root.join("config").join("kilo")).unwrap();
+    let server = stream_provider_overflow_then_ok(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"post compact ok\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":2,\"total_tokens\":4}}}\n\n\
+data: [DONE]\n\n",
+    )
+    .await;
+    state
+        .store
+        .set_provider_auth("openai", oauth_auth())
+        .unwrap();
+    write_openai_config(&root, &server.url);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+
+    let out = prompt_turn(
+        &state,
+        &session.id,
+        PromptInput {
+            parts: vec![json!({ "type": "text", "text": "say short hi" })],
+            model: Some(json!({ "providerID": "openai", "modelID": "gpt-5.1-codex" })),
+            ..Default::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .expect("prompt turn must succeed via reactive compaction + retry");
+
+    // Final assistant carries the post-compaction continuation text.
+    assert_eq!(out.info["finish"], "stop");
+    let text_part = out
+        .parts
+        .iter()
+        .find(|p| p["type"] == "text")
+        .expect("text part");
+    assert_eq!(text_part["text"], "post compact ok");
+
+    // Summary anchor was written by the compaction.
+    let messages = state.store.messages(&session.id, None, None).unwrap();
+    let summary_msg = messages
+        .items
+        .iter()
+        .find(|m| m.info.get("summary").and_then(|v| v.as_bool()) == Some(true))
+        .expect("summary anchor must exist");
+    assert_eq!(summary_msg.info["role"], "assistant");
+
+    // The retry request body must reflect the compacted view —
+    // specifically, the summary anchor's `[Compacted context summary
+    // — earlier history was elided` primer (rewritten to user role by
+    // `real_messages`), proving `base_messages` was rebuilt rather
+    // than the original transcript being resent.
+    let bodies = server.body.lock().unwrap().clone();
+    assert!(
+        bodies.contains("Compacted context summary"),
+        "retry body missing post-compaction primer (proves base_messages was NOT rebuilt): {bodies}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Two-connection mock that splits the response into two chunks
+/// separated by a delay so the spawned tool task has time to
+/// complete before the stream's `error` event lands. Connection 1
+/// streams the tool call (done) then sleeps `delay_ms`, then emits
+/// the error and `[DONE]`. Connection 2 returns the continuation.
+/// Chunked transfer encoding bypasses content-length buffering so
+/// the client sees frames incrementally.
+async fn stream_tool_complete_then_error_then_ok(
+    delay_ms: u64,
+    cont: &'static str,
+) -> super::common::TestStreamProvider {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let copy = bodies.clone();
+    tokio::spawn(async move {
+        // Connection 1: tool call frames, then sleep, then error.
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0; 65536];
+        let size = socket.read(&mut buf).await.unwrap();
+        copy.lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(&buf[..size]).to_string());
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n";
+        let _ = socket.write_all(head.as_bytes()).await;
+        let tool_frames = "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"call_id\":\"call_read\",\"name\":\"read\",\"delta\":\"{\\\"filePath\\\":\"}\n\n\
+data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"\\\"repo/note.txt\\\"}\"}\n\n\
+data: {\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"call_id\":\"call_read\",\"name\":\"read\"}\n\n";
+        let chunk = format!("{:x}\r\n{}\r\n", tool_frames.len(), tool_frames);
+        let _ = socket.write_all(chunk.as_bytes()).await;
+        // Sleep long enough that the spawned `read` tool task
+        // completes on the test runtime before the error event
+        // lands. 200ms is generous for a file read of ~20 bytes.
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        let err_frames = "data: {\"type\":\"error\",\"error\":{\"message\":\"connection reset mid stream\"}}\n\n\
+data: [DONE]\n\n";
+        let chunk = format!("{:x}\r\n{}\r\n", err_frames.len(), err_frames);
+        let _ = socket.write_all(chunk.as_bytes()).await;
+        let _ = socket.write_all(b"0\r\n\r\n").await;
+        // Connection 2: clean continuation.
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0; 65536];
+        let size = socket.read(&mut buf).await.unwrap();
+        copy.lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(&buf[..size]).to_string());
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            cont.len()
+        );
+        let _ = socket.write_all(head.as_bytes()).await;
+        let _ = socket.write_all(cont.as_bytes()).await;
+    });
+    super::common::TestStreamProvider {
+        url: format!("http://{addr}"),
+        bodies,
+    }
+}
+
+/// Fix 2: mid-stream retry must drain the JoinSet to harvest tools
+/// that completed before the error fired, and replay their
+/// `function_call` + `function_call_output` items in the next
+/// request's `input[]`. Without that, the model re-issues the same
+/// tool call and side-effecting tools (bash/edit/write) run twice.
+#[tokio::test]
+async fn mid_stream_retry_replays_completed_tools_in_next_request_input() {
+    std::env::set_var("KILO_MID_STREAM_RETRY_MS", "10");
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    // Seed a target file so `read` has something to return; the
+    // tool's side-effect window for "ran once vs twice" is the
+    // persisted tool part — exactly one settled part with the
+    // original call_id must exist on the assistant record after the
+    // retry round completes.
+    std::fs::create_dir_all(root.join("repo").join("repo")).unwrap();
+    std::fs::write(
+        root.join("repo").join("repo").join("note.txt"),
+        "side effect payload",
+    )
+    .unwrap();
+    let server = stream_tool_complete_then_error_then_ok(
+        200,
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"all done\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n\
+data: [DONE]\n\n",
+    )
+    .await;
+    state
+        .store
+        .set_provider_auth("openai", oauth_auth())
+        .unwrap();
+    write_openai_config(&root, &server.url);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+    let cancel = install_runner(&state, &session.id);
+
+    let out = prompt_turn(
+        &state,
+        &session.id,
+        PromptInput {
+            parts: vec![json!({ "type": "text", "text": "read the note" })],
+            model: Some(json!({
+                "providerID": "openai",
+                "modelID": "gpt-5.1-codex",
+                "capabilities": { "toolcall": true }
+            })),
+            tools: Some(json!(true)),
+            ..Default::default()
+        },
+        cancel,
+    )
+    .await
+    .expect("prompt turn must succeed via mid-stream retry");
+
+    // The retry request body must carry the completed tool's
+    // function_call + function_call_output. With the bug those are
+    // absent (only a synthetic assistant text appeared) and the
+    // model would re-issue `read` → side-effect runs twice.
+    let bodies = server.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2, "expected exactly two upstream requests");
+    let retry_body = &bodies[1];
+    assert!(
+        retry_body.contains("\"type\":\"function_call\""),
+        "retry body missing function_call for completed tool: {retry_body}"
+    );
+    assert!(
+        retry_body.contains("\"call_id\":\"call_read\""),
+        "retry body missing call_id for completed tool: {retry_body}"
+    );
+    assert!(
+        retry_body.contains("\"type\":\"function_call_output\""),
+        "retry body missing function_call_output: {retry_body}"
+    );
+    assert!(
+        retry_body.contains("side effect payload"),
+        "retry body missing tool output payload: {retry_body}"
+    );
+
+    // The tool must appear EXACTLY ONCE on the persisted assistant
+    // record. The harvested completed task gets persisted by the
+    // retry path; with the bug a SECOND fresh task would also fire
+    // (driven by the re-issued tool call) and the store would carry
+    // two tool parts with the same callID. Count tool parts on the
+    // final assistant message — there must be exactly one with
+    // `callID == call_read`.
+    let tool_part_count = out
+        .parts
+        .iter()
+        .filter(|p| p.get("type").and_then(|v| v.as_str()) == Some("tool"))
+        .filter(|p| p.get("callID").and_then(|v| v.as_str()) == Some("call_read"))
+        .count();
+    assert_eq!(
+        tool_part_count, 1,
+        "completed tool must run exactly once across retry; assistant parts: {:?}",
+        out.parts
+    );
+
+    state.runners.lock().unwrap().remove(&session.id);
+    std::env::remove_var("KILO_MID_STREAM_RETRY_MS");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Fix 3: a SECOND mid-stream retry within the same iteration must
+/// only splice the iter_text DELTA produced since the previous
+/// retry's snapshot — not the entire accumulated buffer. Otherwise
+/// retry #2's request body double-bills retry #1's prefix.
+#[tokio::test]
+async fn mid_stream_retry_does_not_double_push_partial_content() {
+    std::env::set_var("KILO_MID_STREAM_RETRY_MS", "10");
+    let root = unique_root();
+    let state = state_at(&root);
+    seed(&state.store);
+    std::fs::create_dir_all(root.join("repo")).unwrap();
+    let server = stream_provider_sequence(vec![
+        // Stream 1: produces "AAA" then errors.
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"AAA\"}\n\n\
+data: {\"type\":\"error\",\"error\":{\"message\":\"first cut\"}}\n\n\
+data: [DONE]\n\n"
+            .to_string(),
+        // Stream 2: produces "BBB" then errors again.
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"BBB\"}\n\n\
+data: {\"type\":\"error\",\"error\":{\"message\":\"second cut\"}}\n\n\
+data: [DONE]\n\n"
+            .to_string(),
+        // Stream 3: completes cleanly.
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"CCC\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n\
+data: [DONE]\n\n"
+            .to_string(),
+    ])
+    .await;
+    state
+        .store
+        .set_provider_auth("openai", oauth_auth())
+        .unwrap();
+    write_openai_config(&root, &server.url);
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .unwrap();
+    let cancel = install_runner(&state, &session.id);
+
+    let _ = prompt_turn(
+        &state,
+        &session.id,
+        PromptInput {
+            parts: vec![json!({ "type": "text", "text": "go" })],
+            model: Some(json!({ "providerID": "openai", "modelID": "gpt-5.1-codex" })),
+            ..Default::default()
+        },
+        cancel,
+    )
+    .await
+    .expect("prompt turn");
+
+    let bodies = server.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 3, "expected initial + 2 retries");
+    // Retry #1 splices "AAA" (the prefix from stream 1).
+    let retry1 = &bodies[1];
+    assert!(
+        retry1.contains("AAA"),
+        "retry #1 body missing AAA: {retry1}"
+    );
+    assert!(
+        !retry1.contains("BBB"),
+        "retry #1 body must not contain BBB yet: {retry1}"
+    );
+    // Retry #2 must contain "AAA" (the first splice still sits in
+    // iter_messages) and "BBB" (the new delta from stream 2). The
+    // bug fix guarantees "AAA" appears at most ONCE in the splice:
+    // one synthetic assistant message carries it from retry #1, the
+    // retry #2 splice adds only "BBB". Pre-fix, retry #2 would re-
+    // push "AAA" + "BBB" combined as a single assistant block on
+    // top of the existing splice → two copies of AAA in the body.
+    let retry2 = &bodies[2];
+    assert!(
+        retry2.contains("AAA"),
+        "retry #2 body missing AAA: {retry2}"
+    );
+    assert!(
+        retry2.contains("BBB"),
+        "retry #2 body missing BBB: {retry2}"
+    );
+    // The critical assertion — AAA appears at most once on retry #2.
+    // (We allow exactly one because the model may echo the user
+    // prompt or other content; the synthetic assistant splice in
+    // input[] is the only legitimate carrier for AAA.)
+    let aaa_count = retry2.matches("AAA").count();
+    assert_eq!(
+        aaa_count, 1,
+        "retry #2 must not double-push partial content; AAA appears {aaa_count} times: {retry2}"
     );
 
     state.runners.lock().unwrap().remove(&session.id);

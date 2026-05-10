@@ -239,7 +239,7 @@ impl Store {
                 data text not null
             );
             create table event_sequence (
-                aggregate_id text not null primary key,
+                aggregate_id text not null primary key references session(id) on delete cascade,
                 seq integer not null
             );
             create table event (
@@ -301,7 +301,11 @@ impl Store {
             .unwrap_or_else(|| self.paths.config.join(config_priority()[0]));
         let body = serde_json::to_string_pretty(&value)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-        fs::write(&target, body)?;
+        // Atomic temp + rename + `.bak`. A crash mid-write must not leave
+        // `kilo.json` truncated — `read_config` would treat the partial
+        // file as malformed JSON and silently fall back to defaults,
+        // wiping the user's settings.
+        write_replace(&target, body.as_bytes())?;
         Ok(read_config(&self.paths.config))
     }
 
@@ -755,16 +759,22 @@ impl Store {
             ensure_table(&tx, "session")?;
             let session = read_session(&tx, id);
             let mut event = None;
-            if session.is_some() {
+            if let Some(session_ref) = &session {
+                // Write the `session.deleted.v1` event BEFORE deleting the
+                // session row. Post-v3 `event_sequence.aggregate_id` has a
+                // FK on `session(id)` with `on delete cascade`, so the
+                // session delete cascades through `event_sequence` and
+                // `event`. The just-written row is dropped by the cascade
+                // — fine, because the in-memory `event` we return here is
+                // what feeds SSE; nothing reads the deletion event back
+                // from disk.
+                event = Some(write_event(
+                    &tx,
+                    id,
+                    "session.deleted.v1",
+                    json!({ "sessionID": id, "info": session_ref }),
+                )?);
                 tx.execute("delete from session where id = ?1", [id])?;
-                if let Some(session) = &session {
-                    event = Some(write_event(
-                        &tx,
-                        id,
-                        "session.deleted.v1",
-                        json!({ "sessionID": id, "info": session }),
-                    )?);
-                }
             }
             tx.commit()?;
             Ok(DeleteRecord { session, event })
@@ -1371,6 +1381,23 @@ impl Store {
                     | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             ) {
                 Ok(conn) => {
+                    // Match the writer's pragma block where it applies to
+                    // a read-only connection. Default `busy_timeout = 0`
+                    // returns `SQLITE_BUSY` immediately on contention,
+                    // which surfaces as an empty sidebar whenever the
+                    // writer is checkpointing. `cache_size = -64000` keeps
+                    // the 64 MiB page cache parity. WAL mode is a DB-level
+                    // attribute set by the writer, so a read-only opener
+                    // does not need to (and cannot) set `journal_mode`.
+                    if let Err(err) = conn
+                        .execute_batch("pragma busy_timeout = 5000; pragma cache_size = -64000;")
+                    {
+                        eprintln!(
+                            "[kilo-store] with_db: failed to stamp pragmas on {path}: {err}",
+                            path = path.display(),
+                        );
+                        return None;
+                    }
                     *guard = Some(conn);
                 }
                 Err(err) => {
@@ -1503,7 +1530,7 @@ fn init_schema(db: &Connection) -> rusqlite::Result<()> {
             data text not null
         );
         create table if not exists event_sequence (
-            aggregate_id text not null primary key,
+            aggregate_id text not null primary key references session(id) on delete cascade,
             seq integer not null
         );
         create table if not exists event (
@@ -1686,7 +1713,14 @@ fn write_replace(path: &Path, body: &[u8]) -> std::io::Result<()> {
     if path.exists() {
         let _ = fs::copy(path, &bak);
         chmod_secret(&bak);
-        fs::remove_file(path)?;
+        // Audit Fix 4: do NOT `fs::remove_file(path)` before the rename.
+        // Modern `fs::rename` on Windows uses `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`
+        // and on POSIX uses `rename(2)`, both of which atomically replace
+        // an existing destination. The previous unlink-then-rename opened
+        // a window where a crash left no `path` and the only valid copy
+        // was `.bak` — `read_replace` callers without a `.bak` fallback
+        // would see empty state. The `.bak` is still copied above so the
+        // recovery point is preserved.
     }
     match fs::rename(&temp, path) {
         Ok(()) => {
@@ -1744,17 +1778,19 @@ fn write_permission_rules(dir: &PathBuf, rules: &[JsonValue]) -> std::io::Result
     let path = dir.join("permissions.json");
     let body = serde_json::to_string_pretty(rules)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    fs::write(path, body)
+    // Atomic temp + rename + `.bak` — a crash mid-write must not leave a
+    // truncated or empty `permissions.json` (which `read_permission_rules`
+    // would silently treat as "no rules" and re-prompt the user).
+    write_replace(&path, body.as_bytes())
 }
 
 fn write_mcp_auths(dir: &PathBuf, data: &BTreeMap<String, JsonValue>) -> std::io::Result<()> {
     let path = dir.join("mcp-auth.json");
     let body = serde_json::to_string_pretty(data)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    fs::write(&path, body)?;
-    // Match `auth.json`: secret blob, force `0o600` on POSIX. No-op on Windows.
-    chmod_secret(&path);
-    Ok(())
+    // Atomic temp + rename + `.bak`. `write_replace` also chmods 0o600
+    // on POSIX, matching the secret-blob hardening on `auth.json`.
+    write_replace(&path, body.as_bytes())
 }
 
 const PROJECT_COLUMNS: &str = "id, worktree, vcs, name, time_created, time_updated, \
@@ -3661,7 +3697,7 @@ mod tests {
                 data text not null
             );
             create table event_sequence (
-                aggregate_id text not null primary key,
+                aggregate_id text not null primary key references session(id) on delete cascade,
                 seq integer not null
             );
             create table event (
@@ -4099,6 +4135,489 @@ mod tests {
         let on_disk = fs::read_to_string(store.paths.data.join("auth.json")).unwrap();
         let parsed: JsonValue = serde_json::from_str(&on_disk).unwrap();
         assert_eq!(parsed["kilo-cloud"], blob);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Audit Fix 1 (migration v3): deleting a session cascades through
+    /// `event_sequence` and `event`. Pre-v3 `event_sequence.aggregate_id`
+    /// had no FK back to `session(id)`, so deleting a session left
+    /// orphaned event rows that grew the DB forever. Drive the
+    /// production code path (no manual seed) so the
+    /// `init_schema` + `migrations::run` pair under test is the same one
+    /// the binary uses.
+    #[test]
+    fn event_sequence_cascade_deletes_with_session() {
+        let root = unique_root();
+        let store = store(&root);
+        set_event_writes_enabled(Some(true));
+
+        // Two sessions so we can assert deletion is targeted, not nuclear.
+        let keep = store
+            .create_session(SessionCreateInput {
+                title: Some("keep".into()),
+                ..Default::default()
+            })
+            .expect("create keep session");
+        let doomed = store
+            .create_session(SessionCreateInput {
+                title: Some("drop".into()),
+                ..Default::default()
+            })
+            .expect("create doomed session");
+
+        // Generate a few events on the doomed session so there's something
+        // for the cascade to remove.
+        store
+            .append_message(
+                &doomed.id,
+                MessageAppendInput {
+                    info: json!({ "id": "msg_drop_1", "role": "user" }),
+                    parts: vec![json!({ "id": "prt_drop_1", "type": "text", "text": "hi" })],
+                },
+            )
+            .expect("append message to doomed");
+        store
+            .append_message(
+                &doomed.id,
+                MessageAppendInput {
+                    info: json!({ "id": "msg_drop_2", "role": "assistant" }),
+                    parts: Vec::new(),
+                },
+            )
+            .expect("append second message");
+
+        // And one on the survivor to prove non-cascade isolation.
+        store
+            .append_message(
+                &keep.id,
+                MessageAppendInput {
+                    info: json!({ "id": "msg_keep", "role": "user" }),
+                    parts: vec![json!({ "id": "prt_keep", "type": "text", "text": "ok" })],
+                },
+            )
+            .expect("append message to keep");
+
+        // Pre-delete sanity: doomed session has event rows.
+        let drop_pre = store
+            .with_db(|db| {
+                let evt: i64 = db
+                    .query_row(
+                        "select count(*) from event where aggregate_id = ?1",
+                        [&doomed.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let seq: i64 = db
+                    .query_row(
+                        "select count(*) from event_sequence where aggregate_id = ?1",
+                        [&doomed.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                (evt, seq)
+            })
+            .expect("reader open");
+        assert!(
+            drop_pre.0 > 0,
+            "precondition: doomed session has event rows"
+        );
+        assert_eq!(drop_pre.1, 1, "precondition: doomed session has seq row");
+
+        // The cascade happens on the writer connection (foreign_keys=ON).
+        store
+            .delete_session_record(&doomed.id)
+            .expect("delete session");
+
+        // Re-query through the writer connection so we see the post-commit
+        // state (the cached reader is a separate connection that, under
+        // WAL, may need to be re-snapshotted; the writer always reads its
+        // own commits).
+        let post = store
+            .with_write(|db| {
+                let drop_evt: i64 = db
+                    .query_row(
+                        "select count(*) from event where aggregate_id = ?1",
+                        [&doomed.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let drop_seq: i64 = db
+                    .query_row(
+                        "select count(*) from event_sequence where aggregate_id = ?1",
+                        [&doomed.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let keep_evt: i64 = db
+                    .query_row(
+                        "select count(*) from event where aggregate_id = ?1",
+                        [&keep.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                Ok::<_, rusqlite::Error>((drop_evt, drop_seq, keep_evt))
+            })
+            .expect("writer query");
+
+        assert_eq!(
+            post.0, 0,
+            "event rows for deleted session must be cascade-deleted",
+        );
+        assert_eq!(
+            post.1, 0,
+            "event_sequence row for deleted session must be cascade-deleted",
+        );
+        assert!(
+            post.2 > 0,
+            "cascade must not touch other sessions' event rows",
+        );
+
+        set_event_writes_enabled(None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Audit Fix 1 supporting check: pre-v3 orphan rows on an upgraded DB
+    /// are cleaned by the migration's `delete ... not in (select id from
+    /// session)` step. Without this, the FK rebuild would refuse to copy
+    /// orphans into `event_sequence_new`.
+    #[test]
+    fn migration_v3_drops_pre_existing_orphans() {
+        let root = unique_root();
+        let data_dir = root.join("data").join("kilo");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("kilo.db");
+
+        // Hand-build a v2 database — pre-v3 schema, no FK on event_sequence.
+        // Insert an orphan event row whose session does not exist.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "pragma user_version = 2;
+                create table project (
+                    id text primary key,
+                    worktree text not null,
+                    vcs text,
+                    name text,
+                    icon_url text,
+                    icon_url_override text,
+                    icon_color text,
+                    time_created integer not null,
+                    time_updated integer not null,
+                    time_initialized integer,
+                    sandboxes text not null,
+                    commands text
+                );
+                create table session (
+                    id text primary key,
+                    project_id text not null references project(id) on delete cascade,
+                    workspace_id text,
+                    parent_id text,
+                    slug text not null,
+                    directory text not null,
+                    title text not null,
+                    version text not null,
+                    share_url text,
+                    summary_additions integer,
+                    summary_deletions integer,
+                    summary_files integer,
+                    summary_diffs text,
+                    revert text,
+                    permission text,
+                    time_created integer not null,
+                    time_updated integer not null,
+                    time_compacting integer,
+                    time_archived integer
+                );
+                create table message (
+                    id text primary key,
+                    session_id text not null references session(id) on delete cascade,
+                    time_created integer not null,
+                    time_updated integer not null,
+                    data text not null
+                );
+                create table part (
+                    id text primary key,
+                    message_id text not null references message(id) on delete cascade,
+                    session_id text not null,
+                    time_created integer not null,
+                    time_updated integer not null,
+                    data text not null
+                );
+                create table event_sequence (
+                    aggregate_id text not null primary key,
+                    seq integer not null
+                );
+                create table event (
+                    id text primary key,
+                    aggregate_id text not null references event_sequence(aggregate_id) on delete cascade,
+                    seq integer not null,
+                    type text not null,
+                    data text not null
+                );
+                create table todo (
+                    session_id text not null references session(id) on delete cascade,
+                    content text not null,
+                    status text not null,
+                    priority text not null,
+                    position integer not null,
+                    time_created integer not null,
+                    time_updated integer not null,
+                    primary key (session_id, position)
+                );",
+            )
+            .unwrap();
+
+            // Orphan: aggregate_id has no matching session row.
+            conn.execute(
+                "insert into event_sequence (aggregate_id, seq) values ('ses_orphan', 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "insert into event (id, aggregate_id, seq, type, data) values \
+                 ('evt_orphan', 'ses_orphan', 0, 'session.deleted.v1', '{}')",
+                [],
+            )
+            .unwrap();
+            let v: i64 = conn
+                .query_row("pragma user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(v, 2);
+        }
+
+        // Open via the production path — triggers the migration runner.
+        let store = store(&root);
+        store
+            .create_session(SessionCreateInput::default())
+            .expect("first write triggers migration");
+
+        let db = Connection::open(&db_path).unwrap();
+        let v: i64 = db
+            .query_row("pragma user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(v, 3, "migration must advance user_version to 3");
+
+        let orphan_seq: i64 = db
+            .query_row(
+                "select count(*) from event_sequence where aggregate_id = 'ses_orphan'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let orphan_evt: i64 = db
+            .query_row(
+                "select count(*) from event where aggregate_id = 'ses_orphan'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_seq, 0, "v3 must drop orphan event_sequence rows");
+        assert_eq!(orphan_evt, 0, "v3 must drop orphan event rows");
+
+        // Schema parity: new event_sequence carries the FK on session(id).
+        let fk_count: i64 = db
+            .query_row(
+                "select count(*) from pragma_foreign_key_list('event_sequence') \
+                 where \"table\" = 'session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fk_count, 1, "event_sequence must have FK on session(id)");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Audit Fix 2: `permissions.json` writes are atomic — temp + rename
+    /// with a `.bak` recovery point. Verify the temp file does not linger
+    /// after a successful write and that the `.bak` appears after the
+    /// second write.
+    #[test]
+    fn permissions_json_write_is_atomic() {
+        let root = unique_root();
+        let store = store(&root);
+
+        store
+            .append_permission_rules(&[json!({ "pattern": "read", "action": "ask" })])
+            .expect("first permission write");
+
+        let dir = store.paths.data.clone();
+        let path = dir.join("permissions.json");
+        assert!(path.exists(), "permissions.json must exist after write");
+
+        // No leftover tmp files in the data dir.
+        let lingering_tmp: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("permissions.json.tmp")
+            })
+            .collect();
+        assert!(
+            lingering_tmp.is_empty(),
+            "temp files must be cleaned by rename: {:?}",
+            lingering_tmp
+                .iter()
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>(),
+        );
+
+        // Second write triggers the `.bak` copy of the previous file.
+        store
+            .append_permission_rules(&[json!({ "pattern": "write", "action": "deny" })])
+            .expect("second permission write");
+        let bak = dir.join("permissions.json.bak");
+        assert!(
+            bak.exists(),
+            "permissions.json.bak must be written before the rename",
+        );
+
+        // Reads round-trip both rules.
+        let rules = store.permission_rules();
+        assert_eq!(rules.len(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Audit Fix 2 (mcp-auth): same atomic write path.
+    #[test]
+    fn mcp_auth_json_write_is_atomic() {
+        let root = unique_root();
+        let store = store(&root);
+
+        store
+            .set_mcp_auth("github", json!({ "type": "oauth", "access": "a" }))
+            .expect("first mcp write");
+        let dir = store.paths.data.clone();
+        let path = dir.join("mcp-auth.json");
+        assert!(path.exists());
+
+        store
+            .set_mcp_auth("gitlab", json!({ "type": "oauth", "access": "b" }))
+            .expect("second mcp write");
+        let bak = dir.join("mcp-auth.json.bak");
+        assert!(bak.exists(), "mcp-auth.json.bak must be written");
+
+        let lingering_tmp: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("mcp-auth.json.tmp")
+            })
+            .collect();
+        assert!(
+            lingering_tmp.is_empty(),
+            "temp files must be cleaned by rename"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Audit Fix 2 (config): `set_config` routes through `write_replace`
+    /// so a crash mid-write cannot truncate `kilo.json` and silently wipe
+    /// the user's settings on next read.
+    #[test]
+    fn set_config_write_is_atomic() {
+        let root = unique_root();
+        let store = store(&root);
+        let mut cfg = Config {
+            data: BTreeMap::new(),
+        };
+        cfg.data
+            .insert("model".to_string(), json!("claude-opus-4-7"));
+        store.set_config(cfg.clone()).expect("first config write");
+
+        let dir = store.paths.config.clone();
+        let path = dir.join("kilo.json");
+        assert!(path.exists(), "kilo.json must exist after write");
+
+        // Second write triggers the .bak copy.
+        cfg.data.insert("model".to_string(), json!("claude-sonnet"));
+        store.set_config(cfg).expect("second config write");
+        let bak = dir.join("kilo.json.bak");
+        assert!(bak.exists(), "kilo.json.bak must be written");
+
+        let lingering_tmp: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("kilo.json.tmp")
+            })
+            .collect();
+        assert!(lingering_tmp.is_empty(), "temp files must be cleaned");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Audit Fix 3: reader connection stamps `busy_timeout = 5000` (and
+    /// `cache_size = -64000`) so reads don't immediately return
+    /// `SQLITE_BUSY` while the writer is checkpointing.
+    #[test]
+    fn reader_busy_timeout_set() {
+        let root = unique_root();
+        let store = store(&root);
+        seed(&store);
+        // First write so the DB file exists and `with_db` opens the reader.
+        store
+            .create_session(SessionCreateInput::default())
+            .expect("create session");
+
+        let timeout: i64 = store
+            .with_db(|conn| {
+                conn.query_row("pragma busy_timeout", [], |row| row.get(0))
+                    .unwrap_or(-1)
+            })
+            .expect("with_db ran");
+        assert_eq!(timeout, 5000, "reader busy_timeout must be 5000");
+
+        let cache: i64 = store
+            .with_db(|conn| {
+                conn.query_row("pragma cache_size", [], |row| row.get(0))
+                    .unwrap_or(0)
+            })
+            .expect("with_db ran");
+        assert_eq!(cache, -64_000, "reader cache_size must be -64000");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Audit Fix 4: `write_replace` no longer pre-removes `path` before
+    /// `fs::rename`. Verify auth.json round-trips through multiple
+    /// rewrites and that the `.bak` recovery point is still produced.
+    #[test]
+    fn write_replace_round_trips_without_pre_remove() {
+        let root = unique_root();
+        let store = store(&root);
+
+        store
+            .set_provider_auth("openai", json!({ "type": "api", "key": "k1" }))
+            .expect("first write");
+        let auth = store.paths.data.join("auth.json");
+        assert!(auth.exists());
+
+        store
+            .set_provider_auth("openai", json!({ "type": "api", "key": "k2" }))
+            .expect("second write");
+        let bak = store.paths.data.join("auth.json.bak");
+        assert!(bak.exists(), "second write must produce auth.json.bak");
+        assert!(auth.exists(), "auth.json must remain after rename");
+
+        // Read-back uses the new value, .bak holds the old.
+        let current = store.provider_auth("openai").unwrap();
+        assert_eq!(current["key"], "k2");
+        let bak_text = fs::read_to_string(&bak).unwrap();
+        let bak_json: JsonValue = serde_json::from_str(&bak_text).unwrap();
+        assert_eq!(bak_json["openai"]["key"], "k1");
 
         let _ = fs::remove_dir_all(root);
     }

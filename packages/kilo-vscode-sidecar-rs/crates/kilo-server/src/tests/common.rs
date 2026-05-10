@@ -131,6 +131,7 @@ pub(super) fn state_at_with(
         session_hard_rules: Mutex::default(),
         broken_turn_anchors: Mutex::default(),
         oauth_pending: Mutex::default(),
+        oauth_refresh: tokio::sync::Mutex::new(()),
         oauth_listener: Mutex::default(),
         oauth_listener_addr: addr,
         oauth_token_endpoint: endpoint,
@@ -866,6 +867,58 @@ input.on("data", (chunk) => {
   }
 })
 setTimeout(() => send({ jsonrpc: "2.0", method: "notifications/tools/list_changed", params: {} }), 50)
+setInterval(() => {}, 1000)
+"#;
+
+/// Fix 1 fixture: an MCP server that emits a fake stale-id response
+/// BEFORE the real tools/call response. With the monotonic id allocator,
+/// the client's wait loop must discard the stale id-bearing message and
+/// pick up the correct response. With the old fixed `MCP_CALL_ID = 3`
+/// every call would have collided on id=3 so the stale frame would
+/// short-circuit the loop and return a wrong body.
+pub(super) const MCP_STALE_RESPONSE_SERVER_JS: &str = r#"
+const input = process.stdin
+let buffer = Buffer.alloc(0)
+function send(value) {
+  const body = Buffer.from(JSON.stringify(value))
+  process.stdout.write(`Content-Length: ${body.length}\r\n\r\n`)
+  process.stdout.write(body)
+}
+function receive(value) {
+  if (value.method === "initialize") {
+    send({ jsonrpc: "2.0", id: value.id, result: { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "stale", version: "1" } } })
+    return
+  }
+  if (value.method === "tools/list") {
+    send({ jsonrpc: "2.0", id: value.id, result: { tools: [{ name: "echo", description: "Echo input", inputSchema: { type: "object", properties: {} } }] } })
+    return
+  }
+  if (value.method === "tools/call") {
+    // Stale-id frame first: an id from a hypothetical earlier request that
+    // timed out. The client's wait loop sees the wrong id and must drop it.
+    send({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "STALE" }] } })
+    // Real response uses the actual request id and must win.
+    send({ jsonrpc: "2.0", id: value.id, result: { content: [{ type: "text", text: value.params?.arguments?.text ?? "OK" }] } })
+    return
+  }
+  send({ jsonrpc: "2.0", id: value.id, error: { code: -32601, message: "not found" } })
+}
+input.on("data", (chunk) => {
+  buffer = Buffer.concat([buffer, chunk])
+  while (true) {
+    const header = buffer.indexOf("\r\n\r\n")
+    if (header < 0) return
+    const text = buffer.slice(0, header).toString("utf8")
+    const match = /content-length:\s*(\d+)/i.exec(text)
+    if (!match) process.exit(2)
+    const length = Number(match[1])
+    const start = header + 4
+    if (buffer.length < start + length) return
+    const body = buffer.slice(start, start + length).toString("utf8")
+    buffer = buffer.slice(start + length)
+    receive(JSON.parse(body))
+  }
+})
 setInterval(() => {}, 1000)
 "#;
 

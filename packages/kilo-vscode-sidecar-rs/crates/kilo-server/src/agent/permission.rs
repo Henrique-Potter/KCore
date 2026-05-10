@@ -411,32 +411,209 @@ pub(crate) fn is_protected_request(
     patterns: &[String],
     metadata: &Value,
 ) -> bool {
-    if permission != "edit" {
-        return false;
-    }
     let paths = state.store.paths();
-    for pattern in patterns {
-        if config_paths::is_protected(pattern, &paths) {
-            return true;
-        }
-    }
-    if let Some(fp) = metadata.get("filePath").and_then(Value::as_str) {
-        if config_paths::is_protected(fp, &paths) {
-            return true;
-        }
-    }
-    if let Some(files) = metadata.get("files").and_then(Value::as_array) {
-        for file in files {
-            for key in ["filePath", "movePath"] {
-                if let Some(value) = file.get(key).and_then(Value::as_str) {
-                    if config_paths::is_protected(value, &paths) {
-                        return true;
+    match permission {
+        "edit" => {
+            for pattern in patterns {
+                if config_paths::is_protected(pattern, &paths) {
+                    return true;
+                }
+            }
+            if let Some(fp) = metadata.get("filePath").and_then(Value::as_str) {
+                if config_paths::is_protected(fp, &paths) {
+                    return true;
+                }
+            }
+            if let Some(files) = metadata.get("files").and_then(Value::as_array) {
+                for file in files {
+                    for key in ["filePath", "movePath"] {
+                        if let Some(value) = file.get(key).and_then(Value::as_str) {
+                            if config_paths::is_protected(value, &paths) {
+                                return true;
+                            }
+                        }
                     }
                 }
             }
+            false
         }
+        "bash" => {
+            // Bash bypass: a model can clobber config files via shell
+            // redirection (`> .kilo/x.json`) or mutating utilities
+            // (`rm`, `mv`, `cp`, `chmod`, ...). The edit permission gate
+            // never sees these because the tool key is "bash". Inspect
+            // the command string for each protected-file candidate and
+            // downgrade `always → once` if any of them is in scope.
+            let cmd = metadata
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if cmd.is_empty() {
+                return false;
+            }
+            for target in bash_protected_targets(cmd) {
+                if config_paths::is_protected(&target, &paths) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
     }
-    false
+}
+
+/// Extract filesystem targets from a bash command string that, if written
+/// to, would mutate a file: shell redirections (`>`, `>>`, `2>`, `&>`,
+/// `>|`) and the arguments of mutating utilities (`rm`, `mv`, `cp`,
+/// `chmod`, `chown`, `touch`, `ln`, `dd`, `tee`, `install`).
+///
+/// Hand-rolled token scanner — no regex / no AST parse — because we
+/// cannot add a new dep in this wave AND
+/// `agent::tools::common::bash_command_patterns` is owned by another
+/// agent. This is intentionally over-broad: a false positive only
+/// downgrades `always → once`, never blocks; a false negative would let
+/// bash bypass config protection (the bug we're fixing).
+pub(crate) fn bash_protected_targets(command: &str) -> Vec<String> {
+    let tokens = bash_tokens(command);
+    let mut out: Vec<String> = Vec::new();
+    let mutating_verbs: &[&str] = &[
+        "rm", "mv", "cp", "chmod", "chown", "touch", "ln", "dd", "tee", "install",
+    ];
+    let mut i = 0usize;
+    let mut at_command_start = true;
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        if matches!(tok.as_str(), "|" | "||" | "&" | "&&" | ";" | "(" | ")") {
+            at_command_start = true;
+            i += 1;
+            continue;
+        }
+        if is_redirect_op(tok) {
+            if let Some(target) = tokens.get(i + 1) {
+                if !target.is_empty() && !is_redirect_op(target) {
+                    out.push(target.clone());
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if at_command_start && mutating_verbs.contains(&tok.as_str()) {
+            let mut j = i + 1;
+            while j < tokens.len() {
+                let arg = &tokens[j];
+                if matches!(arg.as_str(), "|" | "||" | "&" | "&&" | ";" | "(" | ")")
+                    || is_redirect_op(arg)
+                {
+                    break;
+                }
+                if !arg.starts_with('-') && !arg.is_empty() {
+                    out.push(arg.clone());
+                }
+                j += 1;
+            }
+            i = j;
+            at_command_start = false;
+            continue;
+        }
+        at_command_start = false;
+        i += 1;
+    }
+    out
+}
+
+fn is_redirect_op(tok: &str) -> bool {
+    matches!(
+        tok,
+        ">" | ">>" | ">|" | "&>" | "&>>" | "2>" | "2>>" | "1>" | "1>>" | "<>"
+    )
+}
+
+/// Minimal bash lexer for the protection scanner. Splits on whitespace,
+/// extracts redirection operators as standalone tokens, and respects
+/// single/double quoting so paths with spaces survive. Not a full bash
+/// parser — we only need enough fidelity to spot config-path targets.
+fn bash_tokens(input: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    let flush = |buf: &mut String, out: &mut Vec<String>| {
+        if !buf.is_empty() {
+            out.push(std::mem::take(buf));
+        }
+    };
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == '"' || c == '\'' {
+            flush(&mut buf, &mut out);
+            let quote = c;
+            i += 1;
+            let mut inner = String::new();
+            while i < bytes.len() && bytes[i] as char != quote {
+                inner.push(bytes[i] as char);
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+            out.push(inner);
+            continue;
+        }
+        if c.is_whitespace() {
+            flush(&mut buf, &mut out);
+            i += 1;
+            continue;
+        }
+        let rest = &input[i..];
+        let op = if rest.starts_with("&>>") {
+            Some("&>>")
+        } else if rest.starts_with("&>") {
+            Some("&>")
+        } else if rest.starts_with("2>>") {
+            Some("2>>")
+        } else if rest.starts_with("1>>") {
+            Some("1>>")
+        } else if rest.starts_with("2>") {
+            Some("2>")
+        } else if rest.starts_with("1>") {
+            Some("1>")
+        } else if rest.starts_with(">>") {
+            Some(">>")
+        } else if rest.starts_with(">|") {
+            Some(">|")
+        } else if rest.starts_with("<>") {
+            Some("<>")
+        } else if rest.starts_with('>') {
+            Some(">")
+        } else {
+            None
+        };
+        if let Some(op) = op {
+            flush(&mut buf, &mut out);
+            out.push(op.to_string());
+            i += op.len();
+            continue;
+        }
+        let sep = if rest.starts_with("||") {
+            Some("||")
+        } else if rest.starts_with("&&") {
+            Some("&&")
+        } else if c == '|' || c == ';' || c == '&' || c == '(' || c == ')' {
+            Some(&rest[..1])
+        } else {
+            None
+        };
+        if let Some(sep) = sep {
+            flush(&mut buf, &mut out);
+            out.push(sep.to_string());
+            i += sep.len();
+            continue;
+        }
+        buf.push(c);
+        i += 1;
+    }
+    flush(&mut buf, &mut out);
+    out
 }
 
 /// `is_protected_request` overload that consumes a pending entry's `info`
@@ -725,14 +902,70 @@ pub(crate) mod config_paths {
 
     /// Absolute-path protection check. Mirrors Bun's
     /// `ConfigProtection.isAbsolute`.
+    ///
+    /// Symlink defense: `std::fs::canonicalize` resolves the path and
+    /// follows every symlink before the prefix comparison. A symlink like
+    /// `worktree/foo -> .kilo` would otherwise let the lexical prefix
+    /// check pass `foo/x.json` as non-config, then write into the real
+    /// config dir. If canonicalization fails (path doesn't exist yet —
+    /// e.g. write-to-create), we fall back to the lexical check; the
+    /// parent directory is canonicalized when possible so symlinks on
+    /// intermediate directories are still resolved.
     pub(crate) fn is_absolute(filepath: &str, paths: &KiloPath) -> bool {
         let target = PathBuf::from(filepath);
-        for dir in config_dirs(paths) {
-            if within(&target, &dir) {
+        let canonical = canonicalize_with_parent(&target);
+        let dirs: Vec<PathBuf> = config_dirs(paths)
+            .into_iter()
+            .map(|d| std::fs::canonicalize(&d).map(strip_unc).unwrap_or(d))
+            .collect();
+        for dir in &dirs {
+            if within(&canonical, dir) || within(&target, dir) {
                 return true;
             }
         }
         false
+    }
+
+    /// Best-effort canonicalization that survives non-existent leaves.
+    /// If the whole path resolves, return its canonical form. Otherwise
+    /// canonicalize the deepest ancestor that exists and re-attach the
+    /// remaining tail. A symlink anywhere along the existing prefix gets
+    /// resolved even when the file itself doesn't yet exist (the
+    /// write-to-create case).
+    fn canonicalize_with_parent(target: &FsPath) -> PathBuf {
+        if let Ok(p) = std::fs::canonicalize(target) {
+            return strip_unc(p);
+        }
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut cursor = target;
+        loop {
+            match cursor.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => {
+                    if let Some(name) = cursor.file_name() {
+                        tail.push(name.to_os_string());
+                    }
+                    if let Ok(canon) = std::fs::canonicalize(parent) {
+                        let mut out = strip_unc(canon);
+                        for piece in tail.iter().rev() {
+                            out.push(piece);
+                        }
+                        return out;
+                    }
+                    cursor = parent;
+                }
+                _ => return target.to_path_buf(),
+            }
+        }
+    }
+
+    /// Strip Windows `\\?\` extended-length prefix that `canonicalize`
+    /// adds — comparators downstream don't handle it.
+    fn strip_unc(p: PathBuf) -> PathBuf {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest.to_string());
+        }
+        p
     }
 
     /// Combined entry point. Picks `is_absolute` for absolute paths,
@@ -741,6 +974,16 @@ pub(crate) mod config_paths {
         let p = FsPath::new(value);
         if p.is_absolute() {
             return is_absolute(value, paths);
+        }
+        // Relative-path symlink defense: try to canonicalize against the
+        // current working dir. If the path crosses into a config dir
+        // through a symlink, treat as protected. Falls through to the
+        // lexical relative check otherwise.
+        if let Ok(canon) = std::fs::canonicalize(value) {
+            let canon = strip_unc(canon);
+            if is_absolute(&canon.to_string_lossy(), paths) {
+                return true;
+            }
         }
         is_relative(value)
     }
@@ -870,6 +1113,7 @@ mod tests {
             session_hard_rules: std::sync::Mutex::default(),
             broken_turn_anchors: std::sync::Mutex::default(),
             oauth_pending: std::sync::Mutex::default(),
+            oauth_refresh: tokio::sync::Mutex::new(()),
             oauth_listener: std::sync::Mutex::default(),
             oauth_listener_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
             oauth_token_endpoint: format!("{}/oauth/token", crate::oauth::OPENAI_ISSUER),
@@ -1016,6 +1260,102 @@ mod tests {
         let display = PermissionError::ExternalDirectoryDenied { paths }.to_display();
         assert!(display.contains(&outside_a), "{display}");
         assert!(display.contains(&outside_b), "{display}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ----------------------------------------------------------------
+    // Bash redirect / mutating-command target extraction.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn bash_protected_targets_extracts_redirections() {
+        let cases: &[(&str, &[&str])] = &[
+            ("echo foo > .kilo/x.json", &[".kilo/x.json"]),
+            ("echo foo >> .kilo/x.json", &[".kilo/x.json"]),
+            ("date 2> .kilo/log", &[".kilo/log"]),
+            ("cmd &> .kilo/out", &[".kilo/out"]),
+            ("cat foo >| .kilo/dest", &[".kilo/dest"]),
+        ];
+        for (cmd, want) in cases {
+            let got = bash_protected_targets(cmd);
+            for needle in *want {
+                assert!(got.contains(&needle.to_string()), "{cmd:?} -> {got:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bash_protected_targets_extracts_mutating_command_args() {
+        let cmd = "rm -rf .kilo/agents/x.json";
+        let got = bash_protected_targets(cmd);
+        assert!(got.iter().any(|s| s == ".kilo/agents/x.json"), "{got:?}");
+
+        let cmd = "mv kilo.json /tmp/elsewhere";
+        let got = bash_protected_targets(cmd);
+        assert!(got.iter().any(|s| s == "kilo.json"), "{got:?}");
+        assert!(got.iter().any(|s| s == "/tmp/elsewhere"), "{got:?}");
+    }
+
+    #[test]
+    fn bash_protected_targets_handles_quoted_targets() {
+        let cmd = r#"echo hi > ".kilo/space file.json""#;
+        let got = bash_protected_targets(cmd);
+        assert!(got.iter().any(|s| s == ".kilo/space file.json"), "{got:?}");
+    }
+
+    #[test]
+    fn bash_protected_targets_ignores_pure_reads() {
+        let got = bash_protected_targets("cat foo | grep bar");
+        assert!(got.is_empty(), "expected no targets: {got:?}");
+    }
+
+    // (Cross-module test covering `is_protected_request` with a real
+    // AppState lives in `tests/agent_mcp.rs::is_protected_request_*`
+    // because the `tests::common::state_at` helper is private to that
+    // module tree.)
+
+    // ----------------------------------------------------------------
+    // Symlink-aware config-path protection.
+    // ----------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn config_paths_is_absolute_resolves_symlinks() {
+        use kilo_protocol::KiloPath;
+        use std::os::unix::fs::symlink;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("kilo-symlink-prot-{stamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        // Real config dir.
+        let real = root.join("real_kilo");
+        std::fs::create_dir_all(&real).unwrap();
+        // Symlink `foo -> real_kilo`. Writes through `foo/x.json` should
+        // count as protected even though the lexical prefix does not
+        // start with `.kilo/`.
+        let link = root.join("foo");
+        symlink(&real, &link).unwrap();
+        let target = link.join("x.json");
+        let paths = KiloPath {
+            home: String::new(),
+            state: String::new(),
+            config: real.to_string_lossy().into_owned(),
+            worktree: String::new(),
+            directory: String::new(),
+        };
+        assert!(
+            config_paths::is_absolute(&target.to_string_lossy(), &paths),
+            "symlinked write into config dir must be flagged"
+        );
+        // Same canonicalize logic for a path that does not yet exist
+        // (write-to-create through a symlinked parent).
+        let new_target = link.join("new.json");
+        assert!(
+            config_paths::is_absolute(&new_target.to_string_lossy(), &paths),
+            "write-to-create via symlinked parent must be flagged"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

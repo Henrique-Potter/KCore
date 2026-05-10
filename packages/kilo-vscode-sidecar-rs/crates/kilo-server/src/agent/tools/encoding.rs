@@ -90,19 +90,28 @@ fn strip_leading_bom_char(text: &str) -> &str {
 }
 
 fn decode_utf16_le(bytes: &[u8]) -> String {
-    let units = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect::<Vec<_>>();
-    String::from_utf16_lossy(&units)
+    decode_utf16(bytes, u16::from_le_bytes)
 }
 
 fn decode_utf16_be(bytes: &[u8]) -> String {
+    decode_utf16(bytes, u16::from_be_bytes)
+}
+
+/// Decode an even-length UTF-16 byte stream. If `bytes.len()` is odd the
+/// trailing byte is malformed input — `chunks_exact(2)` would silently
+/// discard it. Instead we decode the even prefix, append U+FFFD for the
+/// dangling byte, and log a single warning so the truncation is visible.
+fn decode_utf16(bytes: &[u8], from_bytes: fn([u8; 2]) -> u16) -> String {
     let units = bytes
         .chunks_exact(2)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .map(|c| from_bytes([c[0], c[1]]))
         .collect::<Vec<_>>();
-    String::from_utf16_lossy(&units)
+    let mut out = String::from_utf16_lossy(&units);
+    if bytes.len() % 2 == 1 {
+        eprintln!("[kilo-server] truncated UTF-16 file: odd byte length");
+        out.push('\u{fffd}');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -177,6 +186,25 @@ mod tests {
         assert_eq!(enc, Encoding::Utf8);
         assert_eq!(text, "plain text");
         assert_eq!(write_bytes(&text, enc), original);
+    }
+
+    #[test]
+    fn encoding_odd_length_utf16_returns_replacement_char() {
+        // BOM + 'h' (0x68 0x00) + dangling odd byte (0x69). Decoder must
+        // return the leading 'h' followed by a U+FFFD replacement char,
+        // without panicking.
+        let bytes = [0xff, 0xfe, 0x68, 0x00, 0x69];
+        let (text, enc) = read_to_string(&bytes);
+        assert_eq!(enc, Encoding::Utf16Le);
+        assert!(text.starts_with('h'), "expected leading 'h': {text:?}");
+        assert!(text.contains('\u{fffd}'), "expected U+FFFD in {text:?}");
+
+        // Same check on BE path.
+        let bytes = [0xfe, 0xff, 0x00, 0x68, 0x69];
+        let (text, enc) = read_to_string(&bytes);
+        assert_eq!(enc, Encoding::Utf16Be);
+        assert!(text.starts_with('h'), "expected leading 'h': {text:?}");
+        assert!(text.contains('\u{fffd}'), "expected U+FFFD in {text:?}");
     }
 
     #[test]

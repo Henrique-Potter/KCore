@@ -29,15 +29,10 @@ use kilo_provider::ChatTool;
 use serde_json::{json, Value};
 
 use crate::routes::mcp::{
-    mcp_call_remote, mcp_config, mcp_post_remote, mcp_remote_request_headers, mcp_response_error,
-    mcp_wait_response_cancel, mcp_write_message, MCP_DEFAULT_TIMEOUT_MS,
+    mcp_alloc_id, mcp_call_remote, mcp_config, mcp_post_remote, mcp_remote_request_headers,
+    mcp_response_error, mcp_wait_response_cancel, mcp_write_message, MCP_DEFAULT_TIMEOUT_MS,
 };
 use crate::AppState;
-
-/// JSON-RPC id reserved for `resources/read` requests so the response
-/// pump can distinguish them from `tools/call` (which uses
-/// `MCP_CALL_ID = 3`) on the same shared child stdio.
-const MCP_RESOURCE_READ_ID: i64 = 7;
 
 /// Namespaced view of an MCP tool: the public name the model sees, the
 /// raw client name, and the original tool name as the upstream server
@@ -255,16 +250,19 @@ pub(crate) async fn read_resource(
             let child = children.get_mut(server).ok_or_else(|| {
                 McpResourceError::NotConnected(format!("MCP server {server} is not connected"))
             })?;
+            // Fix 1: allocate a fresh JSON-RPC id per request so a late
+            // response from a previously timed-out call can't bind here.
+            let id = mcp_alloc_id();
             let req = json!({
                 "jsonrpc": "2.0",
-                "id": MCP_RESOURCE_READ_ID,
+                "id": id,
                 "method": "resources/read",
                 "params": { "uri": uri }
             });
             mcp_write_message(&mut child.stdin, &req).map_err(|err| {
                 McpResourceError::Rpc(format!("MCP resources/read write failed: {err}"))
             })?;
-            let res = mcp_wait_response_cancel(child, MCP_RESOURCE_READ_ID, timeout, None)
+            let res = mcp_wait_response_cancel(child, id, timeout, None)
                 .map_err(McpResourceError::Rpc)?;
             mcp_response_error(&res).map_err(McpResourceError::Rpc)?;
             res.get("result").cloned().ok_or_else(|| {
@@ -293,13 +291,14 @@ pub(crate) async fn read_resource(
                 mcp_remote_request_headers(state, server, headers.as_ref())
                     .await
                     .map_err(|err| McpResourceError::Rpc(err.message().to_string()))?;
+            let id = mcp_alloc_id();
             let req = json!({
                 "jsonrpc": "2.0",
-                "id": MCP_RESOURCE_READ_ID,
+                "id": id,
                 "method": "resources/read",
                 "params": { "uri": uri }
             });
-            let res = mcp_post_remote(&url, Some(&resolved), req, MCP_RESOURCE_READ_ID, timeout)
+            let res = mcp_post_remote(&url, Some(&resolved), req, id, timeout)
                 .await
                 .map_err(|err| McpResourceError::Rpc(err.message().to_string()))?;
             mcp_response_error(&res).map_err(McpResourceError::Rpc)?;

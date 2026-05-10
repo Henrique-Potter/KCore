@@ -401,19 +401,17 @@ fn apply_update(
         fs::create_dir_all(parent).map_err(|err| io_error(final_path, err))?;
     }
 
-    let mtime = fs::metadata(&source).and_then(|m| m.modified()).ok();
-
     let mut bytes = Vec::with_capacity(after.len() + 3);
     if had_bom {
         bytes.extend_from_slice(&UTF8_BOM);
     }
     bytes.extend_from_slice(after.as_bytes());
+    // Bun's `apply_patch` writes the new bytes without preserving mtime.
+    // The previous Rust port preserved mtime only when `move_to.is_some()
+    // || had_bom`, which made pure body edits bump mtime while renames
+    // and BOM-rewrites preserved it — confusing for file-watchers that
+    // diff on mtime. Match Bun: always let the write update mtime.
     fs::write(&target, &bytes).map_err(|err| io_error(final_path, err))?;
-
-    if let (Some(time), true) = (mtime, move_to.is_some() || had_bom) {
-        // Best-effort mtime preservation; ignore failures.
-        let _ = filetime_set(&target, time);
-    }
 
     if move_to.is_some() && target != source {
         fs::remove_file(&source).map_err(|err| io_error(path, err))?;
@@ -427,11 +425,6 @@ fn apply_update(
         deletions,
         kind: "modified",
     })
-}
-
-fn filetime_set(path: &FsPath, time: std::time::SystemTime) -> std::io::Result<()> {
-    let file = fs::OpenOptions::new().write(true).open(path)?;
-    file.set_modified(time)
 }
 
 fn unsafe_path_error(path: &str) -> PatchError {
@@ -1103,5 +1096,86 @@ mod tests {
         assert_eq!(v["kind"], "MoveDestExists");
         assert_eq!(v["file"], "b.txt");
         assert_eq!(v["message"], "exists");
+    }
+
+    /// Audit ref: B-A7. Pre-fix the applier preserved mtime only when
+    /// `move_to.is_some() || had_bom`, so a plain body edit bumped mtime
+    /// while a pure rename did not — inconsistent behavior that confused
+    /// file-watchers. New uniform behavior: NEVER preserve mtime (matches
+    /// Bun, which `fs.write`s without touching mtime). The write is
+    /// expected to advance mtime for every code path.
+    #[test]
+    fn apply_patch_mtime_not_preserved_consistently() {
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        // Case 1: pure body edit. mtime MUST advance (write happened).
+        let root = temp_root("mtime-edit");
+        let path = root.join("a.txt");
+        fs::write(&path, "alpha\nbeta\n").unwrap();
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        sleep(Duration::from_millis(20));
+        let text = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: a.txt\n",
+            "@@\n",
+            " alpha\n",
+            "-beta\n",
+            "+BETA\n",
+            "*** End Patch",
+        );
+        fake_apply_patch(&root, &json!({ "patchText": text })).expect("apply");
+        let after = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(
+            after > before,
+            "body edit must advance mtime (no preservation branch)"
+        );
+
+        // Case 2: pure rename (no hunks). Destination is a fresh write —
+        // its mtime is "now", definitely >= the original source mtime.
+        // This locks in the symmetry: no path silently preserves mtime.
+        let root = temp_root("mtime-rename");
+        let src = root.join("a.txt");
+        fs::write(&src, "x\ny\n").unwrap();
+        let src_before = fs::metadata(&src).unwrap().modified().unwrap();
+        sleep(Duration::from_millis(20));
+        let text = "*** Begin Patch\n\
+                    *** Update File: a.txt\n\
+                    *** Move to: b.txt\n\
+                    *** End Patch";
+        fake_apply_patch(&root, &json!({ "patchText": text })).expect("apply");
+        let dst_after = fs::metadata(root.join("b.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(
+            dst_after > src_before,
+            "rename destination mtime must reflect the write, not the source mtime"
+        );
+
+        // Case 3: BOM round-trip — same expectation.
+        let root = temp_root("mtime-bom");
+        let path = root.join("f.txt");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&UTF8_BOM);
+        bytes.extend_from_slice(b"alpha\nbeta\n");
+        fs::write(&path, &bytes).unwrap();
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        sleep(Duration::from_millis(20));
+        let text = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: f.txt\n",
+            "@@\n",
+            " alpha\n",
+            "-beta\n",
+            "+BETA\n",
+            "*** End Patch",
+        );
+        fake_apply_patch(&root, &json!({ "patchText": text })).expect("apply");
+        let after = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(
+            after > before,
+            "BOM-preserving edit must still advance mtime (no preservation branch)"
+        );
     }
 }

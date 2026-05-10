@@ -153,6 +153,7 @@ pub async fn serve(
         session_hard_rules: Mutex::default(),
         broken_turn_anchors: Mutex::default(),
         oauth_pending: Mutex::default(),
+        oauth_refresh: tokio::sync::Mutex::new(()),
         oauth_listener: Mutex::default(),
         oauth_listener_addr: SocketAddr::from(([127, 0, 0, 1], 1455)),
         oauth_token_endpoint: format!("{}/oauth/token", oauth::OPENAI_ISSUER),

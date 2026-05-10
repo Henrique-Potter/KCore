@@ -15,7 +15,8 @@ use crate::http::build_router as app;
 
 use super::common::{
     mcp_add_test_server, mcp_connect_test_server, mcp_script_runtime, mcp_status_value,
-    response_to_value, state_at, unique_root, MCP_EXIT_SERVER_JS, MCP_TEST_SERVER_JS,
+    response_to_value, state_at, unique_root, MCP_EXIT_SERVER_JS, MCP_STALE_RESPONSE_SERVER_JS,
+    MCP_TEST_SERVER_JS,
 };
 
 #[tokio::test]
@@ -375,6 +376,81 @@ async fn mcp_stdio_tool_call_missing_server_returns_named_error() {
     let data = response_to_value(res).await;
     assert_eq!(data["name"], "RustMcpNotImplementedError");
     assert_eq!(data["data"]["server"], "missing");
+}
+
+/// Fix 1: regression coverage for the JSON-RPC id-channel misroute. The
+/// fixture server emits a stale `id=1` frame BEFORE the real response.
+/// With the monotonic id allocator the client allocates a fresh id
+/// (>=100), so the stale `id=1` body must be discarded and the call must
+/// return the real result. Under the old fixed-`MCP_CALL_ID = 3` plus
+/// `MCP_RESOURCE_READ_ID = 7` constants any late prior response with the
+/// same id would short-circuit the wait loop and a tools/call could
+/// accidentally bind to a resources/read body (or vice versa).
+#[tokio::test]
+async fn mcp_id_channel_does_not_misroute_late_response() {
+    let root = unique_root();
+    fs::create_dir_all(root.join("repo")).unwrap();
+    let st = state_at(&root);
+    let Some(runtime) = mcp_script_runtime() else {
+        eprintln!("skipping mcp id misroute test: no node or bun command found");
+        return;
+    };
+    let script = root.join("mcp-stale-server.js");
+    fs::write(&script, MCP_STALE_RESPONSE_SERVER_JS).unwrap();
+
+    crate::tests::common::mcp_add_test_server(&st, "stale", &runtime, &script, 1000).await;
+    crate::tests::common::mcp_connect_test_server(&st, "stale").await;
+
+    // Two back-to-back calls. Each gets a stale id=1 frame followed by
+    // the real response. Both must return the real body.
+    for text in ["alpha", "beta"] {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp/stale/tool")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "name": "echo", "arguments": { "text": text } }).to_string(),
+            ))
+            .unwrap();
+        let res = app(st.clone()).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let data = response_to_value(res).await;
+        assert_eq!(
+            data,
+            json!({ "content": [{ "type": "text", "text": text }] }),
+            "stale id=1 frame leaked into call result"
+        );
+    }
+}
+
+/// Fix 1 unit slice: every call to `mcp_alloc_id` must hand back a
+/// distinct value. A re-used id is the precondition for late-response
+/// misrouting.
+#[tokio::test]
+async fn mcp_alloc_id_returns_unique_values() {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    for _ in 0..1000 {
+        let id = crate::routes::mcp::mcp_alloc_id();
+        assert!(seen.insert(id), "duplicate id from mcp_alloc_id: {id}");
+    }
+}
+
+/// Fix 3: CSRF state compare uses a constant-time helper. Smoke check
+/// the helper's contract — equal slices match, prefix mismatches don't,
+/// length mismatches don't.
+#[tokio::test]
+async fn mcp_csrf_state_compare_is_constant_time() {
+    use crate::routes::mcp::constant_time_eq;
+    assert!(constant_time_eq(b"abc", b"abc"));
+    assert!(!constant_time_eq(b"abc", b"abd"));
+    assert!(!constant_time_eq(b"abc", b"abcd"));
+    assert!(!constant_time_eq(b"", b"a"));
+    assert!(constant_time_eq(b"", b""));
+    // Sanity: also rejects an empty `got` even when the expected state
+    // happens to be empty-prefix — the comparator can't short-circuit
+    // and accidentally accept the empty input as a match.
+    assert!(!constant_time_eq(b"longer-state", b"longer-stat"));
 }
 
 #[tokio::test]

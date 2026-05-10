@@ -213,7 +213,14 @@ fn builtins() -> Map<String, Value> {
                 "description": "Plan mode. Can only edit plan files; all other filesystem mutations are denied.",
                 "mode": "primary",
                 "native": true,
-                "permission": [],
+                // Bun parity: `kilocode/agent/index.ts:159-192` (`planGuard`).
+                // These rules form the hard veto layer the user's "always"
+                // approvals cannot unlock; `state.agent_hard_rules("plan")`
+                // returns them so `evaluate_permission_layered` denies
+                // mutating tools regardless of soft allow rules. The narrow
+                // plan_exit allow lets plan-mode produce its sidecar
+                // markdown.
+                "permission": plan_default_permission(),
                 "options": {}
             }),
         ),
@@ -273,7 +280,11 @@ fn builtins() -> Map<String, Value> {
                 "prompt": PROMPT_ASK,
                 "mode": "primary",
                 "native": true,
-                "permission": [],
+                // Bun parity: `kilocode/agent/index.ts:133-157` (`askGuard`).
+                // Same hard-veto rationale as `plan`: ask is a read-only
+                // research agent so mutating tools must be denied even
+                // when the user has saved "allow always" for them.
+                "permission": ask_default_permission(),
                 "options": {}
             }),
         ),
@@ -378,6 +389,36 @@ fn merge_options(map: &mut Map<String, Value>, value: &Value) {
     for (key, value) in src {
         dst.insert(key.clone(), value.clone());
     }
+}
+
+/// Hard-veto rules for the built-in `plan` agent. Mirrors Bun's
+/// `planGuard` (`kilocode/agent/index.ts:159-192`): the agent denies all
+/// filesystem mutations except `plan_exit`, which is allowed so plan-mode
+/// can produce its sidecar markdown. Rules are emitted in the order the
+/// hard-rule evaluator wants (Bun uses `findLast` semantics — later
+/// matches win), with the broad `*` denies first and the targeted
+/// `plan_exit` allow last.
+fn plan_default_permission() -> Value {
+    json!([
+        { "permission": "edit", "pattern": "*", "action": "deny" },
+        { "permission": "bash", "pattern": "*", "action": "deny" },
+        { "permission": "apply_patch", "pattern": "*", "action": "deny" },
+        { "permission": "write", "pattern": "*", "action": "deny" },
+        { "permission": "plan_exit", "pattern": "*", "action": "allow" },
+    ])
+}
+
+/// Hard-veto rules for the built-in `ask` agent. Mirrors Bun's `askGuard`
+/// (`kilocode/agent/index.ts:133-157`): ask is read-only, every mutating
+/// permission key is denied wildcard-blanket. No `plan_exit` allow —
+/// `ask` is not the plan-mode agent.
+fn ask_default_permission() -> Value {
+    json!([
+        { "permission": "edit", "pattern": "*", "action": "deny" },
+        { "permission": "bash", "pattern": "*", "action": "deny" },
+        { "permission": "apply_patch", "pattern": "*", "action": "deny" },
+        { "permission": "write", "pattern": "*", "action": "deny" },
+    ])
 }
 
 pub(crate) fn permission_value(value: &Value) -> Value {

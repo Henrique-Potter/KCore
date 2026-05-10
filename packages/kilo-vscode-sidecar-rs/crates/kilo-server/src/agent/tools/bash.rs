@@ -202,24 +202,37 @@ fn build_shell_command(command: &str) -> Result<Command, String> {
         return Ok(cmd);
     }
     match resolve_windows_bash() {
-        Some(WindowsBash::Direct(path)) => {
-            let mut cmd = Command::new(path);
-            cmd.args(["-c", command]);
-            Ok(cmd)
-        }
+        Some(WindowsBash::Direct(path)) => Ok(spawn_bash_direct(path.as_os_str(), command)),
         Some(WindowsBash::CmdWrapped(bash)) => {
-            // Run cmd.exe with `bash.exe -c "<command>"`. cmd.exe handles
-            // PATH resolution and we hand the whole bash invocation off
-            // to it as a single string so quoting stays bash's job.
-            let mut cmd = Command::new("cmd.exe");
-            cmd.args([
-                "/C",
-                &format!("{bash} -c \"{}\"", command.replace('"', "\\\"")),
-            ]);
-            Ok(cmd)
+            // Originally this routed through `cmd.exe /C "<bash> -c
+            // "<command>""` to suppress the console window. That left
+            // cmd metacharacters (`&`, `^`, `%`, `!`, `(`, `)`, `|`,
+            // `<`, `>`) unescaped — a command-injection seam any time
+            // the agent passed bash text containing them.
+            //
+            // Spawn `bash.exe` directly instead. `CREATE_NO_WINDOW`
+            // (set on Windows via the helper below) suppresses the
+            // console flash natively, so the cmd.exe wrapper is no
+            // longer required.
+            Ok(spawn_bash_direct(std::ffi::OsStr::new(&bash), command))
         }
         None => Err(SHELL_UNAVAILABLE_ERROR.to_string()),
     }
+}
+
+/// Build a `Command` that invokes `bash -c <command>` with the entire
+/// `command` passed as a single argv element. On Windows we also set
+/// `CREATE_NO_WINDOW` so the spawn doesn't flash a console window.
+fn spawn_bash_direct(bash: &std::ffi::OsStr, command: &str) -> Command {
+    let mut cmd = Command::new(bash);
+    cmd.args(["-c", command]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW = 0x08000000, matches `lock.rs` / `pty.rs`.
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
 }
 
 /// Stable error name (lower-snake-case) returned to the SDK when the
@@ -371,6 +384,46 @@ fn tool_timeout(input: &Value) -> Result<Duration, String> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[cfg(windows)]
+    #[test]
+    fn bash_cmd_exe_injection_metacharacter_does_not_escape() {
+        // Audit bug: the old `WindowsBash::CmdWrapped` branch routed
+        // through `cmd.exe /C "<bash> -c "<command>""` and only
+        // escaped bash `"`. cmd metacharacters (`&`, `^`, `%`, `!`,
+        // `(`, `)`, `|`, `<`, `>`) made it through unmodified — a
+        // straightforward injection seam.
+        //
+        // The fix spawns bash directly (no cmd.exe wrapper) and sets
+        // `CREATE_NO_WINDOW` via `creation_flags`. Verify that the
+        // built command:
+        //  1. Is `bash.exe` (or a path to bash), NOT `cmd.exe`.
+        //  2. Passes the entire command string as a single argv
+        //     element to `-c`, so the dangerous metacharacters never
+        //     get a chance to be reinterpreted by a wrapper shell.
+        let payload = "echo a & calc.exe & echo b | echo c";
+        let cmd = spawn_bash_direct(std::ffi::OsStr::new("bash.exe"), payload);
+        let program = cmd.get_program().to_string_lossy().to_lowercase();
+        assert!(
+            program.ends_with("bash.exe") || program.ends_with("bash"),
+            "program should be bash, got {program:?}"
+        );
+        assert!(
+            !program.contains("cmd.exe"),
+            "must not route through cmd.exe wrapper: {program:?}"
+        );
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.len(), 2, "expected `-c <command>`: {args:?}");
+        assert_eq!(args[0], "-c");
+        // Crucially: the payload is passed unmodified as one argv
+        // element. No `replace('"', "\\\"")`, no concatenation into a
+        // single shell-parsed string.
+        assert_eq!(args[1], payload);
+    }
 
     #[test]
     fn read_pipe_drains_but_keeps_bounded_output() {

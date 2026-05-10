@@ -76,7 +76,6 @@ pub(crate) fn start_runner_with_parent(
                 follow_up_break: Arc::new(AtomicBool::new(false)),
                 parent,
                 abort: std::sync::Mutex::new(None),
-                awaiting_plan_followup: Arc::new(AtomicBool::new(false)),
                 mid_stream_retries: Arc::new(AtomicU8::new(0)),
             },
         );
@@ -148,7 +147,7 @@ async fn run_one_turn(
         if is_child || fake_provider(&input) || fake_abort(&input) || fake_error(&input, &text) {
             None
         } else {
-            pre_turn_snapshot(state.store.clone(), project.clone()).await
+            pre_turn_snapshot(state.store.clone(), project.clone(), id.to_string()).await
         };
     let mut info = user_info(&paths, &input);
     // Bun parity: `KiloSessionPromptQueue.scope()` retargeting. If the
@@ -311,7 +310,11 @@ async fn run_one_turn(
     )?)
 }
 
-async fn pre_turn_snapshot(store: kilo_store::Store, project: String) -> Option<String> {
+async fn pre_turn_snapshot(
+    store: kilo_store::Store,
+    project: String,
+    session_id: String,
+) -> Option<String> {
     #[cfg(test)]
     {
         let root = std::path::PathBuf::from(store.paths().worktree);
@@ -319,7 +322,7 @@ async fn pre_turn_snapshot(store: kilo_store::Store, project: String) -> Option<
             return None;
         }
     }
-    tokio::task::spawn_blocking(move || crate::snapshot::track(&store, &project))
+    tokio::task::spawn_blocking(move || crate::snapshot::track(&store, &project, &session_id))
         .await
         .ok()
         .and_then(Result::ok)
@@ -610,13 +613,9 @@ pub(crate) async fn plan_followup_decision(
         Some(path) => path,
         None => return Ok(PlanFollowup::Stay),
     };
-    // Mark the runner as suspended on a follow-up question so abort/
-    // cancel routes can distinguish a paused turn from a producing one.
-    set_awaiting_plan_followup(state, sid, true);
     let target_agent = preferred_followup_agent(state);
     let info = plan_followup_question_info(sid, result);
     let answer = ask_question(state, info).await;
-    set_awaiting_plan_followup(state, sid, false);
     let yes = match answer {
         Ok(value) => answer_is_yes(&value),
         Err(_) => false,
@@ -768,14 +767,6 @@ fn synth_followup_input(
         agent: Some(target_agent.to_string()),
         model,
         ..Default::default()
-    }
-}
-
-fn set_awaiting_plan_followup(state: &AppState, sid: &str, value: bool) {
-    if let Some(runner) = state.runners.lock().unwrap().get(sid) {
-        runner
-            .awaiting_plan_followup
-            .store(value, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

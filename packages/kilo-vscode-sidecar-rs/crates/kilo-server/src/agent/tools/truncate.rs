@@ -23,7 +23,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::limits::TRUNCATION_SENTINEL;
@@ -78,7 +78,14 @@ pub(crate) fn truncate_for_tool(state_dir: &Path, output: &str) -> TruncateResul
     let file = dir.join(format!("{}.txt", unique_id()));
     let path_for_footer = match write_full_output(&dir, &file, output) {
         Ok(()) => Some(file.clone()),
-        Err(_) => None,
+        Err(err) => {
+            // Disk write failed — surface the error so it can be
+            // diagnosed (silently swallowing meant truncated tool
+            // outputs vanished without explanation). Continue with
+            // `None` outputPath so the preview still flows.
+            eprintln!("[kilo-server] truncate write failed for {file:?}: {err}");
+            None
+        }
     };
 
     let preview_body = preview(output);
@@ -144,17 +151,87 @@ fn write_full_output(dir: &Path, file: &Path, output: &str) -> std::io::Result<(
     Ok(())
 }
 
+/// Walk `<state_dir>/kilo/truncate/` and remove any `.txt` files older than
+/// `max_age_days`. Returns the number of files removed. Mirrors
+/// `snapshot::cleanup_orphaned_plans_at`: best-effort, missing dir is a
+/// no-op, canonicalization guards against symlink escapes.
+///
+/// TODO(lib.rs): wire this into the periodic GC `tokio::spawn` block in
+/// `serve()` next to `cleanup_old_snapshots` / `cleanup_orphaned_plans`
+/// so the truncate spool gets pruned hourly. The wave-10 scheduler is in
+/// `lib.rs` which is outside this module's edit scope.
+pub(crate) fn cleanup_old_truncate_files(state_dir: &Path, max_age_days: u64) -> usize {
+    let root = state_dir.join("kilo").join("truncate");
+    cleanup_old_truncate_files_at(&root, max_age_days)
+}
+
+fn cleanup_old_truncate_files_at(root: &Path, max_age_days: u64) -> usize {
+    if !root.is_dir() {
+        return 0;
+    }
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(max_age_days.saturating_mul(86_400)))
+        .unwrap_or(UNIX_EPOCH);
+    let canonical_root = match fs::canonicalize(root) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let entries = match fs::read_dir(root) {
+        Ok(iter) => iter,
+        Err(_) => return 0,
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let is_txt = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("txt"))
+            .unwrap_or(false);
+        if !is_txt {
+            continue;
+        }
+        // Symlink-escape guard: the canonicalized file path must still
+        // live under the canonical truncate root.
+        let canonical_file = match fs::canonicalize(&path) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if !canonical_file.starts_with(&canonical_root) {
+            continue;
+        }
+        let age_ok = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .map(|modified| modified < cutoff)
+            .unwrap_or(false);
+        if !age_ok {
+            continue;
+        }
+        if fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Generate a unique filename without pulling in the `uuid` crate.
-/// `<unix_nanos>_<process_seq>` is collision-free across processes (nanos
-/// differ) and within a process (atomic counter).
+/// `tool_<pid>_<unix_nanos>_<process_seq>` is collision-free both within a
+/// process (atomic seq) and across concurrent sidecars (pid disambiguates
+/// when two processes see the same `now()` and both start at seq=0).
 fn unique_id() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("tool_{nanos}_{seq}")
+    format!("tool_{pid}_{nanos}_{seq}")
 }
 
 #[cfg(test)]
@@ -261,6 +338,106 @@ mod tests {
         let b = unique_id();
         assert_ne!(a, b);
     }
+
+    #[test]
+    fn truncate_unique_id_includes_pid() {
+        let id = unique_id();
+        let pid = std::process::id();
+        // Format: tool_<pid>_<nanos>_<seq>
+        assert!(id.starts_with(&format!("tool_{pid}_")), "got: {id}");
+        // Four `_`-separated segments: `tool`, pid, nanos, seq.
+        let parts: Vec<&str> = id.split('_').collect();
+        assert_eq!(parts.len(), 4, "id `{id}` should split into 4 parts");
+        assert_eq!(parts[0], "tool");
+        assert_eq!(parts[1], pid.to_string());
+        // nanos + seq are non-empty integers.
+        assert!(parts[2].parse::<u128>().is_ok(), "nanos: {}", parts[2]);
+        assert!(parts[3].parse::<u64>().is_ok(), "seq: {}", parts[3]);
+    }
+
+    #[test]
+    fn cleanup_old_truncate_files_removes_only_older_than_threshold() {
+        let state = tmp_state_dir();
+        let dir = state.join("kilo").join("truncate");
+        fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join("tool_old.txt");
+        let fresh = dir.join("tool_new.txt");
+        fs::write(&stale, "x").unwrap();
+        fs::write(&fresh, "y").unwrap();
+
+        // Backdate `stale` to 40 days ago. Skip the assertion if the
+        // platform refused (best-effort, matches snapshot tests).
+        let cutoff = SystemTime::now() - Duration::from_secs(40 * 86_400);
+        backdate(&stale, cutoff);
+
+        let removed = cleanup_old_truncate_files(&state, 30);
+        let stale_old = stale
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|m| m < SystemTime::now() - Duration::from_secs(35 * 86_400))
+            .unwrap_or(false);
+        if stale_old {
+            assert_eq!(removed, 1, "exactly the >30-day file should be pruned");
+            assert!(!stale.exists(), "stale file must have been removed");
+        }
+        assert!(fresh.exists(), "fresh file must survive");
+
+        let _ = fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn cleanup_old_truncate_files_returns_zero_on_missing_dir() {
+        let state = tmp_state_dir();
+        // Dir does not exist — must be a no-op.
+        assert_eq!(cleanup_old_truncate_files(&state, 30), 0);
+    }
+
+    #[test]
+    fn cleanup_old_truncate_files_skips_non_txt() {
+        let state = tmp_state_dir();
+        let dir = state.join("kilo").join("truncate");
+        fs::create_dir_all(&dir).unwrap();
+        let other = dir.join("foreign.log");
+        fs::write(&other, "x").unwrap();
+        backdate(&other, SystemTime::now() - Duration::from_secs(40 * 86_400));
+
+        let removed = cleanup_old_truncate_files(&state, 30);
+        assert_eq!(removed, 0, "non-.txt files must be left alone");
+        assert!(other.exists());
+
+        let _ = fs::remove_dir_all(&state);
+    }
+
+    #[cfg(unix)]
+    fn backdate(path: &Path, when: SystemTime) {
+        let secs = when
+            .duration_since(UNIX_EPOCH)
+            .map(|dur| dur.as_secs() as i64)
+            .unwrap_or(0);
+        let _ = std::process::Command::new("touch")
+            .args(["-d", &format!("@{secs}")])
+            .arg(path)
+            .output();
+    }
+
+    #[cfg(windows)]
+    fn backdate(path: &Path, when: SystemTime) {
+        let secs = when
+            .duration_since(UNIX_EPOCH)
+            .map(|dur| dur.as_secs())
+            .unwrap_or(0);
+        let script = format!(
+            "(Get-Item -LiteralPath '{}').LastWriteTime = [DateTimeOffset]::FromUnixTimeSeconds({}).LocalDateTime",
+            path.display().to_string().replace('\'', "''"),
+            secs
+        );
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output();
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn backdate(_path: &Path, _when: SystemTime) {}
 
     /// Bun parity for `result.metadata.truncated !== undefined`: a tool
     /// that already manages its own truncation (e.g. `bash`) sets the

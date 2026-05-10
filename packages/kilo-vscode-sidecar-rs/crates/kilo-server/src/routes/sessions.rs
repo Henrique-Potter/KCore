@@ -553,6 +553,8 @@ pub(crate) async fn delete_session(
     state.cancel_prompt_queue(&id);
     state.remove_prompt_queue(&id);
     state.set_session_agent(&id, None);
+    state.broken_turn_anchors.lock().unwrap().remove(&id);
+    state.clear_network_waits_for_session(&id);
     match state.store.delete_session_record(&id) {
         Ok(record) if record.session.is_some() => {
             if let (Some(session), Some(event)) = (&record.session, record.event) {
@@ -569,8 +571,13 @@ pub(crate) async fn delete_session(
                 // dirs are shared per worktree, so we GC instead of rm).
                 let store = state.store.clone();
                 let project_for_cleanup = session.project_id.clone();
+                let sid_for_cleanup = id.clone();
                 tokio::task::spawn_blocking(move || {
-                    let _ = crate::snapshot::on_session_deleted(&store, &project_for_cleanup);
+                    let _ = crate::snapshot::on_session_deleted(
+                        &store,
+                        &project_for_cleanup,
+                        &sid_for_cleanup,
+                    );
                 });
                 // Best-effort plan-markdown cleanup. The `plan_exit` tool path
                 // writes plan files to `<worktree>/.kilo/plans/<created>-<slug>.md`

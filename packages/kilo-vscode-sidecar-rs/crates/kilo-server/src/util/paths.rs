@@ -47,6 +47,67 @@ pub(crate) fn resolve_under(root: &FsPath, input: &str) -> Result<PathBuf, Statu
     Ok(root.join(path))
 }
 
+/// Like [`resolve_under`], but additionally canonicalizes the resolved
+/// path (resolving symlinks) and re-verifies the canonical form still
+/// lives under `root`. Use this anywhere a tool is about to read/write
+/// a path that may have been laundered through a symlink:
+/// `worktree/foo -> /etc/passwd` would pass the lexical check in
+/// `resolve_under` but escape on canonicalize.
+///
+/// Paths that don't resolve (write-to-create / new-file case) keep the
+/// lexical answer — there's nothing to canonicalize yet. The deepest
+/// existing parent is still resolved so a symlink on an intermediate
+/// directory is caught.
+pub(crate) fn resolve_under_strict(root: &FsPath, input: &str) -> Result<PathBuf, StatusCode> {
+    let lexical = resolve_under(root, input)?;
+    let canonical = canonicalize_with_parent(&lexical);
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let canonical_root = strip_unc(canonical_root);
+    if is_within_path(&canonical_root, &canonical) {
+        return Ok(lexical);
+    }
+    Err(StatusCode::FORBIDDEN)
+}
+
+/// Best-effort canonicalization that survives non-existent leaves. If the
+/// whole path resolves, return its canonical form (UNC prefix stripped on
+/// Windows). Otherwise canonicalize the deepest ancestor that exists and
+/// re-attach the missing tail — so a symlink anywhere along the existing
+/// prefix still gets resolved.
+fn canonicalize_with_parent(target: &FsPath) -> PathBuf {
+    if let Ok(p) = std::fs::canonicalize(target) {
+        return strip_unc(p);
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = target;
+    loop {
+        match cursor.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                if let Some(name) = cursor.file_name() {
+                    tail.push(name.to_os_string());
+                }
+                if let Ok(canon) = std::fs::canonicalize(parent) {
+                    let mut out = strip_unc(canon);
+                    for piece in tail.iter().rev() {
+                        out.push(piece);
+                    }
+                    return out;
+                }
+                cursor = parent;
+            }
+            _ => return target.to_path_buf(),
+        }
+    }
+}
+
+fn strip_unc(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest.to_string());
+    }
+    p
+}
+
 /// Outcome of `resolve_with_external`. Bun parity: paths outside the
 /// worktree are not rejected outright — they can be approved per-call by
 /// the user via the `external_directory` permission ask. The strict
@@ -125,5 +186,80 @@ fn cmp_path(path: &FsPath) -> String {
     #[cfg(not(windows))]
     {
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn tmp_root(label: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!("kilo-paths-{label}-{stamp}-{n}"));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn resolve_under_strict_accepts_inside_existing_file() {
+        let root = tmp_root("strict-inside");
+        let worktree = root.join("repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join("hello.txt"), "hi").unwrap();
+        let resolved = resolve_under_strict(&worktree, "hello.txt").expect("inside");
+        assert_eq!(resolved, worktree.join("hello.txt"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_under_strict_accepts_path_that_does_not_exist() {
+        // Write-to-create: the file isn't there yet but the parent is
+        // the worktree itself, so canonicalize_with_parent resolves to
+        // worktree + filename and the check passes.
+        let root = tmp_root("strict-create");
+        let worktree = root.join("repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let resolved = resolve_under_strict(&worktree, "new-file.txt").expect("create");
+        assert_eq!(resolved, worktree.join("new-file.txt"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_under_strict_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let root = tmp_root("strict-symlink");
+        let worktree = root.join("repo");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "leak").unwrap();
+        // worktree/escape -> outside (a symlink). Lexically `escape/x`
+        // is inside the worktree; canonically it resolves outside.
+        symlink(&outside, worktree.join("escape")).unwrap();
+        assert!(resolve_under(&worktree, "escape/secret.txt").is_ok());
+        assert_eq!(
+            resolve_under_strict(&worktree, "escape/secret.txt"),
+            Err(StatusCode::FORBIDDEN),
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_under_strict_still_rejects_dotdot() {
+        let root = tmp_root("strict-dotdot");
+        let worktree = root.join("repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        assert_eq!(
+            resolve_under_strict(&worktree, "../secret.txt"),
+            Err(StatusCode::FORBIDDEN),
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

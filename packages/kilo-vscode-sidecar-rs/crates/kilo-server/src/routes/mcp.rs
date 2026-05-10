@@ -4,12 +4,12 @@
 //! the `kilo-mcp` crate. Do not grow further; new MCP work belongs there.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
     process::{ChildStdin, Command, Stdio},
-    sync::atomic::AtomicBool,
-    sync::{mpsc, Arc},
+    sync::atomic::{AtomicBool, AtomicI64, Ordering},
+    sync::{mpsc, Arc, LazyLock, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -30,10 +30,50 @@ use crate::{AppState, McpChild};
 
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 pub(crate) const MCP_DEFAULT_TIMEOUT_MS: u64 = 30_000;
-const MCP_CALL_ID: i64 = 3;
-const MCP_REFRESH_ID: i64 = 4;
 const MCP_AUTH_REDACTED: &str = "[redacted]";
 const MCP_OAUTH_PENDING_TTL_SECONDS: i64 = 600;
+
+/// Fix 1: monotonic JSON-RPC id allocator. Every outbound MCP request
+/// (tools/call, tools/list, resources/read, initialize, refresh) draws
+/// from this counter so a late response from a previously-timed-out call
+/// can never bind to a new request. Starts past the handshake ids
+/// (1=initialize, 2=tools/list) so existing tests that assert on the
+/// handshake shape keep working.
+static MCP_NEXT_ID: AtomicI64 = AtomicI64::new(100);
+
+pub(crate) fn mcp_alloc_id() -> i64 {
+    MCP_NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Fix 5: per-server single-flight token refresh. The map gives each
+/// server name its own `tokio::sync::Mutex`; concurrent callers serialize
+/// through it so only one IdP roundtrip fires and the rest re-read the
+/// refreshed token from `Store`.
+static MCP_REFRESH_LOCKS: LazyLock<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn mcp_refresh_lock(name: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = MCP_REFRESH_LOCKS.lock().unwrap();
+    map.entry(name.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Fix 3: constant-time byte-string compare. Returns true iff `a == b`
+/// and runs in time proportional to `max(a.len(), b.len())` without
+/// short-circuiting on the first byte difference. OAuth state and PKCE
+/// equality checks route through this so timing leaks can't reveal the
+/// expected value.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let len = a.len().max(b.len());
+    let mut diff: u8 = (a.len() ^ b.len()) as u8;
+    for i in 0..len {
+        let x = *a.get(i).unwrap_or(&0);
+        let y = *b.get(i).unwrap_or(&0);
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 
 /// `GET /mcp` — M11-safe status surface. Parse the existing Rust config shape
 /// and merge in-memory lifecycle state for local stdio children. Disabled
@@ -224,21 +264,40 @@ pub(crate) async fn mcp_oauth_callback(
             "No pending OAuth authorization.",
         );
     };
-    if pending.get("state").and_then(Value::as_str) != Some(got) {
+    // Fix 3: constant-time state compare. A non-CT compare leaks the
+    // expected CSRF state byte-by-byte to an attacker who can measure
+    // server response timing.
+    let expected = pending
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !constant_time_eq(expected.as_bytes(), got.as_bytes()) {
         return html(
             StatusCode::BAD_REQUEST,
             "RustMcpOAuthStateError",
             "OAuth state does not match.",
         );
     }
-    let Some(verifier) = pending.get("codeVerifier").and_then(Value::as_str) else {
+    let Some(verifier) = pending
+        .get("codeVerifier")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        // Pending blob shape is corrupt — best-effort scrub before bailing
+        // so a malformed entry can't block subsequent authorize flows.
+        let _ = mcp_scrub_pending(&state, &name);
         return html(
             StatusCode::BAD_REQUEST,
             "RustMcpOAuthStateError",
             "Pending OAuth verifier is missing.",
         );
     };
-    match mcp_oauth_exchange(&cfg, code, verifier).await {
+    let outcome = mcp_oauth_exchange(&cfg, code, &verifier).await;
+    // Fix 4: scrub the persisted `pending` blob on both success AND
+    // failure. The success path used to remove it implicitly via
+    // `mcp_refreshed_auth` overwrite; the failure path left the verifier
+    // sitting in mcp-auth.json indefinitely.
+    match outcome {
         Ok(data) => {
             let mut next = mcp_refreshed_auth(
                 json!({
@@ -264,8 +323,33 @@ pub(crate) async fn mcp_oauth_callback(
                 "Authorization succeeded. You can close this tab.",
             )
         }
-        Err(err) => html(err.status(), err.name(), err.message()),
+        Err(err) => {
+            let _ = mcp_scrub_pending(&state, &name);
+            html(err.status(), err.name(), err.message())
+        }
     }
+}
+
+/// Fix 4: remove only the `pending` key from the persisted MCP auth blob,
+/// leaving any successful tokens / client registration in place. Used by
+/// the OAuth callback handler on failure paths so a partial flow never
+/// leaves the PKCE verifier sitting on disk.
+fn mcp_scrub_pending(state: &AppState, name: &str) -> Result<(), String> {
+    let Some(mut auth) = state.store.mcp_auth(name) else {
+        return Ok(());
+    };
+    let removed = auth
+        .as_object_mut()
+        .map(|map| map.remove("pending").is_some())
+        .unwrap_or(false);
+    if !removed {
+        return Ok(());
+    }
+    state
+        .store
+        .set_mcp_auth(name, auth)
+        .map(|_| ())
+        .map_err(|err| err.to_string())
 }
 
 /// `POST /mcp/{name}/connect` — local stdio lifecycle baseline plus the first
@@ -476,7 +560,7 @@ pub(crate) fn mcp_refresh_changed(state: &AppState, name: &str, timeout: Duratio
             return;
         }
         child.tools_changed = false;
-        match mcp_list_tools(child, MCP_REFRESH_ID, timeout) {
+        match mcp_list_tools(child, mcp_alloc_id(), timeout) {
             Ok(tools) => Ok(tools),
             Err(err) => {
                 if matches!(
@@ -653,7 +737,21 @@ pub(crate) fn mcp_stop_child(child: &mut McpChild) -> std::io::Result<()> {
     if child.child.try_wait()?.is_some() {
         return Ok(());
     }
-    child.child.kill()?;
+    // Fix 2: on Windows, `child.kill()` only signals the immediate PID.
+    // `npx`, `bun`, `docker` etc. spawn grandchildren that survive the
+    // wrapper's death and keep ports / locks. Fan-tree-kill via `taskkill
+    // /F /T /PID <pid>` first, then fall through to `child.kill()` as a
+    // safety net for the wrapper itself.
+    #[cfg(windows)]
+    {
+        let pid = child.child.id();
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.child.kill();
     let _ = child.child.wait()?;
     Ok(())
 }
@@ -734,9 +832,10 @@ pub(crate) fn mcp_call_child_cancel(
     timeout: Duration,
     cancel: Option<&AtomicBool>,
 ) -> Result<Value, McpCallError> {
+    let id = mcp_alloc_id();
     let req = json!({
         "jsonrpc": "2.0",
-        "id": MCP_CALL_ID,
+        "id": id,
         "method": "tools/call",
         "params": {
             "name": input.name,
@@ -745,8 +844,8 @@ pub(crate) fn mcp_call_child_cancel(
     });
     mcp_write_message(&mut child.stdin, &req)
         .map_err(|err| McpCallError::Write(format!("MCP tools/call write failed: {err}")))?;
-    let res = mcp_wait_response_cancel(child, MCP_CALL_ID, timeout, cancel)
-        .map_err(McpCallError::from_wait)?;
+    let res =
+        mcp_wait_response_cancel(child, id, timeout, cancel).map_err(McpCallError::from_wait)?;
     mcp_response_error(&res).map_err(McpCallError::Rpc)?;
     res.get("result")
         .cloned()
@@ -890,13 +989,14 @@ pub(crate) async fn mcp_call_remote(
     input: kilo_mcp::CallInput,
     timeout: Option<u64>,
 ) -> Result<Value, McpRemoteError> {
+    let id = mcp_alloc_id();
     let req = json!({
         "jsonrpc": "2.0",
-        "id": MCP_CALL_ID,
+        "id": id,
         "method": "tools/call",
         "params": { "name": input.name, "arguments": input.arguments }
     });
-    let res = mcp_post_remote(url, headers, req, MCP_CALL_ID, timeout).await?;
+    let res = mcp_post_remote(url, headers, req, id, timeout).await?;
     mcp_response_error(&res).map_err(McpRemoteError::Rpc)?;
     res.get("result")
         .cloned()
@@ -1096,6 +1196,22 @@ async fn mcp_token_for_request(
     name: &str,
     auth: Value,
 ) -> Result<Option<String>, McpRemoteError> {
+    let access = auth
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    if access.is_some() && !mcp_auth_expired(&auth) {
+        return Ok(access.map(str::to_string));
+    }
+    // Fix 5: single-flight refresh per server name. Concurrent callers
+    // race the read-modify-write of `Store::set_mcp_auth` — N callers
+    // could each fire a refresh against the IdP. Acquire the per-server
+    // lock, then re-read the persisted auth: if another task already
+    // refreshed, its fresh access token is on disk and we skip the
+    // round-trip entirely.
+    let lock = mcp_refresh_lock(name);
+    let _guard = lock.lock().await;
+    let auth = state.store.mcp_auth(name).unwrap_or(auth);
     let access = auth
         .get("accessToken")
         .and_then(Value::as_str)

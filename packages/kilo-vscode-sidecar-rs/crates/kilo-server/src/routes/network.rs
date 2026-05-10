@@ -376,6 +376,7 @@ mod tests {
             session_hard_rules: Mutex::new(Default::default()),
             broken_turn_anchors: Mutex::new(Default::default()),
             oauth_pending: Mutex::new(Default::default()),
+            oauth_refresh: tokio::sync::Mutex::new(()),
             oauth_listener: Mutex::new(Default::default()),
             oauth_listener_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             oauth_token_endpoint: "https://example.invalid/oauth/token".to_string(),

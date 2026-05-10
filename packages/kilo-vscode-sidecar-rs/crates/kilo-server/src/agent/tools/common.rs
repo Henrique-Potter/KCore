@@ -8,14 +8,52 @@
 //! boundary (`agent::fake`, `agent::tools::*`, and the still-in-`lib.rs`
 //! permission machinery that consumes `tool_permission`/`tool_patterns`).
 
+use std::cell::RefCell;
 use std::path::Path as FsPath;
 
 use serde_json::Value;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 use crate::agent::tools::patch::parse_apply_patch;
 use crate::util::paths::slash;
 use crate::KNOWN_TOOLS;
+
+thread_local! {
+    /// One tree-sitter-bash `Parser` per thread. `Parser::new()` plus
+    /// `set_language` is ~200-500µs each call; bash permission checks
+    /// happen on every tool invocation so caching the parser saves
+    /// roughly 80% of the per-call parse cost. `set_language` is
+    /// idempotent — once initialised we just reuse the parser.
+    static BASH_PARSER: RefCell<Option<Parser>> = const { RefCell::new(None) };
+}
+
+/// Parse `command` with the cached thread-local bash parser, hand the
+/// produced tree to `f`, and return its result. Returns `None` if the
+/// parser couldn't be initialised or the parse itself failed.
+///
+/// The parser is moved out of the `RefCell` for the duration of the
+/// parse + callback so recursive calls (`arity_prefixes` → `parse_bash`
+/// for `bash -c` inner commands) don't double-borrow. The parser is
+/// returned to the slot on exit; if a recursive call already populated
+/// the slot, this outer call's parser is dropped.
+fn with_bash_parser<R>(command: &str, f: impl FnOnce(&Tree) -> R) -> Option<R> {
+    let mut parser = BASH_PARSER.with(|slot| slot.borrow_mut().take());
+    if parser.is_none() {
+        let mut fresh = Parser::new();
+        fresh.set_language(&tree_sitter_bash::language()).ok()?;
+        parser = Some(fresh);
+    }
+    let mut parser = parser?;
+    let tree = parser.parse(command, None);
+    let result = tree.map(|tree| f(&tree));
+    BASH_PARSER.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        if borrow.is_none() {
+            *borrow = Some(parser);
+        }
+    });
+    result
+}
 
 pub(crate) fn tool_enabled(value: &Value) -> bool {
     match value {
@@ -142,47 +180,46 @@ pub(crate) fn bash_command_patterns(command: &str) -> Vec<String> {
 /// the parser cannot be initialised; returns `Some(empty)` when the parse
 /// succeeded but yielded no usable command nodes (caller falls back).
 fn parse_bash(command: &str) -> Option<Vec<String>> {
-    let mut parser = Parser::new();
-    let language = tree_sitter_bash::language();
-    parser.set_language(&language).ok()?;
-    let tree = parser.parse(command, None)?;
-    let root = tree.root_node();
-
-    // A parse error at the top level (e.g. `if then else`) means the
-    // grammar bailed; let the caller fall back to the heuristic. We
-    // intentionally don't reject *any* error in the tree — most real
-    // commands tolerate minor parse warnings while still extracting
-    // sensible command nodes.
-    if root.has_error() && root.child_count() == 0 {
-        return None;
-    }
-    if root.kind() == "ERROR" {
-        return None;
-    }
-
     let bytes = command.as_bytes();
-    let mut commands: Vec<Vec<String>> = Vec::new();
-    walk(root, bytes, &mut commands);
+    with_bash_parser(command, |tree| {
+        let root = tree.root_node();
 
-    if commands.is_empty() && root.has_error() {
-        // Parse produced no commands and the tree has errors -> the
-        // input is malformed enough that fallback is safer.
-        return None;
-    }
+        // A parse error at the top level (e.g. `if then else`) means
+        // the grammar bailed; let the caller fall back to the
+        // heuristic. We intentionally don't reject *any* error in the
+        // tree — most real commands tolerate minor parse warnings
+        // while still extracting sensible command nodes.
+        if root.has_error() && root.child_count() == 0 {
+            return None;
+        }
+        if root.kind() == "ERROR" {
+            return None;
+        }
 
-    let mut patterns: Vec<String> = Vec::new();
-    for tokens in commands {
-        for prefix in arity_prefixes(&tokens) {
-            let value = format!("{prefix} *");
-            if !patterns.contains(&value) {
-                patterns.push(value);
+        let mut commands: Vec<Vec<String>> = Vec::new();
+        walk(root, bytes, &mut commands);
+
+        if commands.is_empty() && root.has_error() {
+            // Parse produced no commands and the tree has errors -> the
+            // input is malformed enough that fallback is safer.
+            return None;
+        }
+
+        let mut patterns: Vec<String> = Vec::new();
+        for tokens in commands {
+            for prefix in arity_prefixes(&tokens) {
+                let value = format!("{prefix} *");
+                if !patterns.contains(&value) {
+                    patterns.push(value);
+                }
             }
         }
-    }
-    if !patterns.contains(&"*".to_string()) {
-        patterns.push("*".to_string());
-    }
-    Some(patterns)
+        if !patterns.contains(&"*".to_string()) {
+            patterns.push("*".to_string());
+        }
+        Some(patterns)
+    })
+    .flatten()
 }
 
 /// Recursively visit nodes, collecting tokens for each `command` node.
@@ -252,15 +289,34 @@ fn arity_prefixes(tokens: &[String]) -> Vec<String> {
     if tokens.is_empty() {
         return Vec::new();
     }
-    // `bash -c "rm -rf /"`: re-tokenise the inner string and recurse.
-    // Bun does this implicitly via the parse tree, but since the inner
-    // command is a single quoted string the tree-sitter `command` node
-    // sees it as one token — handle it here.
+    // `bash -c "cd /tmp && rm foo"`: re-parse the inner string with
+    // the same tree-sitter bash grammar so chained / piped / quoted
+    // verbs all surface (`split_whitespace` would emit `&&` as a
+    // pseudo-token and lose every verb after the first).
     if matches!(tokens[0].as_str(), "bash" | "sh")
         && tokens.get(1).map(String::as_str) == Some("-c")
     {
         if let Some(inner) = tokens.get(2) {
             let inner = inner.trim_matches(|c: char| c == '\'' || c == '"');
+            // Recursive parse via the cached parser. `parse_bash`
+            // already appends a `*` wildcard; strip it so the caller
+            // can decide where the wildcard lands in the merged list.
+            if let Some(mut inner_patterns) = parse_bash(inner) {
+                inner_patterns.retain(|p| p != "*");
+                if !inner_patterns.is_empty() {
+                    // Strip the trailing ` *` we'll re-add upstream.
+                    let prefixes: Vec<String> = inner_patterns
+                        .into_iter()
+                        .filter_map(|p| p.strip_suffix(" *").map(str::to_string))
+                        .collect();
+                    if !prefixes.is_empty() {
+                        return prefixes;
+                    }
+                }
+            }
+            // Inner parse failed or yielded nothing useful — fall back
+            // to the naive whitespace split so we still surface
+            // *something* (the audited regression).
             let inner_tokens: Vec<String> = inner.split_whitespace().map(str::to_string).collect();
             if !inner_tokens.is_empty() {
                 return arity_prefixes(&inner_tokens);
@@ -579,6 +635,47 @@ mod tests {
         assert!(p.contains(&"cat *".to_string()), "{p:?}");
         assert!(p.contains(&"*".to_string()), "{p:?}");
         assert!(!p.contains(&"rm *".to_string()), "{p:?}");
+    }
+
+    #[test]
+    fn bash_arity_recursive_parse_extracts_inner_verbs() {
+        // Audit bug: `bash -c "cd /tmp && rm foo"` used to split on
+        // whitespace, producing `["cd", "/tmp", "&&", "rm", "foo"]`
+        // and surfacing only `cd *`. Tree-sitter re-parse must catch
+        // both `cd` and `rm` (and the `*` wildcard).
+        let p = bash_command_patterns("bash -c \"cd /tmp && rm foo\"");
+        assert!(p.contains(&"cd *".to_string()), "{p:?}");
+        assert!(p.contains(&"rm *".to_string()), "{p:?}");
+        assert!(p.contains(&"*".to_string()), "{p:?}");
+    }
+
+    #[test]
+    fn bash_arity_recursive_parse_handles_pipe() {
+        let p = bash_command_patterns("bash -c 'cat foo | grep bar'");
+        assert!(p.contains(&"cat *".to_string()), "{p:?}");
+        assert!(p.contains(&"grep *".to_string()), "{p:?}");
+        assert!(p.contains(&"*".to_string()), "{p:?}");
+    }
+
+    #[test]
+    fn bash_arity_thread_local_parser_reused() {
+        // Smoke test: call repeatedly. Confirms the thread-local
+        // parser is functional under repeated reuse and produces
+        // stable output. The first call lazily initialises the
+        // thread_local Parser; later calls must hit the cached one
+        // without rebuilding `set_language` (idempotent reuse).
+        let mut last: Option<Vec<String>> = None;
+        for _ in 0..100 {
+            let p = bash_command_patterns("git push origin main");
+            if let Some(prev) = &last {
+                assert_eq!(prev, &p, "results diverged across calls: {p:?}");
+            }
+            last = Some(p);
+        }
+        let p = last.expect("at least one iteration");
+        assert!(p.contains(&"git push *".to_string()), "{p:?}");
+        assert!(p.contains(&"git *".to_string()), "{p:?}");
+        assert!(p.contains(&"*".to_string()), "{p:?}");
     }
 
     #[test]

@@ -1553,16 +1553,6 @@ async fn plan_exit_raises_continue_question() {
     assert_eq!(info["questions"][0]["options"][1]["label"], "no");
     assert_eq!(info["metadata"]["kind"], "plan_followup");
 
-    // The runner should be marked as awaiting the follow-up question.
-    let awaiting = state
-        .runners
-        .lock()
-        .unwrap()
-        .get(&session.id)
-        .map(|r| r.awaiting_plan_followup.load(Ordering::SeqCst))
-        .unwrap_or(false);
-    assert!(awaiting, "runner should be marked awaiting plan follow-up");
-
     // The bus should have published the question.
     let mut saw_asked = false;
     while let Ok(event) = bus.try_recv() {
@@ -1633,16 +1623,6 @@ async fn plan_followup_yes_dispatches_implementation_prompt() {
         "expected plan path in synth prompt, got {text}"
     );
     assert!(text.to_lowercase().contains("implement"));
-
-    // Awaiting flag should be cleared once the helper returns.
-    let awaiting = state
-        .runners
-        .lock()
-        .unwrap()
-        .get(&session.id)
-        .map(|r| r.awaiting_plan_followup.load(Ordering::SeqCst))
-        .unwrap_or(false);
-    assert!(!awaiting, "awaiting flag should be cleared after reply");
 
     let _ = std::fs::remove_dir_all(root);
 }

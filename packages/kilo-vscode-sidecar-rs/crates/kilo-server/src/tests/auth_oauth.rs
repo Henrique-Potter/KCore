@@ -317,6 +317,60 @@ async fn fresh_auths_refreshes_malformed_unexpired_access_token() {
 }
 
 #[tokio::test]
+async fn fresh_auths_serializes_concurrent_openai_refreshes() {
+    let root = unique_root();
+    let server = provider_server(json!({
+        "access_token": jwt(r#"{"exp":4102444800,"chatgpt_account_id":"acct_new"}"#),
+        "refresh_token": "new-refresh",
+        "expires_in": 3600
+    }))
+    .await;
+    let st = state_at_with(
+        Some(store(&root)),
+        "127.0.0.1:0".parse().unwrap(),
+        server.url.clone(),
+    );
+    st.store
+        .set_provider_auth(
+            "openai",
+            json!({
+                "type": "oauth",
+                "access": "not-a-jwt",
+                "refresh": "old-refresh",
+                "expires": unix_millis() + 3_600_000,
+                "accountId": "acct_old"
+            }),
+        )
+        .unwrap();
+
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let left_state = st.clone();
+    let right_state = st.clone();
+    let left_cancel = cancel.clone();
+    let right_cancel = cancel.clone();
+    let (left, right) = tokio::join!(
+        async move { fresh_auths(&left_state, &left_cancel).await },
+        async move { fresh_auths(&right_state, &right_cancel).await },
+    );
+
+    let left = left.expect("left refresh");
+    let right = right.expect("right refresh");
+    assert_eq!(left["openai"]["refresh"], "new-refresh");
+    assert_eq!(right["openai"]["refresh"], "new-refresh");
+    assert_eq!(
+        st.store.provider_auth("openai").unwrap()["refresh"],
+        "new-refresh"
+    );
+    assert!(server
+        .body
+        .lock()
+        .unwrap()
+        .contains("refresh_token=old-refresh"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn fresh_auths_aborts_promptly_when_cancel_fires_during_token_request() {
     // Fix C2: the token endpoint POST in `refresh_access` previously had
     // no cancel race and no timeout. This test stands up a TCP listener

@@ -118,6 +118,19 @@ pub(crate) async fn fresh_auths(state: &AppState, cancel: &AtomicBool) -> Result
     if !oauth_access_stale(auth) {
         return Ok(json!(auths));
     }
+
+    let _guard = state.oauth_refresh.lock().await;
+    auths = state.store.provider_auths();
+    let Some(auth) = auths.get("openai") else {
+        return Ok(json!(auths));
+    };
+    if auth.get("type").and_then(Value::as_str) != Some("oauth") {
+        return Ok(json!(auths));
+    }
+    if !oauth_access_stale(auth) {
+        return Ok(json!(auths));
+    }
+
     let refresh = auth
         .get("refresh")
         .and_then(Value::as_str)

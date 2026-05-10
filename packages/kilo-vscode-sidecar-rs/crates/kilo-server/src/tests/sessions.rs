@@ -464,7 +464,7 @@ async fn revert_restores_pre_turn_snapshot_and_unrevert_restores_redo_snapshot()
     let repo = root.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join("a.txt"), "before\n").unwrap();
-    let snapshot = match crate::snapshot::track(&state.store, &session.project_id) {
+    let snapshot = match crate::snapshot::track(&state.store, &session.project_id, &session.id) {
         Ok(snapshot) => snapshot,
         Err(_) => {
             let _ = std::fs::remove_dir_all(root);
@@ -543,7 +543,7 @@ async fn revert_populates_summary_from_diff_full() {
     let repo = root.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join("a.txt"), "alpha\nbravo\ncharlie\n").unwrap();
-    let snapshot = match crate::snapshot::track(&state.store, &session.project_id) {
+    let snapshot = match crate::snapshot::track(&state.store, &session.project_id, &session.id) {
         Ok(snapshot) => snapshot,
         Err(_) => {
             // Skip on hosts without git (matches existing snapshot test pattern).
@@ -622,7 +622,7 @@ async fn delete_session_triggers_snapshot_cleanup() {
     let repo = root.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join("a.txt"), "x\n").unwrap();
-    if crate::snapshot::track(&state.store, &session.project_id).is_err() {
+    if crate::snapshot::track(&state.store, &session.project_id, &session.id).is_err() {
         // Host without git — wiring still verified by the cargo build.
         let _ = std::fs::remove_dir_all(root);
         return;
@@ -694,7 +694,7 @@ async fn revert_target_after_snapshot_uses_transcript_order_not_message_id_order
     let repo = root.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join("a.txt"), "before\n").unwrap();
-    let snapshot = match crate::snapshot::track(&state.store, &session.project_id) {
+    let snapshot = match crate::snapshot::track(&state.store, &session.project_id, &session.id) {
         Ok(snapshot) => snapshot,
         Err(_) => {
             let _ = std::fs::remove_dir_all(root);
@@ -779,6 +779,65 @@ async fn delete_session_cleans_prompt_queue_state() {
         .lock()
         .unwrap()
         .contains_key(&session.id));
+}
+
+/// `delete_session` must also clear any pending broken-turn anchor
+/// for the session — the `prompt_queues`/`prompt_queue_versions`
+/// cleanup pattern but extended to `broken_turn_anchors` so a
+/// recreated session id can't observe a stale follow-up parent.
+#[tokio::test]
+async fn delete_session_clears_broken_turn_anchor() {
+    let state = state();
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("create session");
+
+    state.set_broken_turn_anchor(&session.id, "msg_parent");
+    assert!(state
+        .broken_turn_anchors
+        .lock()
+        .unwrap()
+        .contains_key(&session.id));
+
+    let res = delete_session(State(state.clone()), Path(session.id.clone())).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    assert!(!state
+        .broken_turn_anchors
+        .lock()
+        .unwrap()
+        .contains_key(&session.id));
+}
+
+/// `delete_session` must drop every `network` wait belonging to the
+/// session, so a follow-up `/network` poll doesn't surface waits
+/// whose owning session no longer exists. Companion of
+/// `delete_session_clears_broken_turn_anchor`.
+#[tokio::test]
+async fn delete_session_clears_network_waits() {
+    let state = state();
+    let session = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("create session");
+    let other = state
+        .store
+        .create_session(SessionCreateInput::default())
+        .expect("create other");
+
+    let _ = state.add_network_wait(&session.id, "Connection refused");
+    let _ = state.add_network_wait(&other.id, "DNS lookup failed");
+    assert!(state.has_network_wait_for_session(&session.id));
+    assert!(state.has_network_wait_for_session(&other.id));
+
+    let res = delete_session(State(state.clone()), Path(session.id.clone())).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // The deleted session's wait is gone…
+    assert!(!state.has_network_wait_for_session(&session.id));
+    // …but the unrelated session's wait survives.
+    assert!(state.has_network_wait_for_session(&other.id));
 }
 
 #[tokio::test]
