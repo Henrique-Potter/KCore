@@ -10,7 +10,14 @@ import {
 } from "../constants"
 import { getDefaultModelId, getModelQueryPrefix } from "../model-registry"
 import { withValidationErrorHandling, type HttpError, formatEmbeddingError } from "../shared/validation-helpers"
-import { Mutex } from "async-mutex"
+import { applyQueryPrefix, embedBatches } from "../shared/embedder-helpers"
+import {
+  createRateLimitState,
+  getRateLimitDelay,
+  projectEmbeddingResponse,
+  updateRateLimitState,
+  waitForRateLimit,
+} from "../shared/openai-compatible-helpers"
 import { DEFAULT_HEADERS } from "../../headers"
 import { Log } from "../../util/log"
 
@@ -25,7 +32,8 @@ interface EmbeddingItem {
 }
 
 interface OpenRouterEmbeddingResponse {
-  data: EmbeddingItem[]
+  data?: EmbeddingItem[]
+  error?: string | { code?: string | number; message?: string }
   usage?: {
     prompt_tokens?: number
     total_tokens?: number
@@ -47,14 +55,7 @@ export class OpenRouterEmbedder implements IEmbedder {
   private readonly dimensions?: number
 
   // Global rate limiting state shared across all instances
-  private static globalRateLimitState = {
-    isRateLimited: false,
-    rateLimitResetTime: 0,
-    consecutiveRateLimitErrors: 0,
-    lastRateLimitError: 0,
-    // Mutex to ensure thread-safe access to rate limit state
-    mutex: new Mutex(),
-  }
+  private static globalRateLimitState = createRateLimitState()
 
   /**
    * Creates a new OpenRouter embedder
@@ -105,73 +106,21 @@ export class OpenRouterEmbedder implements IEmbedder {
     const modelToUse = model || this.defaultModelId
 
     // Apply model-specific query prefix if required
-    const queryPrefix = getModelQueryPrefix("openrouter", modelToUse)
-    const processedTexts = queryPrefix
-      ? texts.map((text, index) => {
-          // Prevent double-prefixing
-          if (text.startsWith(queryPrefix)) {
-            return text
-          }
-          const prefixedText = `${queryPrefix}${text}`
-          const estimatedTokens = Math.ceil(prefixedText.length / 4)
-          if (estimatedTokens > MAX_ITEM_TOKENS) {
-            log.warn(`Text at index ${index} with prefix exceeds token limit (${estimatedTokens} > ${MAX_ITEM_TOKENS})`)
-            // Return original text if adding prefix would exceed limit
-            return text
-          }
-          return prefixedText
-        })
-      : texts
+    const processedTexts = applyQueryPrefix(
+      texts,
+      getModelQueryPrefix("openrouter", modelToUse),
+      MAX_ITEM_TOKENS,
+      (index, tokens) =>
+        log.warn(`Text at index ${index} with prefix exceeds token limit (${tokens} > ${MAX_ITEM_TOKENS})`),
+    )
 
-    const allEmbeddings: number[][] = []
-    const usage = { promptTokens: 0, totalTokens: 0 }
-    const remainingTexts = [...processedTexts]
-
-    while (remainingTexts.length > 0) {
-      const currentBatch: string[] = []
-      let currentBatchTokens = 0
-      const processedIndices: number[] = []
-
-      for (let i = 0; i < remainingTexts.length; i++) {
-        const text = remainingTexts[i]
-        if (text === undefined) {
-          continue
-        }
-        const itemTokens = Math.ceil(text.length / 4)
-
-        if (itemTokens > this.maxItemTokens) {
-          log.warn(`Text at index ${i} exceeds token limit (${itemTokens} > ${this.maxItemTokens})`)
-          processedIndices.push(i)
-          continue
-        }
-
-        if (currentBatchTokens + itemTokens <= MAX_BATCH_TOKENS) {
-          currentBatch.push(text)
-          currentBatchTokens += itemTokens
-          processedIndices.push(i)
-        } else {
-          break
-        }
-      }
-
-      // Remove processed items from remainingTexts (in reverse order to maintain correct indices)
-      for (let i = processedIndices.length - 1; i >= 0; i--) {
-        const idx = processedIndices[i]
-        if (idx === undefined) {
-          continue
-        }
-        remainingTexts.splice(idx, 1)
-      }
-
-      if (currentBatch.length > 0) {
-        const batchResult = await this._embedBatchWithRetries(currentBatch, modelToUse)
-        allEmbeddings.push(...batchResult.embeddings)
-        usage.promptTokens += batchResult.usage.promptTokens
-        usage.totalTokens += batchResult.usage.totalTokens
-      }
-    }
-
-    return { embeddings: allEmbeddings, usage }
+    return embedBatches(
+      processedTexts,
+      this.maxItemTokens,
+      MAX_BATCH_TOKENS,
+      (batch) => this._embedBatchWithRetries(batch, modelToUse),
+      (index, tokens) => log.warn(`Text at index ${index} exceeds token limit (${tokens} > ${this.maxItemTokens})`),
+    )
   }
 
   /**
@@ -193,10 +142,7 @@ export class OpenRouterEmbedder implements IEmbedder {
         const requestParams: any = {
           input: batchTexts,
           model: model,
-          // OpenAI package (as of v4.78.1) has a parsing issue that truncates embedding dimensions to 256
-          // when processing numeric arrays, which breaks compatibility with models using larger dimensions.
-          // By requesting base64 encoding, we bypass the package's parser and handle decoding ourselves.
-          encoding_format: "base64",
+          encoding_format: "float",
         }
 
         if (this.dimensions !== undefined) {
@@ -213,35 +159,24 @@ export class OpenRouterEmbedder implements IEmbedder {
         }
 
         const response = (await this.embeddingsClient.embeddings.create(requestParams)) as OpenRouterEmbeddingResponse
-
-        // Convert base64 embeddings to float32 arrays
-        const processedEmbeddings = response.data.map((item: EmbeddingItem) => {
-          if (typeof item.embedding === "string") {
-            const buffer = Buffer.from(item.embedding, "base64")
-
-            // Create Float32Array view over the buffer
-            const float32Array = new Float32Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 4)
-
-            return {
-              ...item,
-              embedding: Array.from(float32Array),
-            }
-          }
-          return item
-        })
-
-        // Replace the original data with processed embeddings
-        response.data = processedEmbeddings
-
-        const embeddings = response.data.map((item) => item.embedding as number[])
-
-        return {
-          embeddings: embeddings,
-          usage: {
-            promptTokens: response.usage?.prompt_tokens || 0,
-            totalTokens: response.usage?.total_tokens || 0,
-          },
+        const err = response.error
+        const msg = typeof err === "string" ? err : err?.message
+        const code = typeof err === "object" && err ? err.code : undefined
+        if (!response.data || response.data.length === 0) {
+          log.warn("OpenRouter embedder batch returned invalid response", {
+            location: "OpenRouterEmbedder:_embedBatchWithRetries",
+            model,
+            dimensions: this.dimensions,
+            provider: this.specificProvider,
+            code,
+            err: msg,
+          })
+          const invalid = new Error(msg ?? "Invalid response from OpenRouter embedding endpoint") as HttpError
+          invalid.status = typeof code === "number" ? code : 422
+          throw invalid
         }
+
+        return projectEmbeddingResponse({ data: response.data, usage: response.usage })
       } catch (error) {
         log.error("OpenRouter embedder batch error", {
           err: error instanceof Error ? error.message : String(error),
@@ -292,7 +227,7 @@ export class OpenRouterEmbedder implements IEmbedder {
         const requestParams: any = {
           input: testTexts,
           model: modelToUse,
-          encoding_format: "base64",
+          encoding_format: "float",
         }
 
         if (this.dimensions !== undefined) {
@@ -315,6 +250,18 @@ export class OpenRouterEmbedder implements IEmbedder {
 
         // Check if we got a valid response
         if (!response?.data || response.data.length === 0) {
+          const err = response?.error
+          const msg = typeof err === "string" ? err : err?.message
+          const code = typeof err === "object" && err ? err.code : undefined
+          log.warn("OpenRouter embedder validation returned invalid response", {
+            location: "OpenRouterEmbedder:validateConfiguration",
+            model: modelToUse,
+            dimensions: this.dimensions,
+            provider: this.specificProvider,
+            dataCount: response?.data?.length ?? 0,
+            code,
+            err: msg,
+          })
           return {
             valid: false,
             error: "Invalid response from OpenRouter embedding endpoint",
@@ -345,83 +292,20 @@ export class OpenRouterEmbedder implements IEmbedder {
    * Waits if there's an active global rate limit
    */
   private async waitForGlobalRateLimit(): Promise<void> {
-    const release = await OpenRouterEmbedder.globalRateLimitState.mutex.acquire()
-    let mutexReleased = false
-
-    try {
-      const state = OpenRouterEmbedder.globalRateLimitState
-
-      if (state.isRateLimited && state.rateLimitResetTime > Date.now()) {
-        const waitTime = state.rateLimitResetTime - Date.now()
-        // Silent wait - no logging to prevent flooding
-        release()
-        mutexReleased = true
-        await new Promise((resolve) => setTimeout(resolve, waitTime))
-        return
-      }
-
-      // Reset rate limit if time has passed
-      if (state.isRateLimited && state.rateLimitResetTime <= Date.now()) {
-        state.isRateLimited = false
-        state.consecutiveRateLimitErrors = 0
-      }
-    } finally {
-      // Only release if we haven't already
-      if (!mutexReleased) {
-        release()
-      }
-    }
+    return waitForRateLimit(OpenRouterEmbedder.globalRateLimitState)
   }
 
   /**
    * Updates global rate limit state when a 429 error occurs
    */
-  private async updateGlobalRateLimitState(error: HttpError): Promise<void> {
-    const release = await OpenRouterEmbedder.globalRateLimitState.mutex.acquire()
-    try {
-      const state = OpenRouterEmbedder.globalRateLimitState
-      const now = Date.now()
-
-      // Increment consecutive rate limit errors
-      if (now - state.lastRateLimitError < 60000) {
-        // Within 1 minute
-        state.consecutiveRateLimitErrors++
-      } else {
-        state.consecutiveRateLimitErrors = 1
-      }
-
-      state.lastRateLimitError = now
-
-      // Calculate exponential backoff based on consecutive errors
-      const baseDelay = 5000 // 5 seconds base
-      const maxDelay = 300000 // 5 minutes max
-      const exponentialDelay = Math.min(baseDelay * Math.pow(2, state.consecutiveRateLimitErrors - 1), maxDelay)
-
-      // Set global rate limit
-      state.isRateLimited = true
-      state.rateLimitResetTime = now + exponentialDelay
-
-      // Silent rate limit activation - no logging to prevent flooding
-    } finally {
-      release()
-    }
+  private async updateGlobalRateLimitState(_error: HttpError): Promise<void> {
+    return updateRateLimitState(OpenRouterEmbedder.globalRateLimitState)
   }
 
   /**
    * Gets the current global rate limit delay
    */
   private async getGlobalRateLimitDelay(): Promise<number> {
-    const release = await OpenRouterEmbedder.globalRateLimitState.mutex.acquire()
-    try {
-      const state = OpenRouterEmbedder.globalRateLimitState
-
-      if (state.isRateLimited && state.rateLimitResetTime > Date.now()) {
-        return state.rateLimitResetTime - Date.now()
-      }
-
-      return 0
-    } finally {
-      release()
-    }
+    return getRateLimitDelay(OpenRouterEmbedder.globalRateLimitState)
   }
 }

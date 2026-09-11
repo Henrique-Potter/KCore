@@ -1,3 +1,4 @@
+import { release } from "node:os"
 import { Client } from "./client.js"
 import { Identity } from "./identity.js"
 import { TelemetryEvent } from "./events.js"
@@ -6,9 +7,14 @@ export interface TelemetryProperties {
   appName: string
   appVersion: string
   platform: string
+  os_name: string
+  os_version: string
+  os_arch: string
   editorName?: string
   vscodeVersion?: string
 }
+
+export type ReviewCommand = "review"
 
 export interface IndexingTelemetryProperties extends Record<string, unknown> {
   source: "scan" | "watcher"
@@ -56,6 +62,9 @@ export namespace Telemetry {
     appName: "kilo-cli",
     appVersion: "unknown",
     platform: process.platform,
+    os_name: process.platform,
+    os_version: release(),
+    os_arch: process.arch,
   }
 
   export async function init(options: { dataPath: string; version: string; enabled: boolean }): Promise<void> {
@@ -96,6 +105,8 @@ export namespace Telemetry {
   }
 
   export async function updateIdentity(token: string | null, accountId?: string): Promise<void> {
+    if (!isEnabled()) return
+
     const previousId = Identity.getDistinctId()
     await Identity.updateFromKiloAuth(token, accountId)
 
@@ -107,6 +118,9 @@ export namespace Telemetry {
         appName: props.appName,
         appVersion: props.appVersion,
         platform: props.platform,
+        os_name: props.os_name,
+        os_version: props.os_version,
+        os_arch: props.os_arch,
       })
 
       // Link the anonymous machineId to the authenticated email
@@ -121,6 +135,12 @@ export namespace Telemetry {
   // CLI Lifecycle
   export function trackCliStart() {
     track(TelemetryEvent.CLI_START)
+  }
+
+  // Upload queued events without blocking. Call after bootstrap so the flush
+  // overlaps with command execution and shutdown() stays fast (#10242).
+  export function flushInBackground() {
+    Client.flushInBackground()
   }
 
   export function trackCliExit(exitCode?: number) {
@@ -156,7 +176,8 @@ export namespace Telemetry {
     taskId?: string
     mode?: "review"
     feature?: "code_reviews"
-    command?: "local-review" | "local-review-uncommitted"
+    command?: ReviewCommand
+    tool?: "suggest"
     apiProvider: string
     modelId: string
     inputTokens?: number
@@ -183,8 +204,33 @@ export namespace Telemetry {
     track(TelemetryEvent.AGENT_USED, { agent, sessionId })
   }
 
-  export function trackPlanFollowup(sessionId: string, choice: "new_session" | "continue" | "custom" | "dismissed") {
+  export function trackPlanFollowup(
+    sessionId: string,
+    choice: "new_session" | "continue" | "keep_refining" | "custom" | "dismissed",
+  ) {
     track(TelemetryEvent.PLAN_FOLLOWUP, { sessionId, choice })
+  }
+
+  export function trackSuggestionAccepted(properties: {
+    sessionId: string
+    requestId: string
+    index: number
+    tool: "suggest"
+    command: ReviewCommand
+    actionCount?: number
+  }) {
+    track(TelemetryEvent.SUGGESTION_ACCEPTED, properties)
+  }
+
+  export function trackSuggestionShown(properties: {
+    sessionId: string
+    requestId: string
+    index: number
+    tool: "suggest"
+    command: ReviewCommand
+    actionCount?: number
+  }) {
+    track(TelemetryEvent.SUGGESTION_SHOWN, properties)
   }
 
   export function trackIndexingStarted(properties: IndexingTelemetryProperties) {
@@ -260,7 +306,7 @@ export namespace Telemetry {
     track(TelemetryEvent.FEEDBACK_SUBMITTED, props)
   }
 
-  export async function shutdown(): Promise<void> {
-    await Client.shutdown()
+  export async function shutdown(timeoutMs?: number): Promise<void> {
+    await Client.shutdown(timeoutMs)
   }
 }

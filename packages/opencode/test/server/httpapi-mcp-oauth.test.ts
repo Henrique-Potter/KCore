@@ -27,16 +27,15 @@ const testMcpHandlers = HttpApiBuilder.group(TestHttpApi, "mcp", (handlers) =>
       .handle("authAuthenticate", () => Effect.die("unexpected MCP authAuthenticate"))
       .handle("authRemove", () => Effect.die("unexpected MCP authRemove"))
       .handle("connect", () => Effect.die("unexpected MCP connect"))
-      .handle("disconnect", () => Effect.die("unexpected MCP disconnect")),
+      .handle("disconnect", () => Effect.die("unexpected MCP disconnect")) // kilocode_change
+      .handle("readResource", () => Effect.die("unexpected MCP readResource")) // kilocode_change
+      .handle("callTool", () => Effect.die("unexpected MCP callTool")), // kilocode_change
   ),
 )
 
 const passthroughAuthorization = Layer.succeed(
   Authorization,
-  Authorization.of({
-    basic: (effect) => effect,
-    authToken: (effect) => effect,
-  }),
+  Authorization.of((effect) => effect),
 )
 
 const passthroughInstanceContext = Layer.succeed(

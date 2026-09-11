@@ -1,18 +1,30 @@
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Permission } from "@/permission"
-import { PermissionID } from "@/permission/schema"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
+import { PermissionNotFoundError } from "../errors"
 import { Authorization } from "../middleware/authorization"
 import { InstanceContextMiddleware } from "../middleware/instance-context"
-import { WorkspaceRoutingMiddleware } from "../middleware/workspace-routing"
+import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
 import { described } from "./metadata"
 
 const root = "/permission"
+const ReplyPayload = Schema.Struct({
+  reply: PermissionV1.Reply,
+  message: Schema.optional(Schema.String),
+  interactive: Schema.optional(Schema.Boolean), // kilocode_change - human-answered flag; gates skill-shell approvals
+})
 
 // kilocode_change start
 export const SaveAlwaysRulesBody = Schema.Struct({
   approvedAlways: Schema.Array(Schema.String).pipe(Schema.optional),
   deniedAlways: Schema.Array(Schema.String).pipe(Schema.optional),
+})
+
+export const AllowEverythingBody = Schema.Struct({
+  enable: Schema.Boolean,
+  requestID: Schema.optional(Schema.String),
+  sessionID: Schema.optional(Schema.String),
 })
 // kilocode_change end
 
@@ -21,7 +33,8 @@ export const PermissionApi = HttpApi.make("permission")
     HttpApiGroup.make("permission")
       .add(
         HttpApiEndpoint.get("list", root, {
-          success: described(Schema.Array(Permission.Request), "List of pending permissions"),
+          query: WorkspaceRoutingQuery,
+          success: described(Schema.Array(PermissionV1.Request), "List of pending permissions"),
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "permission.list",
@@ -30,10 +43,11 @@ export const PermissionApi = HttpApi.make("permission")
           }),
         ),
         HttpApiEndpoint.post("reply", `${root}/:requestID/reply`, {
-          params: { requestID: PermissionID },
-          payload: Permission.ReplyBody,
+          params: { requestID: PermissionV1.ID },
+          query: WorkspaceRoutingQuery,
+          payload: ReplyPayload,
           success: described(Schema.Boolean, "Permission processed successfully"),
-          error: [HttpApiError.BadRequest, HttpApiError.NotFound],
+          error: [HttpApiError.BadRequest, PermissionNotFoundError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "permission.reply",
@@ -43,15 +57,28 @@ export const PermissionApi = HttpApi.make("permission")
         ),
         // kilocode_change start
         HttpApiEndpoint.post("saveAlwaysRules", `${root}/:requestID/always-rules`, {
-          params: { requestID: PermissionID },
+          params: { requestID: PermissionV1.ID },
+          query: WorkspaceRoutingQuery,
           payload: SaveAlwaysRulesBody,
           success: described(Schema.Boolean, "Always-rules saved"),
-          error: [HttpApiError.NotFound],
+          error: [PermissionNotFoundError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "permission.saveAlwaysRules",
             summary: "Save always-allow/deny permission rules",
             description: "Save approved/denied always-rules for a pending permission request.",
+          }),
+        ),
+        HttpApiEndpoint.post("allowEverything", `${root}/allow-everything`, {
+          query: WorkspaceRoutingQuery,
+          payload: AllowEverythingBody,
+          success: described(Schema.Boolean, "Success"),
+          error: [HttpApiError.BadRequest, PermissionNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "permission.allowEverything",
+            summary: "Allow everything",
+            description: "Enable or disable allowing all permissions without prompts.",
           }),
         ),
         // kilocode_change end

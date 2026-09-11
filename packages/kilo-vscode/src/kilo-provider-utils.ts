@@ -1,10 +1,20 @@
 import type { Session, Agent, Event, ProviderListResponse } from "@kilocode/sdk/v2/client"
+import type { SyncPayload } from "./services/cli-backend/sdk-sse-adapter"
 import { prettifyError } from "zod/v4"
 import type { CloudSessionMessage, IndexingStatus } from "./services/cli-backend/types"
 import type { PartBatch, PartUpdate } from "./kilo-provider/session-stream-scheduler"
 import type { PartRemove } from "./shared/stream-messages"
+import * as path from "path"
 
 export { SessionStreamScheduler } from "./kilo-provider/session-stream-scheduler"
+
+type SyncEventMessageUpdated = Extract<SyncPayload, { name: "message.updated.1" }>
+type SyncEventMessageRemoved = Extract<SyncPayload, { name: "message.removed.1" }>
+type SyncEventMessagePartUpdated = Extract<SyncPayload, { name: "message.part.updated.1" }>
+type SyncEventMessagePartRemoved = Extract<SyncPayload, { name: "message.part.removed.1" }>
+type SyncEventSessionCreated = Extract<SyncPayload, { name: "session.created.1" }>
+type SyncEventSessionUpdated = Extract<SyncPayload, { name: "session.updated.1" }>
+type SyncEventSessionDeleted = Extract<SyncPayload, { name: "session.deleted.1" }>
 
 /** A single provider entry as returned by the /provider list endpoint. */
 export type ProviderInfo = ProviderListResponse["all"][number]
@@ -184,7 +194,10 @@ export async function runWithMessageConfirmation<T>(
   }
 }
 
-export function sessionToWebview(session: Session) {
+export function sessionToWebview(
+  session: Pick<Session, "id" | "parentID" | "title" | "time" | "summary" | "revert" | "metadata">,
+) {
+  const goal = session.metadata?.["kilo.goal"]
   return {
     id: session.id,
     parentID: session.parentID ?? null,
@@ -196,6 +209,26 @@ export function sessionToWebview(session: Session) {
     // SolidJS store merge never clears the existing revert state.
     revert: session.revert ?? null,
     summary: session.summary ?? null,
+    goal:
+      goal &&
+      typeof goal === "object" &&
+      "text" in goal &&
+      typeof goal.text === "string" &&
+      "active" in goal &&
+      typeof goal.active === "boolean"
+        ? {
+            text: goal.text,
+            active: goal.active,
+            ...("status" in goal &&
+            (goal.status === "active" ||
+              goal.status === "complete" ||
+              goal.status === "blocked" ||
+              goal.status === "paused")
+              ? { status: goal.status }
+              : {}),
+            ...("reason" in goal && typeof goal.reason === "string" ? { reason: goal.reason } : {}),
+          }
+        : null,
   }
 }
 
@@ -222,7 +255,9 @@ export interface SessionRefreshContext {
   connectionState: "connecting" | "connected" | "disconnected" | "error"
   listSessions: ((dir: string) => Promise<Session[]>) | null
   sessionDirectories: Map<string, string>
+  worktreeDirectories?: () => string[]
   workspaceDirectory: string
+  isCurrent?: () => boolean
   postMessage(message: unknown): void
 }
 
@@ -245,7 +280,7 @@ export async function loadSessions(ctx: SessionRefreshContext): Promise<string |
 
   const sessions = await list(ctx.workspaceDirectory)
   const projectID = sessions[0]?.projectID
-  const worktreeDirs = new Set(ctx.sessionDirectories.values())
+  const worktreeDirs = new Set(ctx.worktreeDirectories ? ctx.worktreeDirectories() : ctx.sessionDirectories.values())
   const failed = new Set<string>()
   const extra = await Promise.all(
     [...worktreeDirs].map((dir) =>
@@ -264,6 +299,8 @@ export async function loadSessions(ctx: SessionRefreshContext): Promise<string |
       seen.add(s.id)
     }
   }
+
+  if (ctx.isCurrent && !ctx.isCurrent()) return
 
   // Sessions whose worktree directories failed to list — the webview must
   // not delete these during reconciliation since the absence is transient.
@@ -339,6 +376,7 @@ export function resolveNewSessionDirectory(input: {
   currentSessionID?: string
   contextSessionID?: string
   agentManagerContext?: string
+  contextDirectory?: string
   sessionDirectories: Map<string, string>
   workspaceDirectory: string
 }) {
@@ -350,6 +388,8 @@ export function resolveNewSessionDirectory(input: {
     })
   }
 
+  if (input.contextDirectory) return input.contextDirectory
+
   return resolveContextDirectory({
     currentSessionID: input.currentSessionID,
     contextSessionID: input.contextSessionID,
@@ -358,6 +398,28 @@ export function resolveNewSessionDirectory(input: {
     forceWorkspaceRoot: input.agentManagerContext === "local",
   })
 }
+
+export function sameDirectory(a: string, b: string): boolean {
+  if (!a || !b) return false
+
+  const left = path.resolve(a)
+  const right = path.resolve(b)
+  if (path.relative(left, right) === "") return true
+
+  if (process.platform !== "win32") return false
+  return path.relative(left.toLowerCase(), right.toLowerCase()) === ""
+}
+
+type SyncEvent =
+  | SyncEventMessageUpdated
+  | SyncEventMessageRemoved
+  | SyncEventMessagePartUpdated
+  | SyncEventMessagePartRemoved
+  | SyncEventSessionCreated
+  | SyncEventSessionUpdated
+  | SyncEventSessionDeleted
+
+type StreamEvent = Event | SyncEvent
 
 export type WebviewMessage =
   | PartUpdate
@@ -372,6 +434,13 @@ export type WebviewMessage =
       message: Record<string, unknown>
     }
   | { type: "sessionStatus"; sessionID: string; status: string; attempt?: number; message?: string; next?: number }
+  | {
+      type: "sessionTurnClosed"
+      sessionID: string
+      eventID: string
+      reason: "completed" | "error" | "interrupted" | "superseded"
+      parentID?: string
+    }
   | {
       type: "permissionRequest"
       permission: {
@@ -408,84 +477,102 @@ export type WebviewMessage =
   | { type: "permissionError"; permissionID: string; stale?: boolean }
   | { type: "sessionCreated"; session: ReturnType<typeof sessionToWebview>; draftID?: string }
   | { type: "sessionUpdated"; session: ReturnType<typeof sessionToWebview> }
+  | { type: "sessionDeleted"; sessionID: string }
   | { type: "messageRemoved"; sessionID: string; messageID: string }
-  | { type: "sessionError"; sessionID?: string; error?: unknown }
+  | { type: "sessionError"; eventID: string; sessionID?: string; error?: unknown }
+  | {
+      type: "sandboxStatus"
+      sessionID: string
+      directory: string
+      enabled: boolean
+      available: boolean
+      reason?: string
+      version: number
+    }
   | null
 
-type PartEvent = Extract<Event, { type: "message.part.updated" | "message.part.delta" | "message.part.removed" }>
+type PartEvent =
+  | Extract<Event, { type: "message.part.delta" }>
+  | SyncEventMessagePartUpdated
+  | SyncEventMessagePartRemoved
 
 function mapPartEvent(event: PartEvent, sessionID: string | undefined): WebviewMessage {
+  if (event.type === "sync") {
+    if (event.name === "message.part.updated.1") {
+      const part = event.data.part
+      return {
+        type: "partUpdated",
+        sessionID: event.data.sessionID,
+        messageID: part.messageID,
+        part,
+      }
+    }
+    return {
+      type: "partRemoved",
+      sessionID: event.data.sessionID,
+      messageID: event.data.messageID,
+      partID: event.data.partID,
+    }
+  }
   if (!sessionID) return null
-  if (event.type === "message.part.updated") {
-    const part = event.properties.part as { messageID?: string; sessionID?: string }
-    return {
-      type: "partUpdated",
-      sessionID,
-      messageID: part.messageID || "",
-      part: event.properties.part,
-    }
-  }
-  if (event.type === "message.part.delta") {
-    const props = event.properties
-    return {
-      type: "partUpdated",
-      sessionID: props.sessionID,
-      messageID: props.messageID,
-      part: { id: props.partID, type: "text", messageID: props.messageID, text: props.delta },
-      delta: { type: "text-delta", textDelta: props.delta },
-    }
-  }
   const props = event.properties
   return {
-    type: "partRemoved",
+    type: "partUpdated",
     sessionID: props.sessionID,
     messageID: props.messageID,
-    partID: props.partID,
+    part: { id: props.partID, type: "text", messageID: props.messageID, text: props.delta },
+    delta: { type: "text-delta", textDelta: props.delta },
   }
 }
 
-export function mapSSEEventToWebviewMessage(event: Event, sessionID: string | undefined): WebviewMessage {
-  if (
-    event.type === "message.part.updated" ||
-    event.type === "message.part.delta" ||
-    event.type === "message.part.removed"
-  ) {
-    return mapPartEvent(event, sessionID)
+function statusExtra(info: Extract<Event, { type: "session.status" }>["properties"]["status"]) {
+  if (info.type === "retry") return { attempt: info.attempt, message: info.message, next: info.next }
+  if (info.type === "offline") return { message: info.message }
+  return {}
+}
+
+export function mapSSEEventToWebviewMessage(event: StreamEvent, sessionID: string | undefined): WebviewMessage {
+  if (event.type === "sync") {
+    switch (event.name) {
+      case "message.updated.1": {
+        const info = event.data.info
+        return {
+          type: "messageCreated",
+          message: {
+            ...info,
+            createdAt: new Date(info.time.created).toISOString(),
+          },
+        }
+      }
+      case "message.removed.1":
+        return {
+          type: "messageRemoved",
+          sessionID: event.data.sessionID,
+          messageID: event.data.messageID,
+        }
+      case "message.part.updated.1":
+      case "message.part.removed.1":
+        return mapPartEvent(event, sessionID)
+      case "session.created.1":
+        return {
+          type: "sessionCreated",
+          session: sessionToWebview(event.data.info),
+        }
+      case "session.updated.1":
+        return null
+      case "session.deleted.1":
+        return {
+          type: "sessionDeleted",
+          sessionID: event.data.sessionID,
+        }
+    }
   }
+  if (event.type === "message.part.delta") return mapPartEvent(event, sessionID)
   switch (event.type) {
-    case "message.updated": {
-      const info = event.properties.info
-      return {
-        type: "messageCreated",
-        message: {
-          ...info,
-          createdAt: new Date(info.time.created).toISOString(),
-        },
-      }
-    }
-    case "message.removed": {
-      const props = event.properties as { sessionID: string; messageID: string }
-      return {
-        type: "messageRemoved",
-        sessionID: props.sessionID,
-        messageID: props.messageID,
-      }
-    }
     case "session.status": {
       const info = event.properties.status
-      // "offline" is not yet in the SDK SessionStatus type (pending SDK regeneration),
-      // so we use string comparison to forward the message field for offline status.
-      const status = info.type as string
-      const extra =
-        status === "retry"
-          ? {
-              attempt: (info as any).attempt as number,
-              message: (info as any).message as string,
-              next: (info as any).next as number,
-            }
-          : status === "offline"
-            ? { message: (info as any).message as string }
-            : {}
+      const status = info.type
+      const extra = statusExtra(info)
       return {
         type: "sessionStatus" as const,
         sessionID: event.properties.sessionID,
@@ -493,6 +580,14 @@ export function mapSSEEventToWebviewMessage(event: Event, sessionID: string | un
         ...extra,
       }
     }
+    case "session.turn.close":
+      return {
+        type: "sessionTurnClosed",
+        sessionID: event.properties.sessionID,
+        eventID: event.id,
+        reason: event.properties.reason,
+        ...(event.properties.parentID ? { parentID: event.properties.parentID } : {}),
+      }
     case "permission.asked":
       return {
         type: "permissionRequest",
@@ -556,19 +651,20 @@ export function mapSSEEventToWebviewMessage(event: Event, sessionID: string | un
     case "session.error": {
       return {
         type: "sessionError",
+        eventID: event.id,
         sessionID: event.properties.sessionID,
         error: event.properties.error,
       }
     }
-    case "session.created":
+    case "sandbox.status.changed":
       return {
-        type: "sessionCreated",
-        session: sessionToWebview(event.properties.info),
-      }
-    case "session.updated":
-      return {
-        type: "sessionUpdated",
-        session: sessionToWebview(event.properties.info),
+        type: "sandboxStatus",
+        sessionID: event.properties.sessionID,
+        directory: event.properties.directory,
+        enabled: event.properties.enabled,
+        available: event.properties.available,
+        reason: event.properties.reason,
+        version: event.properties.version,
       }
     case "indexing.status":
       return {
@@ -600,37 +696,15 @@ export function mapCloudSessionMessageToWebviewMessage(message: CloudSessionMess
  * Returns true when the event carries a projectID that does not match the expected one.
  * When expectedProjectID is undefined (not yet resolved), nothing is filtered.
  */
-export function isEventFromForeignProject(event: Event, expectedProjectID: string | undefined): boolean {
-  if (!expectedProjectID) return false
-  if (event.type === "session.created" || event.type === "session.updated") {
-    return event.properties.info.projectID !== expectedProjectID
+export function isEventFromForeignProject(
+  event: StreamEvent | SyncPayload,
+  expectedProjectID: string | undefined,
+): boolean {
+  if (!expectedProjectID || event.type !== "sync") return false
+  if (event.name === "session.created.1" || event.name === "session.deleted.1") {
+    return event.data.info.projectID !== expectedProjectID
   }
-  return false
-}
-
-/**
- * Merge open-tab paths with backend file search results for the @ mention dropdown.
- *
- * Ordering: active file → other open tabs → backend results (all deduplicated).
- * When a query is present, open tabs are filtered to only include matches.
- * The `active` path (if provided) is placed first when it exists in `open`.
- */
-export function mergeFileSearchResults(input: {
-  query: string
-  backend: string[]
-  open: Set<string>
-  active?: string
-}): string[] {
-  const norm = (p: string) => p.replaceAll("\\", "/")
-  const query = norm(input.query).trim().toLowerCase()
-  const open = new Set([...input.open].map(norm))
-  const active = input.active ? norm(input.active) : undefined
-  const backend = input.backend.map(norm)
-  const ok = (p: string) => !query || p.toLowerCase().includes(query)
-  const tabs =
-    active && open.has(active) && ok(active)
-      ? [active, ...[...open].filter((p) => p !== active && ok(p))]
-      : [...open].filter(ok)
-  const seen = new Set(tabs)
-  return [...tabs, ...backend.filter((p) => !seen.has(p))]
+  if (event.name !== "session.updated.1") return false
+  const project = event.data.info.projectID
+  return project !== undefined && project !== expectedProjectID
 }

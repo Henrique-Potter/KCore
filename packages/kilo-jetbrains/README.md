@@ -2,15 +2,39 @@
 
 AI coding agent plugin for JetBrains IDEs.
 
+To try the v7 Early Access Program plugin, follow the [JetBrains EAP installation guide](https://kilo.ai/docs/code-with-ai/platforms/jetbrains#jetbrains-early-access).
+
 ---
 
 ## Set up your environment
 
 ### Prerequisites
 
-- **Bun** -- used to build CLI binaries and run build scripts
-- **JDK 21+** -- required by Gradle and the IntelliJ Platform SDK
+- **Bun** -- used to run package build scripts
+- **JDK 21+** -- required by Gradle and the IntelliJ Platform SDK. Check with `java -version`. The preferred way to install is via [SDKMAN](https://sdkman.io/install):
+
+  ```bash
+  # Install SDKMAN (if not already installed)
+  curl -s "https://get.sdkman.io" | bash
+
+  # Install and activate Java 21 (Eclipse Temurin)
+  sdk install java 21-tem
+  sdk use java 21-tem
+  ```
+
 - **IntelliJ IDEA** -- to run the plugin in a sandboxed IDE
+
+---
+
+## Fresh worktree setup
+
+When working in a git worktree (e.g. via the Agent Manager), run `bun install` from the repo root before building or running Gradle tasks:
+
+```bash
+bun install
+```
+
+This installs Node dependencies required by the build scripts.
 
 ---
 
@@ -28,7 +52,7 @@ From `packages/kilo-jetbrains/`:
 bun run build
 ```
 
-This builds the CLI binary for your current OS/arch only, copies it into the backend module resources, and runs `./gradlew buildPlugin`. The plugin archive is output to `build/distributions/`.
+This builds the plugin without bundling CLI binaries. The backend downloads the pinned Kilo CLI release for the host platform at connect time. The plugin archive is output to `build/distributions/`.
 
 Or via Turbo from the repo root:
 
@@ -46,23 +70,78 @@ From `packages/kilo-jetbrains/`:
 bun run build:production
 ```
 
-This builds CLI binaries for all 6 desktop platforms (darwin-arm64, darwin-x64, linux-arm64, linux-x64, windows-x64, windows-arm64), copies them all into the backend jar, and fails if any are missing. Gradle also validates all platforms are present via `-Pproduction=true`.
+This builds the plugin without bundling CLI binaries. The backend downloads the pinned Kilo CLI release for the host platform at connect time.
 
 The built plugin archive is at `build/distributions/kilo.jetbrains-<version>.zip`. This zip can be installed in any JetBrains IDE via **Settings > Plugins > Install Plugin from Disk**.
 
 ---
 
+## Releasing
+
+See [RELEASING.md](RELEASING.md) for the full release process, including how to tag and push an RC, where to watch workflow progress, how to install RC builds, and how the signed bundled CLI build is published to the GitHub-hosted stable plugin repository.
+
+---
+
 ## Run the plugin
 
-Use the `runIde` Gradle task (available in the Gradle tool window or via the "Run JetBrains Plugin" run configuration) to launch a sandboxed IntelliJ instance with the plugin installed.
+Use the checked-in `Run IDE (Split Mode)` run configuration (or `./gradlew --no-configuration-cache runIdeSplitMode` from `packages/kilo-jetbrains/`) to launch the backend and frontend halves of a local split-mode sandbox. The backend downloads the pinned CLI release on first connect.
 
-On a fresh worktree, `runIde` now checks `backend/build/generated/cli/cli/` first. If the local-platform CLI binary is missing, it runs the standard single-binary generation flow and copies the result into the backend resources automatically.
+Use `runIde` only when you need a monolithic sandboxed IntelliJ instance.
 
-That bootstrap is local-development only. Production packaging still requires running `bun run build:production` so all platform binaries are present.
+Production packaging uses `bun run build:production` and still downloads the host CLI at runtime.
+
+### Run the split backend
+
+Use the checked-in `Run IDE (Backend)` run configuration (or `./gradlew --no-configuration-cache runIdeBackend`) to launch just the backend half of a split-mode session.
+
+If `Run IDE (Backend)` exits shortly after startup, check for an orphaned Java process from a previous backend run and kill it before restarting the backend.
+
+Use `Run IDE (Frontend)` (or `./gradlew --no-configuration-cache runIdeFrontend`) with a running backend when you need frontend JVM debugging; `Run IDE (Split Mode)` launches the frontend itself and does not attach frontend debugging.
+
+### Development Gradle properties
+
+All properties below are passed with `-P` on the Gradle command line or in the run configuration's script parameters field.
+
+| Property | Default | Description |
+|---|---|---|
+| `kilo.splitModeServerPort` | `0` | Backend split-mode server port. `0` or omitted lets the IntelliJ Platform Gradle Plugin pick a free port when the task runs. |
+| `kilo.dev.storage.isolated` | `false` | When `true`, CLI runs with `XDG_*_HOME` pointing to `.kilo-dev/` in the worktree root, fully isolating dev storage from your real Kilo installation. Enabled by default in the checked-in split-mode run configurations. |
+| `kilo.dev.worktree.root` | monorepo root | Worktree root used to resolve `.kilo-dev/`. Auto-detected from the Gradle project directory; override only when the auto-detection is wrong. |
+
+The checked-in IDE run configurations pass `--no-configuration-cache` because the IntelliJ Platform Gradle Plugin run-IDE tasks are not configuration-cache compatible in this setup.
+They also pass `--purge-old-log-directories` so stale sandbox logs do not hide the current backend and frontend `kilo.log*` files.
+
+Example with a fixed split-mode port:
+
+```text
+-Pkilo.dev.log.level=debug -Pkilo.splitModeServerPort=12345
+```
+
+### Dev storage isolation
+
+When `kilo.dev.storage.isolated=true`, the CLI subprocess receives standard `XDG_*_HOME` env vars pointing under `.kilo-dev/` in the worktree root:
+
+```
+.kilo-dev/
+  data/    -> XDG_DATA_HOME   (CLI uses .../data/kilo for sessions, logs, ...)
+  config/  -> XDG_CONFIG_HOME (CLI uses .../config/kilo for global config)
+  state/   -> XDG_STATE_HOME  (CLI uses .../state/kilo for state)
+  cache/   -> XDG_CACHE_HOME  (CLI uses .../cache/kilo for cache, bin)
+```
+
+This keeps all development data isolated from your real Kilo installation. The `.kilo-dev/` directory is gitignored and created automatically on first run.
+
+The checked-in `Run IDE (Backend)`, `Run IDE (Frontend)`, and `Run IDE (Split Mode)` run configurations enable this by default. To disable it:
+
+```text
+-Pkilo.dev.storage.isolated=false
+```
+
+---
 
 ### Debug logging properties
 
-The plugin supports a few JVM system properties for local debugging. These are most useful with `runIde` in sandbox mode because the logs are mirrored to `kilo-dev.log` files for frontend and backend.
+The plugin supports a few JVM system properties for local debugging. These are most useful with sandbox runs because the logs are mirrored to `kilo.log*` files for frontend and backend.
 
 `kilo.dev.log.level`
 
@@ -87,9 +166,10 @@ The plugin supports a few JVM system properties for local debugging. These are m
 
 Where to find the log files:
 
-- In sandbox `runIde` runs, Kilo writes separate dev log files for each side under the IDE sandbox log directory reported by `PathManager.getLogDir()`.
-- Frontend log file: `<sandbox log dir>/kilo-frontend/kilo-dev.log`
-- Backend log file: `<sandbox log dir>/kilo-backend/kilo-dev.log`
+- In sandbox runs, Kilo writes separate dev log files for each side under the IDE sandbox log directory reported by `PathManager.getLogDir()`.
+- Frontend log file: `<sandbox log dir>/kilo-frontend/kilo.log`
+- Backend log file: `<sandbox log dir>/kilo-backend/kilo.log`
+- Rotated files use numbered suffixes: `kilo.log.0`, `kilo.log.1`.
 - In practice these sit under the current `log_run*` sandbox logs for the active run.
 - If you are unsure of the exact sandbox root, open the IDE log directory from the running sandbox instance and then look for the `kilo-frontend/` and `kilo-backend/` subdirectories.
 
@@ -109,7 +189,13 @@ Use `off` first. Switch to `preview` only when you need prompt or tool payload h
 
 ## Run Gradle directly
 
-You can run `./gradlew buildPlugin` directly for local development. Gradle will auto-generate the current-platform CLI binary if `backend/build/generated/cli/` is missing.
+For direct local packaging, run:
+
+```bash
+bun run build
+```
+
+This runs `./gradlew buildPlugin`.
 
 For production verification:
 

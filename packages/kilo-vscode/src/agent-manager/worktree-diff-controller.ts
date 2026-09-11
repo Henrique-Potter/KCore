@@ -1,48 +1,113 @@
-import type { KiloClient } from "@kilocode/sdk/v2/client"
-import { hashFileDiffs } from "../diff/shared/hash"
+import { SourceController } from "../diff/SourceController"
 import { resolveLocalDiffTarget } from "../diff/shared/target"
-import { DIFF_POLL_INTERVAL_MS } from "../diff/polling"
-import { WorktreeDiffClient } from "../diff/shared/client"
+import { WorktreeDiffReverter, type StatusResolver } from "../diff/shared/reverter"
+import type { DiffFile, PanelContext } from "../diff/types"
+import type { DiffSource } from "../diff/sources/types"
+import type { DiffSourceCatalog } from "../diff/sources/catalog"
 import type { ApplyConflict, GitOps } from "./GitOps"
 import { shouldStopDiffPolling } from "./delete-worktree"
 import { remoteRef, type ManagedSession, type WorktreeStateManager } from "./WorktreeStateManager"
+import { parseDiffId, scopeToSourceId } from "./diff-scope"
+import { readDocument } from "../documents/document-reader"
 import type { AgentManagerOutMessage, WorktreeDiffEntry } from "./types"
 
 const LOCAL_DIFF_ID = "local" as const
 
 type Target = { sessionId: string; directory: string; baseBranch: string }
 
+type AgentManagerDiffFile = DiffFile & WorktreeDiffEntry
+
 export interface WorktreeDiffControllerContext {
   getState: () => WorktreeStateManager | undefined
   getRoot: () => string | undefined
   getStateReady: () => Promise<void> | undefined
-  /**
-   * SDK client — used by `revert()` via `WorktreeDiffClient` for the one-shot
-   * file-status lookup. Hot polling paths (`request`, `requestFile`, `poll`)
-   * deliberately bypass the client and go through `localDiff`/`localDiffFile`
-   * to keep git spawns out of the Bun `kilo serve` process (see oven-sh/bun#18265).
-   */
-  getClient: () => KiloClient
+  /** Builds the underlying per-scope diff sources (workspace/staged/unstaged/session). */
+  catalog: DiffSourceCatalog
+  /** Shared git ops, injected into sources so they don't spawn their own channels. */
   git: GitOps
-  /** In-process diff summary (replaces client.worktree.diffSummary). */
-  localDiff: (dir: string, base: string) => Promise<WorktreeDiffEntry[]>
-  /** In-process single-file diff (replaces client.worktree.diffFile). */
+  /** In-process single-file diff (replaces client.worktree.diffFile). Used by revert. */
   localDiffFile: (dir: string, base: string, file: string) => Promise<WorktreeDiffEntry | null>
   post: (msg: AgentManagerOutMessage) => void
   log: (...args: unknown[]) => void
+  projectId?: () => string | undefined
 }
 
 export class WorktreeDiffController {
-  private interval: ReturnType<typeof setInterval> | undefined
-  private session: string | undefined
-  private hash: string | undefined
+  private readonly controller: SourceController
   private target: Target | undefined
   private applying: string | undefined
+  /** Intended watch mode for the active context; isPolling lags the initial fetch. */
+  private poll = false
+  private owner: string | undefined
+  private generation = 0
+  /** Ephemeral per-context base override, keyed by context id. */
+  private baseOverrides = new Map<string, string>()
 
-  constructor(private readonly ctx: WorktreeDiffControllerContext) {}
+  constructor(private readonly ctx: WorktreeDiffControllerContext) {
+    this.controller = new SourceController(
+      (id, ctx) => this.source(id, ctx),
+      () => [],
+      (msg) => this.ctx.post(msg as AgentManagerOutMessage),
+      {
+        available: (_, sessionId) => ({
+          type: "agentManager.worktreeDiffLoading",
+          projectId: this.owner,
+          sessionId,
+          loading: true,
+          reset: true,
+        }),
+        loading: (source, loading) => ({
+          type: "agentManager.worktreeDiffLoading",
+          projectId: this.owner,
+          sessionId: source.descriptor.id,
+          loading,
+        }),
+        notice: (source, notice) => ({
+          type: "agentManager.worktreeDiffNotice",
+          projectId: this.owner,
+          sessionId: source.descriptor.id,
+          notice,
+        }),
+        diffs: (source, diffs) => ({
+          type: "agentManager.worktreeDiff",
+          projectId: this.owner,
+          sessionId: source.descriptor.id,
+          diffs: diffs as AgentManagerDiffFile[],
+        }),
+        diffFile: (source, file, diff) => ({
+          type: "agentManager.worktreeDiffFile",
+          projectId: this.owner,
+          sessionId: source?.descriptor.id ?? "",
+          file,
+          diff: diff as AgentManagerDiffFile | null,
+        }),
+        revertFileResult: (source, file, result) => ({
+          type: "agentManager.revertWorktreeFileResult",
+          projectId: this.owner,
+          sessionId: source?.descriptor.id ?? "",
+          file,
+          status: result.ok ? "success" : "error",
+          message: result.message,
+        }),
+        unsupportedRevert: (source, file) => ({
+          type: "agentManager.revertWorktreeFileResult",
+          projectId: this.owner,
+          sessionId: source?.descriptor.id ?? "",
+          file,
+          status: "error",
+          message: "Revert is not supported for the current source",
+        }),
+      },
+    )
+    this.controller.setContext({ workspaceRoot: this.ctx.getRoot() })
+  }
 
   public shouldStopForWorktree(path: string, sessions: ManagedSession[]): boolean {
-    return shouldStopDiffPolling(path, sessions, this.target, this.session)
+    // The parsed context id is a worktree id (or `local`), so the
+    // orphaned-session check matches sessions of the deleted worktree.
+    const current = this.controller.currentId
+    const ctxId = current ? parseDiffId(current).ctx : undefined
+    return shouldStopDiffPolling(path, sessions, this.target, ctxId)
   }
 
   public async apply(worktreeId: string, value?: unknown): Promise<void> {
@@ -106,166 +171,236 @@ export class WorktreeDiffController {
     }
   }
 
-  public async revert(sessionId: string, file: string): Promise<void> {
+  public async revert(id: string, file: string): Promise<void> {
     if (!file) return
-    await this.ready("stateReady rejected, continuing revert resolve:")
-
-    const target = this.target?.sessionId === sessionId ? this.target : await this.resolve(sessionId)
-    if (!target) {
-      this.ctx.post({
-        type: "agentManager.revertWorktreeFileResult",
-        sessionId,
-        file,
-        status: "error",
-        message: "Could not resolve diff target",
-      })
+    if (this.controller.currentId !== id) {
+      const result = await this.revertFile(id, file)
+      this.postRevertResult(id, file, result)
       return
     }
-
-    try {
-      const diff = new WorktreeDiffClient(this.ctx.getClient(), this.ctx.git, (...args) => this.ctx.log(...args))
-      const result = await diff.revertFile(target, file)
-      this.ctx.post({
-        type: "agentManager.revertWorktreeFileResult",
-        sessionId,
-        file,
-        status: result.ok ? "success" : "error",
-        message: result.message,
-      })
-
-      if (result.ok) void this.request(sessionId)
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error)
-      this.ctx.log("Failed to revert worktree file:", msg)
-      this.ctx.post({
-        type: "agentManager.revertWorktreeFileResult",
-        sessionId,
-        file,
-        status: "error",
-        message: msg,
-      })
-    }
+    await this.controller.revertFile(file)
   }
 
-  public async request(sessionId: string): Promise<void> {
-    await this.ready("stateReady rejected, continuing diff resolve:")
-
-    const target = await this.resolve(sessionId)
-    if (!target) return
-
-    this.target = { sessionId, ...target }
-    this.ctx.post({ type: "agentManager.worktreeDiffLoading", sessionId, loading: true })
-
-    try {
-      const files = await this.ctx.localDiff(target.directory, target.baseBranch)
-      this.ctx.log(`Worktree diff returned ${files.length} file(s) for session ${sessionId}`)
-      this.hash = hashFileDiffs(files)
-      this.session = sessionId
-      this.ctx.post({ type: "agentManager.worktreeDiff", sessionId, diffs: files })
-    } catch (error) {
-      this.ctx.log("Failed to fetch worktree diff:", error)
-    } finally {
-      this.ctx.post({ type: "agentManager.worktreeDiffLoading", sessionId, loading: false })
-    }
-  }
-
-  public async requestFile(sessionId: string, file: string): Promise<void> {
-    if (!file) return
-    await this.ready("stateReady rejected, continuing diff detail resolve:")
-
-    const target = this.target?.sessionId === sessionId ? this.target : await this.resolve(sessionId)
-    if (!target) return
-
-    this.target = { sessionId, directory: target.directory, baseBranch: target.baseBranch }
-
-    try {
-      const data = await this.ctx.localDiffFile(target.directory, target.baseBranch, file)
-      this.ctx.post({ type: "agentManager.worktreeDiffFile", sessionId, file, diff: data })
-    } catch (error) {
-      this.ctx.log("Failed to fetch worktree diff file:", error)
-      this.ctx.post({ type: "agentManager.worktreeDiffFile", sessionId, file, diff: null })
-    }
-  }
-
-  public start(sessionId: string): void {
-    if (this.session === sessionId && this.interval) {
-      this.ctx.log(`Already polling session ${sessionId}, skipping restart`)
+  public async request(id: string): Promise<void> {
+    if (this.controller.currentId !== id || this.owner !== this.ctx.projectId?.()) {
+      await this.activate(id, false, true)
       return
     }
+    this.target = undefined
+    await this.controller.refresh()
+  }
 
-    this.stop()
-    this.session = sessionId
-    this.hash = undefined
-    this.ctx.log(`Starting diff polling for session ${sessionId}`)
+  public async requestFile(id: string, file: string): Promise<void> {
+    if (!file || this.controller.currentId !== id) return
+    await this.controller.requestFile(file)
+  }
 
-    void this.request(sessionId).then(() => {
-      if (this.session !== sessionId) return
-      this.interval = setInterval(() => {
-        void this.poll(sessionId)
-      }, DIFF_POLL_INTERVAL_MS)
+  /** Resolve the base-branch choices for a context and push them to the webview. */
+  public async postBranches(id: string): Promise<void> {
+    const result = await this.branches(id).catch((err) => {
+      this.ctx.log("Failed to list diff branches:", err instanceof Error ? err.message : String(err))
+      return undefined
+    })
+    if (!result) return
+    this.ctx.post({
+      type: "agentManager.diffBranches",
+      sessionId: id,
+      branches: result.branches,
+      defaultBranch: result.defaultBranch,
+      autoBase: result.autoBase,
+      currentBase: result.currentBase,
+      isAuto: result.isAuto,
+      currentBranch: result.currentBranch,
     })
   }
 
+  /**
+   * Read one file from a worktree for the document inspector. Reuses this
+   * controller's state/root context because a document read is a worktree file
+   * read, resolved against the same directory the diff for that context uses.
+   */
+  public document(sessionId: string, file: string, contextKey?: string): null {
+    void this.ready("stateReady rejected, continuing document resolve:").then(() => {
+      const state = this.ctx.getState()
+      const worktree = sessionId === LOCAL_DIFF_ID ? undefined : state?.getWorktree(sessionId)
+      const session = worktree || sessionId === LOCAL_DIFF_ID ? undefined : state?.getSession(sessionId)
+      const root =
+        sessionId === LOCAL_DIFF_ID
+          ? this.ctx.getRoot()
+          : (worktree?.path ??
+            (session?.worktreeId
+              ? state?.getWorktree(session.worktreeId)?.path
+              : session
+                ? this.ctx.getRoot()
+                : undefined))
+      const result = root ? readDocument(root, file) : { error: "The document context is no longer available." }
+      this.ctx.post({ type: "agentManager.document", sessionId, file, requestedFile: file, contextKey, ...result })
+    })
+    return null
+  }
+
+  public start(id: string): void {
+    if (this.controller.isPolling && this.controller.currentId === id && this.owner === this.ctx.projectId?.()) return
+    this.ctx.log(`Starting diff polling for ${id}`)
+    void this.activate(id, true, true)
+  }
+
+  public async setVisible(visible: boolean): Promise<void> {
+    await this.controller.setVisible(visible)
+  }
+
   public stop(): void {
-    if (this.interval) {
-      clearInterval(this.interval)
-      this.interval = undefined
-    }
-    this.session = undefined
-    this.hash = undefined
+    this.generation++
+    this.controller.stop()
     this.target = undefined
+    this.poll = false
+    this.owner = undefined
   }
 
-  private async poll(sessionId: string): Promise<void> {
-    const target = this.target?.sessionId === sessionId ? this.target : undefined
-    if (!target) return
-
-    try {
-      const files = await this.ctx.localDiff(target.directory, target.baseBranch)
-      const hash = hashFileDiffs(files)
-      if (hash === this.hash && this.session === sessionId) return
-      this.hash = hash
-      this.session = sessionId
-      this.ctx.post({ type: "agentManager.worktreeDiff", sessionId, diffs: files })
-    } catch (error) {
-      this.ctx.log("Failed to poll worktree diff:", error)
-    }
+  /**
+   * Set or clear an ephemeral base override for a context (worktree or local),
+   * then re-activate the current source so it refetches against the new base.
+   * Passing undefined clears the override and falls back to the recorded parent.
+   */
+  public async setBase(id: string, branch: string | undefined): Promise<void> {
+    const { ctx } = parseDiffId(id)
+    if (branch) this.baseOverrides.set(ctx, branch)
+    else this.baseOverrides.delete(ctx)
+    // Nothing to rebuild when the context isn't active; the override is
+    // picked up the next time start()/request() resolves it.
+    if (this.controller.currentId !== id) return
+    // Route through activate() so the base is re-resolved and pushed via
+    // setContext() — SourceController.reactivate() alone would rebuild the
+    // source against the stale context captured by the last activate(). The
+    // recorded poll intent preserves watch mode even when the initial fetch
+    // is still in flight (isPolling only turns true once it resolves).
+    await this.activate(id, this.poll, true)
   }
 
-  private async resolve(sessionId: string): Promise<{ directory: string; baseBranch: string } | undefined> {
-    if (sessionId === LOCAL_DIFF_ID) return await this.resolveLocal()
+  /** Branch picker data for a context's directory, using any active override. */
+  public async branches(id: string) {
+    await this.ready("stateReady rejected, continuing diff branches resolve:")
+    const { ctx } = parseDiffId(id)
+    const target = await this.resolve(ctx)
+    if (!target) return undefined
+    return await this.ctx.catalog.listWorkspaceBranches(this.baseOverrides.get(ctx), target.directory)
+  }
+
+  private async activate(id: string, poll: boolean, fetch: boolean): Promise<void> {
+    const generation = ++this.generation
+    this.target = undefined
+    this.poll = poll
+    const owner = this.ctx.projectId?.()
+    this.owner = owner
+    await this.ready("stateReady rejected, continuing diff activate:")
+    if (this.generation !== generation || this.owner !== owner || this.ctx.projectId?.() !== owner) return
+    const { ctx } = parseDiffId(id)
+    const resolved = await this.resolve(ctx)
+    if (this.generation !== generation || this.owner !== owner || this.ctx.projectId?.() !== owner) return
+    this.target = resolved ? { sessionId: id, ...resolved } : undefined
+    // Clear any stale source notice up front; sources only push a notice when
+    // one is active, so a swap away from a noticing source must reset it.
+    this.ctx.post({
+      type: "agentManager.worktreeDiffNotice",
+      projectId: this.owner,
+      sessionId: id,
+      notice: undefined,
+    })
+    this.controller.setContext({
+      workspaceRoot: this.ctx.getRoot(),
+      dir: resolved?.directory,
+      // The resolved base already bakes in any ephemeral override (see
+      // resolve()), so pass it as the explicit base and leave
+      // baseBranchOverride unset to avoid double resolution.
+      baseBranch: resolved?.baseBranch,
+      // Agent Manager always knows its intended directory (LOCAL resolves to
+      // the root). Never fall back to the workspace root for an unresolvable
+      // worktree context — return an empty diff instead.
+      strictDir: true,
+      git: this.ctx.git,
+      log: (...args) => this.ctx.log(...args),
+    })
+    await this.controller.activate(id, { poll, fetch })
+  }
+
+  private async resolve(ctxId: string): Promise<{ directory: string; baseBranch: string } | undefined> {
+    if (ctxId === LOCAL_DIFF_ID) return await this.resolveLocal()
     const state = this.ctx.getState()
     if (!state) {
-      this.ctx.log(`resolveDiffTarget: no state manager for session ${sessionId}`)
+      this.ctx.log(`resolveDiffTarget: no state manager for context ${ctxId}`)
       return undefined
     }
 
-    const session = state.getSession(sessionId)
-    if (!session) {
-      this.ctx.log(
-        `resolveDiffTarget: session ${sessionId} not found in state (${state.getSessions().length} total sessions)`,
-      )
-      return undefined
-    }
-    if (!session.worktreeId) {
-      this.ctx.log(`resolveDiffTarget: session ${sessionId} has no worktreeId (local session)`)
-      return undefined
-    }
-
-    const worktree = state.getWorktree(session.worktreeId)
+    // The context is the worktree itself (the sidebar selection), not one of
+    // its sessions — resolution survives session churn inside the worktree.
+    const worktree = state.getWorktree(ctxId)
     if (!worktree) {
-      this.ctx.log(`resolveDiffTarget: worktree ${session.worktreeId} not found for session ${sessionId}`)
+      this.ctx.log(`resolveDiffTarget: worktree ${ctxId} not found`)
       return undefined
     }
-    return { directory: worktree.path, baseBranch: remoteRef(worktree) }
+    const base = this.baseOverrides.get(ctxId) ?? remoteRef(worktree)
+    return { directory: worktree.path, baseBranch: base }
   }
 
   private async resolveLocal(): Promise<{ directory: string; baseBranch: string } | undefined> {
-    return await resolveLocalDiffTarget(this.ctx.git, (...args) => this.ctx.log(...args), this.ctx.getRoot())
+    const root = this.ctx.getRoot()
+    if (!root) return undefined
+    const override = this.baseOverrides.get(LOCAL_DIFF_ID)
+    if (override) {
+      return { directory: root, baseBranch: override }
+    }
+    return await resolveLocalDiffTarget(this.ctx.git, (...args) => this.ctx.log(...args), root)
   }
 
   private async ready(msg: string): Promise<void> {
     await this.ctx.getStateReady()?.catch((err) => this.ctx.log(msg, err))
+  }
+
+  /**
+   * Build the active source for a composite id by delegating to the catalog.
+   * The composite id (`ctx#scope`, or `ctx#session:<sid>` for the session
+   * scope) is preserved as the descriptor id so the webview keys diff data by
+   * context+scope. Context resolution (dir/base) already happened in
+   * activate() and is carried by the PanelContext.
+   */
+  private source(id: string, panelCtx: PanelContext): DiffSource {
+    const { ctx, scope, sessionId } = parseDiffId(id)
+    const built = this.ctx.catalog.build(scopeToSourceId(scope, ctx, sessionId), panelCtx)
+    return {
+      ...built,
+      descriptor: { ...built.descriptor, id },
+    }
+  }
+
+  private async revertFile(id: string, file: string): Promise<{ ok: boolean; message: string }> {
+    await this.ready("stateReady rejected, continuing revert resolve:")
+    const { ctx } = parseDiffId(id)
+    const target = await this.resolve(ctx)
+    if (!target) return { ok: false, message: "Could not resolve diff target" }
+
+    try {
+      const status: StatusResolver = async (current, item) => {
+        const diff = await this.ctx.localDiffFile(current.directory, current.baseBranch, item)
+        return diff?.status
+      }
+      const diff = new WorktreeDiffReverter(this.ctx.git, status, (...args) => this.ctx.log(...args))
+      return await diff.revertFile(target, file)
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      this.ctx.log("Failed to revert worktree file:", msg)
+      return { ok: false, message: msg }
+    }
+  }
+
+  private postRevertResult(sessionId: string, file: string, result: { ok: boolean; message: string }): void {
+    this.ctx.post({
+      type: "agentManager.revertWorktreeFileResult",
+      projectId: this.owner,
+      sessionId,
+      file,
+      status: result.ok ? "success" : "error",
+      message: result.message,
+    })
   }
 
   private postApplyResult(
@@ -276,6 +411,7 @@ export class WorktreeDiffController {
   ): void {
     this.ctx.post({
       type: "agentManager.applyWorktreeDiffResult",
+      projectId: this.owner,
       worktreeId,
       status,
       message,

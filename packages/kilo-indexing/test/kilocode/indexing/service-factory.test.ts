@@ -1,6 +1,11 @@
 import { describe, expect, test, mock, beforeEach } from "bun:test"
 import path from "path"
 import { mockEmbeddingsCreate, openAIMockFactory, setOpenAIConstructorHook } from "./embedders/__helpers__/openai-mock"
+import {
+  OLLAMA_EMBEDDER_REQUEST_TIMEOUT_MS,
+  REMOTE_EMBEDDER_VALIDATION_TIMEOUT_MS,
+} from "../../../src/indexing/constants"
+import type { AvailableEmbedders, IEmbedder } from "../../../src/indexing/interfaces/embedder"
 
 mock.module("openai", openAIMockFactory)
 import { CodeIndexServiceFactory } from "../../../src/indexing/service-factory"
@@ -23,10 +28,83 @@ function createFactory(input?: Partial<ConstructorParameters<typeof CodeIndexCon
   return new CodeIndexServiceFactory(cfg, workspacePath, cache, cacheDirectory)
 }
 
+function createEmbedder(name: AvailableEmbedders): IEmbedder {
+  return {
+    async createEmbeddings() {
+      return { embeddings: [] }
+    },
+    async validateConfiguration() {
+      return { valid: true }
+    },
+    get embedderInfo() {
+      return { name }
+    },
+  }
+}
+
 describe("CodeIndexServiceFactory", () => {
   beforeEach(() => {
     mockEmbeddingsCreate.mockReset()
     setOpenAIConstructorHook(undefined)
+  })
+
+  test("creates an OpenAI-compatible embedder without an API key", () => {
+    const factory = createFactory({
+      embedderProvider: "openai-compatible",
+      openAiKey: undefined,
+      openAiCompatibleBaseUrl: "http://localhost:1234/v1",
+    })
+
+    expect(factory.createEmbedder().embedderInfo).toEqual({ name: "openai-compatible" })
+  })
+
+  test("lets SDK-backed embedders own validation timeouts", async () => {
+    const original = globalThis.setTimeout
+    const timer = mock((...args: Parameters<typeof setTimeout>) => original(...args))
+    globalThis.setTimeout = timer
+
+    try {
+      const factory = createFactory()
+      const providers = [
+        "openai",
+        "openrouter",
+        "openai-compatible",
+        "kilo",
+        "gemini",
+        "mistral",
+        "vercel-ai-gateway",
+      ] satisfies AvailableEmbedders[]
+
+      for (const provider of providers) {
+        await expect(factory.validateEmbedder(createEmbedder(provider))).resolves.toEqual({ valid: true })
+      }
+
+      expect(timer).not.toHaveBeenCalled()
+    } finally {
+      globalThis.setTimeout = original
+    }
+  })
+
+  test("retains factory deadlines for non-SDK embedders", async () => {
+    const original = globalThis.setTimeout
+    const timer = mock((...args: Parameters<typeof setTimeout>) => original(...args))
+    globalThis.setTimeout = timer
+
+    try {
+      const factory = createFactory()
+
+      await factory.validateEmbedder(createEmbedder("voyage"))
+      await factory.validateEmbedder(createEmbedder("bedrock"))
+      await factory.validateEmbedder(createEmbedder("ollama"))
+
+      expect(timer.mock.calls.map((call) => call[1])).toEqual([
+        REMOTE_EMBEDDER_VALIDATION_TIMEOUT_MS,
+        REMOTE_EMBEDDER_VALIDATION_TIMEOUT_MS,
+        OLLAMA_EMBEDDER_REQUEST_TIMEOUT_MS,
+      ])
+    } finally {
+      globalThis.setTimeout = original
+    }
   })
 
   test("uses default LanceDB directory when config is unset", () => {
@@ -39,7 +117,7 @@ describe("CodeIndexServiceFactory", () => {
   })
 
   test("uses explicit LanceDB directory when configured", () => {
-    const dir = "/tmp/custom-lancedb"
+    const dir = path.join(process.cwd(), "tmp", "custom-lancedb")
     const factory = createFactory({ vectorStoreProvider: "lancedb", lancedbVectorStoreDirectory: dir })
 
     const store = factory.createVectorStore() as unknown as { dbPath: string }
@@ -149,9 +227,40 @@ describe("CodeIndexServiceFactory", () => {
     expect(mockEmbeddingsCreate).toHaveBeenCalledWith({
       input: ["hello"],
       model: "openai/text-embedding-3-small",
-      encoding_format: "base64",
+      encoding_format: "float",
       dimensions: 1024,
     })
+  })
+
+  test("creates vector store for OpenRouter Gemini embedding preview", () => {
+    const factory = createFactory({
+      embedderProvider: "openrouter",
+      openAiKey: undefined,
+      openRouterApiKey: "or-test",
+      modelId: "google/gemini-embedding-2-preview",
+      vectorStoreProvider: "lancedb",
+    })
+
+    const store = factory.createVectorStore() as unknown as { vectorSize: number }
+
+    expect(store).toBeDefined()
+    expect(store.vectorSize).toBe(3072)
+  })
+
+  test("uses configured dimension before static model metadata for vector stores", () => {
+    const factory = createFactory({
+      embedderProvider: "openrouter",
+      openAiKey: undefined,
+      openRouterApiKey: "or-test",
+      modelId: "openai/text-embedding-3-small",
+      modelDimension: 1024,
+      vectorStoreProvider: "lancedb",
+    })
+
+    const store = factory.createVectorStore() as unknown as { vectorSize: number }
+
+    expect(store).toBeDefined()
+    expect(store.vectorSize).toBe(1024)
   })
 
   test("creates Kilo embedder with Cloud-provided model", async () => {
@@ -177,6 +286,7 @@ describe("CodeIndexServiceFactory", () => {
       input: ["hello"],
       model: "mistralai/mistral-embed-2312",
       encoding_format: "base64",
+      dimensions: 1024,
     })
   })
 })

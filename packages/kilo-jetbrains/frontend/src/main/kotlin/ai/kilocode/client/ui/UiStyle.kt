@@ -1,104 +1,332 @@
 package ai.kilocode.client.ui
 
+import com.intellij.openapi.editor.DefaultLanguageHighlighterColors
 import com.intellij.openapi.editor.colors.EditorColorsManager
+import com.intellij.openapi.editor.colors.EditorColorsScheme
+import com.intellij.openapi.util.registry.Registry
+import com.intellij.ui.ColorUtil
 import com.intellij.ui.JBColor
-import com.intellij.ui.RoundedLineBorder
-import com.intellij.ui.components.JBLabel
+import com.intellij.util.ui.JBFont
 import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
-import java.awt.BorderLayout
 import java.awt.Color
-import java.awt.Dimension
-import java.awt.Graphics
-import java.awt.Graphics2D
-import java.awt.RenderingHints
-import java.awt.event.MouseAdapter
-import java.awt.event.MouseEvent
-import javax.swing.JButton
+import javax.swing.AbstractButton
 import javax.swing.JComponent
 import javax.swing.UIManager
-import javax.swing.border.Border
 
-/** Static UI tokens and helpers for JetBrains session Swing surfaces. */
+/** Shared Swing style tokens that are not tied to one session component. */
 object UiStyle {
-    object Size {
-        const val WIDTH = 350
-        const val LIMIT = 5
-        const val LINES = 3
-        const val CHROME = 16
-        const val BUTTON_WIDTH = 28
-        const val BUTTON = 24
-        const val SCROLL = 16
-        const val USER_PROMPT = 100
-        const val TOOL_BODY = 20_000
 
-        fun userPromptMin(): Int = JBUI.scale(USER_PROMPT)
-
-        fun toolBodyLimit(): Int = TOOL_BODY
-    }
-
-    object Space {
+    /**
+     * DPI-aware spacing primitives used across custom Swing layouts.
+     *
+     * The functions return pixels for the current scale and suit manual layout and painting. The
+     * constants are the raw steps and belong in APIs that scale what they are handed — notably
+     * [JBUI.Borders] and [JBUI.insets], whose `JBInsets` re-applies the user scale on every read.
+     * Passing a function result there scales twice, which stays invisible at 100% and drifts as
+     * soon as the IDE is zoomed.
+     */
+    object Gap {
         const val XS = 2
+
         const val SM = 4
+
         const val MD = 6
+
         const val LG = 8
+
         const val PAD = 12
-        const val LOGO = 14
-        const val RECENT = 28
+
+        const val XL = 16
+
+        fun xs() = JBUI.scale(XS)
+
+        fun sm() = JBUI.scale(SM)
+
+        fun md() = JBUI.scale(MD)
+
+        fun lg() = JBUI.scale(LG)
+
+        fun pad() = JBUI.scale(PAD)
+
+        fun xl() = JBUI.scale(XL)
     }
 
+    /** Theme-aware component geometry tokens. */
+    object Arc {
+        /** Standard component corner arc, matching the platform's `Component.arc` key. */
+        fun component() = com.intellij.util.ui.JBValue.UIInteger("Component.arc", 8).get()
+    }
+
+    /** Geometry of the trailing band over which clipped single-line text dissolves into its backdrop. */
+    object Fade {
+        /**
+         * Unscaled width of the band, wider than the 10 the platform defaults
+         * `ide.editor.tabs.fadeout.width` to. A tab fades its own trailing padding, where a few pixels
+         * are enough; this band has to cover the glyph the cut runs through, or the cut stays visible at
+         * the point the fade is still opaque.
+         */
+        private const val WIDTH = 16
+
+        fun width() = JBUI.scale(WIDTH)
+    }
+
+    /** Platform balloon styling used by lightweight contextual overlays. */
+    object Balloon {
+        /** Mirrors the platform default for `ide.balloon.shadow.size`, used only if the key is gone. */
+        private const val SHADOW_SIZE = 24
+
+        fun bg(): Color = UIUtil.getPanelBackground()
+
+        fun border(): Color = JBUI.CurrentTheme.Popup.borderColor(true)
+
+        /** New UI parameter-info balloon insets: symmetric vertical padding with wider sides. */
+        fun insets() = JBUI.insets(6, 12, 6, 12)
+
+        fun pointer() = JBUI.size(16, 8)
+
+        fun arc() = JBUI.scale(8)
+
+        /**
+         * Drop-shadow inset the platform reserves on every side of a balloon, or 0 when shadows are
+         * off. Read from the same registry keys `BalloonImpl` uses, because callers that size a
+         * balloon to fit an area have to account for it: an overflowing balloon is silently
+         * re-pointed to another side.
+         */
+        fun shadow(): Int =
+            if (Registry.`is`("ide.balloon.shadowEnabled", true)) {
+                JBUI.scale(Registry.intValue("ide.balloon.shadow.size", SHADOW_SIZE))
+            } else {
+                0
+            }
+    }
+
+    /** Filled badge styles shared across JetBrains UI surfaces. */
+    object Badge {
+        private const val PR_SOFT_ALPHA = 0.15
+
+        interface Style {
+            fun bg(): Color
+
+            fun fg(): Color
+        }
+
+        object Primary : Style {
+            override fun bg(): Color = JBColor.namedColor(
+                "Kilo.History.activityBadgeBackground",
+                JBUI.CurrentTheme.Link.Foreground.ENABLED,
+            )
+
+            override fun fg(): Color = JBColor.namedColor(
+                "Kilo.History.activityBadgeForeground",
+                Color.WHITE,
+            )
+        }
+
+        object Secondary : Style {
+            override fun bg(): Color = JBColor.lazy {
+                UIManager.getColor("Badge.background")
+                    ?: UIManager.getColor("Label.infoBackground")
+                    ?: Colors.blend(Colors.contentBackground(), Colors.fg(), 0.16f)
+            }
+
+            override fun fg(): Color = JBColor.lazy {
+                UIManager.getColor("Badge.foreground")
+                    ?: UIManager.getColor("Label.infoForeground")
+                    ?: UIUtil.getLabelForeground()
+            }
+        }
+
+        object Highlight : Style {
+            override fun bg(): Color = JBColor.namedColor(
+                "Kilo.ModelPicker.freeBadgeBackground",
+                JBColor(0x95D6AC, 0x7FCA99),
+            )
+
+            override fun fg(): Color = JBColor.namedColor(
+                "Kilo.ModelPicker.freeBadgeForeground",
+                JBColor.WHITE,
+            )
+        }
+
+        object Alert : Style {
+            override fun bg(): Color = JBColor.namedColor(
+                "Kilo.History.runningBadgeBackground",
+                JBColor(0xF5C542, 0x7A5A00),
+            )
+
+            override fun fg(): Color = JBColor.namedColor(
+                "Kilo.History.runningBadgeForeground",
+                JBColor(Color.BLACK, Color.WHITE),
+            )
+        }
+
+        object ActivityRunning : Style {
+            override fun bg(): Color = JBColor.namedColor(
+                "Kilo.Activity.runningBackground",
+                JBColor(Color(0x55, 0xA7, 0x6A), Color(0x57, 0x96, 0x5C)),
+            )
+
+            override fun fg(): Color = JBColor.namedColor(
+                "Kilo.Activity.runningForeground",
+                Color.WHITE,
+            )
+        }
+
+        object ActivityAttention : Style {
+            override fun bg(): Color = JBColor.namedColor(
+                "Kilo.Activity.attentionBackground",
+                JBColor(Color(0xE6, 0x6D, 0x17), Color(0xC7, 0x7D, 0x55)),
+            )
+
+            override fun fg(): Color = JBColor.namedColor(
+                "Kilo.Activity.attentionForeground",
+                Color.WHITE,
+            )
+        }
+
+        object ActivityError : Style {
+            override fun bg(): Color = JBColor.namedColor(
+                "Kilo.Activity.errorBackground",
+                JBColor(Color(0xE5, 0x57, 0x65), Color(0xDB, 0x5C, 0x5C)),
+            )
+
+            override fun fg(): Color = JBColor.namedColor(
+                "Kilo.Activity.errorForeground",
+                Color.WHITE,
+            )
+        }
+
+        object PullRequestOpen : Style {
+            private val accent = JBColor.namedColor(
+                "Kilo.PullRequest.openBadgeForeground",
+                JBColor(Color(0x1A, 0x7F, 0x37), Color(0x3F, 0xB9, 0x50)),
+            )
+
+            override fun bg(): Color = ColorUtil.withAlpha(accent, PR_SOFT_ALPHA)
+
+            override fun fg(): Color = accent
+        }
+
+        object PullRequestDraft : Style {
+            private val accent = JBColor.namedColor(
+                "Kilo.PullRequest.draftBadgeForeground",
+                JBColor(Color(0x59, 0x63, 0x6E), Color(0x91, 0x98, 0xA1)),
+            )
+
+            override fun bg(): Color = ColorUtil.withAlpha(accent, PR_SOFT_ALPHA)
+
+            override fun fg(): Color = accent
+        }
+
+        object PullRequestMerged : Style {
+            private val accent = JBColor.namedColor(
+                "Kilo.PullRequest.mergedBadgeForeground",
+                JBColor(Color(0x82, 0x50, 0xDF), Color(0xA3, 0x71, 0xF7)),
+            )
+
+            override fun bg(): Color = ColorUtil.withAlpha(accent, PR_SOFT_ALPHA)
+
+            override fun fg(): Color = accent
+        }
+
+        object PullRequestClosed : Style {
+            private val accent = JBColor.namedColor(
+                "Kilo.PullRequest.closedBadgeForeground",
+                JBColor(Color(0xCF, 0x22, 0x2E), Color(0xF8, 0x51, 0x49)),
+            )
+
+            override fun bg(): Color = ColorUtil.withAlpha(accent, PR_SOFT_ALPHA)
+
+            override fun fg(): Color = accent
+        }
+    }
+
+    /** Theme-aware colors and color math used by multiple UI surfaces. */
     object Colors {
-        internal const val BORDER_DELTA = 64
-        internal const val HOVER_ALPHA = 0.35f
-
-        val timelineRead: Color = JBColor(Color(0x37, 0x94, 0xff), Color(0x37, 0x94, 0xff))
-        val timelineWrite: Color = JBColor(Color(0x00, 0x7f, 0xd4), Color(0x00, 0x7f, 0xd4))
-        val timelineTool: Color = JBColor(Color(0x00, 0x7a, 0xcc), Color(0x00, 0x7a, 0xcc))
-        val timelineSuccess: Color = JBColor.namedColor("Label.successForeground", UIUtil.getLabelSuccessForeground())
-        val timelineError: Color = JBColor(Color(0xf4, 0x87, 0x71), Color(0xf4, 0x87, 0x71))
-        val timelineText: Color = JBColor(Color(0x9d, 0x9d, 0x9d), Color(0x9d, 0x9d, 0x9d))
-        val timelineStep: Color = JBColor(Color(0x4d, 0x4d, 0x4d), Color(0x4d, 0x4d, 0x4d))
-
         fun bg(): Color = UIUtil.getPanelBackground()
 
         fun fg(): Color = UIUtil.getLabelForeground()
 
         fun weak(): Color = UIUtil.getContextHelpForeground()
 
-        /** Creates a visible separator against editor-derived transcript surfaces. */
-        fun line(): Color = JBColor.lazy { contrast(panel(), BORDER_DELTA) }
+        // Neutral icon greys from the New UI palette: the same values our svg row icons paint with, so
+        // an animated icon reads at the row's icon weight instead of as a colored status light. Each
+        // variant carries the contrast its own theme needs — mid grey on light, near-white on dark.
+        val runningLight = Color(0x6C, 0x70, 0x7E)
+        val runningDark = Color(0xCE, 0xD0, 0xD6)
 
-        fun surface(): Color = panel()
+        fun running(): Color = JBColor.namedColor(
+            "Kilo.Activity.runningSpinnerForeground",
+            JBColor(runningLight, runningDark),
+        )
 
         /** Uses the editor background so chat cards feel native beside editor content. */
-        fun panel(): Color = JBColor.lazy { EditorColorsManager.getInstance().globalScheme.defaultBackground }
+        fun editorBackground(): Color = JBColor.lazy { EditorColorsManager.getInstance().globalScheme.defaultBackground }
 
-        fun panelHover(): Color = JBColor.lazy { blend(panel(), line(), HOVER_ALPHA) }
+        /** Background for code fragments when a caller explicitly wants the editor scheme's doc-code style. */
+        fun codeBlockBackground(scheme: EditorColorsScheme): Color =
+            scheme.getAttributes(DefaultLanguageHighlighterColors.DOC_CODE_BLOCK)?.backgroundColor ?: scheme.defaultBackground
 
-        fun header(): Color = panel()
-
-        fun headerBar(): Color = JBUI.CurrentTheme.ToolWindow.headerBackground(false)
-
-        /** Local hover color for collapsible transcript card headers. */
-        fun headerHover(): Color = panelHover()
-
-        fun error(): Color = JBColor.namedColor("Label.errorForeground", UIUtil.getErrorForeground())
-
-        fun warning(): Color = JBColor.lazy {
-            UIManager.getColor("Component.warningFocusColor")
-                ?: UIManager.getColor("Label.warningForeground")
-                ?: UIUtil.getContextHelpForeground()
+        /**
+         * Contained panel background: follows the active theme's text-field/input surface.
+         * Falls back to the panel background when unavailable.
+         */
+        fun contentBackground(): Color = JBColor.lazy {
+            UIManager.getColor("TextField.background") ?: UIUtil.getPanelBackground()
         }
 
-        fun running(): Color = JBColor.namedColor("ProgressBar.foreground", UIUtil.getLabelForeground())
-
+        /** Standard picker/combobox surface, contrasted against the default panel background by the active theme. */
         fun picker(): Color = JBColor.lazy {
             UIManager.getColor("ComboBoxButton.background")
                 ?: UIManager.getColor("ComboBox.nonEditableBackground")
                 ?: UIUtil.getPanelBackground()
         }
 
-        fun pickerHover(): Color = JBUI.CurrentTheme.ActionButton.hoverBackground()
+        /** Border color shared across contained panels. */
+        fun contentBorder(): Color = JBColor.namedColor("Component.borderColor", JBColor.border())
+
+        /**
+         * Floating panel background: white in light themes, black in dark themes.
+         * Used for account switcher popup panels and any overlay panels that need
+         * a high-contrast base distinct from the standard editor/sidebar background.
+         */
+        fun floatingPanel(): Color = JBColor.namedColor(
+            "Kilo.FloatingPanel.background",
+            JBColor(java.awt.Color.WHITE, java.awt.Color.BLACK),
+        )
+
+        fun errorLabelForeground(): Color = JBColor.namedColor("Label.errorForeground", UIUtil.getErrorForeground())
+
+        fun addedForeground(): Color = JBColor.namedColor(
+            "Kilo.DiffStat.addedForeground",
+            JBColor(Color(0x1f, 0x9d, 0x66), Color(0x35, 0xd4, 0x9a)),
+        )
+
+        fun removedForeground(): Color = JBColor.namedColor(
+            "Kilo.DiffStat.removedForeground",
+            JBColor(Color(0xdb, 0x58, 0x66), Color(0xff, 0x6b, 0x7a)),
+        )
+
+        fun warningLabelForeground(): Color = JBColor.lazy {
+            UIManager.getColor("Component.warningFocusColor")
+                ?: UIManager.getColor("Label.warningForeground")
+                ?: UIUtil.getContextHelpForeground()
+        }
+
+        fun infoOverlayBackground(): Color = JBUI.CurrentTheme.NotificationInfo.backgroundColor()
+
+        fun infoOverlayForeground(): Color = JBUI.CurrentTheme.NotificationInfo.foregroundColor()
+
+        fun infoOverlayBorder(): Color = JBUI.CurrentTheme.NotificationInfo.borderColor()
+
+        fun actionHoverBackground(): Color = JBUI.CurrentTheme.ActionButton.hoverBackground()
+
+        fun errorOverlayBackground(): Color = JBUI.CurrentTheme.NotificationError.backgroundColor()
+
+        fun errorOverlayForeground(): Color = JBUI.CurrentTheme.NotificationError.foregroundColor()
+
+        fun errorOverlayBorder(): Color = JBUI.CurrentTheme.NotificationError.borderColor()
 
         internal fun contrast(base: Color, delta: Int): Color {
             val step = if (bright(base)) -delta else delta
@@ -124,208 +352,72 @@ object UiStyle {
             (color.red * 0.299 + color.green * 0.587 + color.blue * 0.114) >= 128
     }
 
-    object Insets {
-        fun none(): java.awt.Insets = JBUI.emptyInsets()
+    /**
+     * Platform typography tokens for use throughout the plugin.
+     *
+     * Use these instead of [java.awt.Font.deriveFont] with manual size multipliers.
+     * All values delegate to [JBFont] helpers which scale with the platform default font.
+     */
+    object Fonts {
+        /** Large display value, e.g. account balance. Maps to [JBFont.h1] bold. */
+        fun display(): JBFont = JBFont.h1().asBold()
 
-        fun transcript(): java.awt.Insets = JBUI.insets(Space.PAD, Space.PAD, Space.PAD, Space.PAD)
+        /** Page/section heading, e.g. login card title. Maps to [JBFont.h3] bold. */
+        fun heading(): JBFont = JBFont.h3().asBold()
 
-        fun userPrompt(): Int = Size.userPromptMin()
+        /** Prominent short content, e.g. device auth code. Maps to [JBFont.h2] bold. */
+        fun large(): JBFont = JBFont.h2().asBold()
 
-        fun empty(): Border = JBUI.Borders.empty(Space.PAD)
+        /** Card/question header font — bold at heading level 4. */
+        fun header(): JBFont = JBFont.h4().asBold()
 
-        fun prompt(): Border = JBUI.Borders.empty(Space.LG, Space.PAD, Space.LG, Space.PAD)
+        /** Hint or description font — plain regular size. */
+        fun hint(): JBFont = JBFont.regular()
 
-        fun header(): Border = JBUI.Borders.empty(Space.LG, Space.LG)
+        /** Standard body/label text. */
+        fun regular(): JBFont = JBFont.regular()
 
-        fun body(): Border = JBUI.Borders.empty(Space.LG, Space.PAD)
+        /** Bold body/label text. */
+        fun bold(): JBFont = JBFont.regular().asBold()
+
+        /** Small secondary text, e.g. metadata labels. */
+        fun small(): JBFont = JBFont.small()
     }
 
-    object Borders {
-        fun card(): Border = cardBorder()
-
-        fun cardBorder(): Border = JBUI.Borders.customLine(Colors.line(), 1)
-
-        fun cardTop(): Border = JBUI.Borders.customLineTop(Colors.line())
-
-        fun warning(): Border = JBUI.Borders.customLine(Colors.warning(), 1)
-
-        fun picker(): Border = JBUI.Borders.empty(Space.XS, Space.LG)
-
-        fun user(): Border = JBUI.Borders.compound(
-            RoundedLineBorder(Colors.line(), JBUI.scale(Space.LG)),
-            JBUI.Borders.empty(Space.LG, Space.PAD),
-        )!!
-
-        fun assistant(): Border = JBUI.Borders.empty()
-    }
-
-    /** Shared geometry for collapsible transcript cards such as tools and reasoning. */
-    object Card {
-        const val LINES = 15
-        const val REASONING_LINES = 5
-
-        fun layout(): BorderLayout = Gap.layout(Space.MD)
-
-        fun groupGap(): Int = Gap.small()
-
-        fun headerInsets(): Border = JBUI.Borders.empty(Space.LG, Space.PAD)
-
-        fun bodyInsets(): Border = JBUI.Borders.empty(Space.LG, Space.PAD)
-
-        fun border(): Border = Borders.card()
-
-        fun divider(): Border = Borders.cardTop()
-
-        fun scrollChrome(): Int = JBUI.scale(Size.CHROME)
-    }
-
-    object Dock {
-        fun banner(): Border = JBUI.Borders.compound(
-            JBUI.Borders.customLineTop(Colors.line()),
-            JBUI.Borders.empty(Space.SM, Space.LG, 0, Space.LG),
-        )!!
-
-        fun neutral(): Border = JBUI.Borders.compound(
-            JBUI.Borders.customLine(Colors.line(), 1),
-            JBUI.Borders.empty(Space.LG, Space.PAD),
-        )!!
-
-        fun warning(): Border = JBUI.Borders.compound(
-            Borders.warning(),
-            JBUI.Borders.empty(Space.LG, Space.PAD),
-        )!!
-    }
-
-    object Gap {
-        fun xs() = JBUI.scale(Space.XS)
-
-        fun inline() = JBUI.scale(Space.MD)
-
-        fun regular() = JBUI.scale(Space.LG)
-
-        fun small() = JBUI.scale(Space.SM)
-
-        fun turn() = JBUI.scale(Space.PAD)
-
-        fun part() = JBUI.scale(Space.SM)
-
-        fun scroll() = JBUI.scale(Size.SCROLL)
-
-        fun layout(gap: Int = Space.LG) = BorderLayout(JBUI.scale(gap), 0)
-    }
-
-    object Buttons {
-        class HoverIcon : JButton() {
-            private var over = false
-
-            init {
-                isFocusable = false
-                setRequestFocusEnabled(false)
-                isContentAreaFilled = false
-                isBorderPainted = false
-                isOpaque = false
-                border = JBUI.Borders.empty()
-                addMouseListener(object : MouseAdapter() {
-                    override fun mouseEntered(e: MouseEvent) {
-                        sync(true)
-                    }
-
-                    override fun mouseExited(e: MouseEvent) {
-                        sync(false)
-                    }
-                })
-            }
-
-            override fun getPreferredSize(): Dimension = JBUI.size(Size.BUTTON, Size.BUTTON)
-
-            override fun getMinimumSize(): Dimension = preferredSize
-
-            override fun getMaximumSize(): Dimension = preferredSize
-
-            override fun paintComponent(g: Graphics) {
-                if (isEnabled && over) paintHover(g)
-                super.paintComponent(g)
-            }
-
-            private fun paintHover(g: Graphics) {
-                val g2 = g.create() as Graphics2D
-                try {
-                    g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
-                    g2.color = JBUI.CurrentTheme.ActionButton.hoverBackground()
-                    val arc = JBUI.scale(JBUI.getInt("Button.arc", 6))
-                    g2.fillRoundRect(0, 0, width, height, arc, arc)
-                } finally {
-                    g2.dispose()
-                }
-            }
-
-            private fun sync(value: Boolean) {
-                if (over == value) return
-                over = value
-                repaint()
-            }
-        }
-
-        fun icon(button: JButton) {
-            button.isFocusable = false
-            button.setRequestFocusEnabled(false)
-            button.isContentAreaFilled = false
-            button.isBorderPainted = false
-            button.isOpaque = false
-            button.border = JBUI.Borders.empty()
-        }
-    }
-
-    object Pickers {
-        open class Label : JBLabel() {
-            private var over = false
-
-            init {
-                border = Borders.picker()
-                background = Colors.picker()
-                // The custom rounded fill needs parent background around the corners.
-                isOpaque = false
-                addMouseListener(object : MouseAdapter() {
-                    override fun mouseEntered(e: MouseEvent) {
-                        sync(true)
-                    }
-
-                    override fun mouseExited(e: MouseEvent) {
-                        sync(false)
-                    }
-                })
-            }
-
-            override fun updateUI() {
-                super.updateUI()
-                border = Borders.picker()
-                background = Colors.picker()
-            }
-
-            override fun paintComponent(g: Graphics) {
-                val g2 = g.create() as Graphics2D
-                try {
-                    g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
-                    g2.color = if (isEnabled && over) Colors.pickerHover() else Colors.picker()
-                    val arc = JBUI.scale(JBUI.getInt("Button.arc", 6))
-                    g2.fillRoundRect(0, 0, width, height, arc, arc)
-                } finally {
-                    g2.dispose()
-                }
-                super.paintComponent(g)
-            }
-
-            private fun sync(value: Boolean) {
-                if (over == value) return
-                over = value
-                repaint()
-            }
-        }
-    }
-
+    /** Small component helpers that keep repeated Swing setup in one place. */
     object Components {
-        fun transparent(component: JComponent) {
-            component.isOpaque = false
+        fun transparent(vararg components: JComponent) {
+            components.forEach { it.isOpaque = false }
+        }
+
+        fun actionForeground(enabled: Boolean): Color = if (enabled) {
+            UIManager.getColor("Button.foreground") ?: UIUtil.getLabelForeground()
+        } else {
+            UIManager.getColor("Button.disabledText") ?: UIUtil.getContextHelpForeground()
+        }
+
+        fun actionBackground(): Color = UIManager.getColor("Button.background") ?: UIUtil.getPanelBackground()
+
+        fun actionBorder() = JBUI.Borders.compound(
+            JBUI.Borders.customLine(UIUtil.getBoundsColor()),
+            JBUI.Borders.empty(Gap.sm(), Gap.pad()),
+        )
+
+        fun actionLabel(component: JComponent, enabled: Boolean = component.isEnabled) {
+            component.foreground = actionForeground(enabled)
+            component.background = actionBackground()
+            component.border = actionBorder()
+            component.isOpaque = true
+        }
+
+        fun actionButton(button: AbstractButton) {
+            button.foreground = actionForeground(button.isEnabled)
+            button.background = actionBackground()
+            button.border = actionBorder()
+            button.isOpaque = true
+            button.isBorderPainted = true
+            button.isContentAreaFilled = false
+            button.isFocusPainted = false
         }
     }
 }

@@ -13,7 +13,7 @@
  *   --base-branch <name> Base branch to merge into, or HEAD for current branch (default: main)
  *   --dry-run            Preview changes without applying them
  *   --no-push            Don't push branches to remote
- *   --no-worktrees       Don't create reference worktrees for manual resolution
+ *   --no-worktrees       Don't create auxiliary worktrees
  *   --report-only        Only generate conflict report, don't merge
  *   --verbose            Enable verbose logging
  *   --author <name>      Author name for branch prefix (default: from git config)
@@ -33,11 +33,18 @@ import { skipFiles } from "./transforms/skip-files"
 import { transformConflictedI18n, transformAllI18n } from "./transforms/transform-i18n"
 // New transforms for auto-resolving more conflict types
 import { transformConflictedTakeTheirs, transformAllTakeTheirs } from "./transforms/transform-take-theirs"
-import { transformConflictedPackageJson, transformAllPackageJson } from "./transforms/transform-package-json"
+import {
+  transformConflictedPackageJson,
+  transformAllPackageJson,
+  reconcileAllPackageJson,
+  assertBunPackageManager,
+} from "./transforms/transform-package-json"
 import { transformConflictedScripts, transformAllScripts } from "./transforms/transform-scripts"
 import { transformConflictedExtensions, transformAllExtensions } from "./transforms/transform-extensions"
 import { transformConflictedWeb, transformAllWeb } from "./transforms/transform-web"
+import { transformKiloWeb } from "./transforms/remove-kilo-web"
 import { resolveLockFileConflicts, regenerateLockFiles } from "./transforms/lock-files"
+import { writeVersion } from "./utils/upstream"
 
 interface MergeOptions {
   version?: string
@@ -201,6 +208,27 @@ async function getAuthor(): Promise<string> {
     .replace(/\s+/g, "")
 }
 
+function manager(content: string): string | undefined {
+  const pkg: unknown = JSON.parse(content)
+  if (!pkg || typeof pkg !== "object" || !("packageManager" in pkg)) return undefined
+  return typeof pkg.packageManager === "string" ? pkg.packageManager : undefined
+}
+
+async function managerAt(ref: string): Promise<string | undefined> {
+  const result = await $`git show ${ref}:package.json`.quiet().nothrow()
+  if (result.exitCode === 0) return manager(result.stdout.toString())
+  logger.warn(`Could not read package.json at ${ref}; excluding it from Bun packageManager validation`)
+  return undefined
+}
+
+async function validateBun(base: string, upstream: string): Promise<void> {
+  const current = manager(await Bun.file("package.json").text())
+  const ours = await managerAt(base)
+  const theirs = await managerAt(upstream)
+  assertBunPackageManager(current, ours, theirs)
+  logger.success(`Validated Bun packageManager: ${current ?? "missing"}`)
+}
+
 async function createBackupBranch(baseBranch: string): Promise<string> {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)
   const backupName = `backup/${baseBranch}-${timestamp}`
@@ -264,12 +292,18 @@ async function main() {
     // historical convention used by older upstream merges ("[Rr]esolve merge conflicts").
     // Without the lowercase alternative, ~70 past merges are dropped from training on
     // this repo, since most older resolution commits use a lowercase "resolve".
-    logger.info("Training rerere cache from past merge history...")
-    const learned = await git.trainRerere("merge: upstream\\|[Rr]esolve merge conflict")
-    if (learned > 0) {
-      logger.success(`Learned ${learned} conflict resolution(s) from history`)
-    } else {
-      logger.info("No new resolutions to learn from history (cache already up to date)")
+    if (options.worktrees) {
+      logger.info("Training rerere cache from past merge history...")
+      const learned = await git.trainRerere("merge: upstream\\|[Rr]esolve merge conflict")
+      if (learned > 0) {
+        logger.success(`Learned ${learned} conflict resolution(s) from history`)
+      }
+      if (learned === 0) {
+        logger.info("No new resolutions to learn from history (cache already up to date)")
+      }
+    }
+    if (!options.worktrees) {
+      logger.info("Skipping rerere history training because --no-worktrees was requested")
     }
   }
 
@@ -386,6 +420,8 @@ async function main() {
   const author = options.author || (await getAuthor())
   const kiloVersion = await version.getCurrentKiloVersion()
   const dirs = ["packages/ui/src/assets/icons/provider", "packages/ui/src/components/provider-icons"]
+  const kiloBranch = `${author}/kilo-opencode-${targetVersion.tag}`
+  const inplace = options.baseBranch === "HEAD" && currentBranch === kiloBranch
 
   logger.info("Resetting generated provider icons before checkout...")
   await git.restoreDirectories(dirs)
@@ -393,18 +429,27 @@ async function main() {
 
   // Create backup branch
   await git.checkout(config.baseBranch)
-  await git.pull(config.originRemote)
+  if (options.baseBranch !== "HEAD") {
+    await git.pull(config.originRemote)
+  }
+  if (options.baseBranch === "HEAD") {
+    logger.info("Using the checked-out HEAD as the merge base without pulling")
+  }
   const baseSha = await git.getCommitHash("HEAD")
   const backupBranch = await createBackupBranch(config.baseBranch)
   logger.info(`Created backup branch: ${backupBranch}`)
 
   // Create Kilo merge branch
-  const kiloBranch = `${author}/kilo-opencode-${targetVersion.tag}`
-  const kiloBackup = await git.backupAndDeleteBranch(kiloBranch)
-  if (kiloBackup) {
-    logger.info(`Backed up existing branch to: ${kiloBackup}`)
+  if (inplace) {
+    logger.info(`Using the checked-out target branch in place: ${kiloBranch}`)
   }
-  await git.createBranch(kiloBranch)
+  if (!inplace) {
+    const kiloBackup = await git.backupAndDeleteBranch(kiloBranch)
+    if (kiloBackup) {
+      logger.info(`Backed up existing branch to: ${kiloBackup}`)
+    }
+    await git.createBranch(kiloBranch)
+  }
 
   if (options.push) {
     await git.push(config.originRemote, kiloBranch, true)
@@ -421,6 +466,15 @@ async function main() {
   await git.createBranch(opencodeBranch)
   logger.info(`Created opencode branch: ${opencodeBranch}`)
 
+  const prior = await git.findLatestCompatCommit(config.baseBranch, targetVersion.commit)
+  if (prior) {
+    logger.info(
+      `Found previous compatibility base: ${prior.message} (${prior.commit.slice(0, 8)}) from upstream ${prior.upstream.slice(0, 8)}`,
+    )
+  } else {
+    logger.warn("No previous compatibility base found; merge base will remain pristine upstream")
+  }
+
   // Step 6: Apply ALL transformations to opencode branch (pre-merge)
   // This reduces conflicts by transforming upstream code to Kilo conventions BEFORE merging
   logger.step(6, 8, "Applying transformations to opencode branch (pre-merge)...")
@@ -430,6 +484,14 @@ async function main() {
   const count = skips.filter((r) => r.action === "removed").length
   if (count > 0) {
     logger.success(`Removed ${count} skipped file(s) from opencode branch`)
+  }
+
+  // Kilo does not ship upstream's embedded web UI command. Remove the known
+  // registration before merging so upstream updates cannot restore it silently.
+  logger.info("Removing unsupported Kilo web command...")
+  const webCommand = await transformKiloWeb({ dryRun: false, verbose: options.verbose })
+  if (webCommand.removals > 0) {
+    logger.success("Removed unsupported Kilo web command registration")
   }
 
   // 6a. Transform package names (opencode-ai -> @kilocode/cli)
@@ -499,6 +561,11 @@ async function main() {
   const keepOursResults = await resetToOurs(config.keepOurs, { dryRun: false, verbose: options.verbose })
   logger.success(`Reset ${keepOursResults.length} files to Kilo's version`)
 
+  // 6k. Record the last merged upstream tag so future automation can find it
+  // without walking ls-remote + isAncestor for every tag.
+  const versionFile = await writeVersion(targetVersion.tag)
+  logger.success(`Recorded ${targetVersion.tag} in ${versionFile.split("/").pop()}`)
+
   // Clean untracked build artifacts from Kilo-specific directories.
   // These packages don't exist in upstream, so their .gitignore files are absent
   // on the opencode branch. Artifacts like bin/, out/, .next/ etc. would otherwise
@@ -508,13 +575,32 @@ async function main() {
 
   // Commit all transformations
   await git.stageAll()
-  await git.commit(`refactor: kilo compat for ${targetVersion.tag}`)
+  const compatMessage = `refactor: kilo compat for ${targetVersion.tag}`
+  if (prior) {
+    const transformed = await git.writeTree()
+    const tree = await git.overlayCompatTree({
+      previous: prior.commit,
+      upstream: prior.upstream,
+      target: targetVersion.commit,
+      transformed,
+      extra: [".opencode-version"],
+    })
+    const commit = await git.createCommit(tree, compatMessage, prior.commit)
+    await git.updateBranch(opencodeBranch, commit)
+    await $`git reset --hard ${commit}`.quiet()
+  } else {
+    await git.commit(compatMessage)
+  }
   logger.success("Committed pre-merge transformations")
 
   // Step 7: Merge into Kilo branch
   logger.step(7, 8, "Merging into Kilo branch...")
 
   await git.checkout(kiloBranch)
+  if (prior) {
+    const linked = await git.recordAncestor(targetVersion.commit, `merge: record upstream ${targetVersion.tag}`)
+    if (linked) logger.info(`Recorded upstream ${targetVersion.tag} as Kilo branch ancestry`)
+  }
   const mergeResult = await git.merge(opencodeBranch)
 
   if (!mergeResult.success) {
@@ -707,6 +793,24 @@ async function main() {
       }
     }
 
+    // Reconcile every package.json that the merge touched, regardless of
+    // whether it was conflicted, auto-resolved by rerere, or merged textually.
+    // rerere can replay stale resolutions that bypass our package.json
+    // transform entirely, so always run our merge logic as the final word for
+    // package.json content. Skip files that are still conflicted so the user
+    // can resolve them manually instead of silently overwriting markers.
+    const stillConflicted = new Set(await git.getConflictedFiles())
+    const reconcileResults = await reconcileAllPackageJson({
+      oursRef: baseSha,
+      theirsRef: opencodeBranch,
+      verbose: options.verbose,
+      skip: stillConflicted,
+    })
+    const reconcileCount = reconcileResults.filter((r) => r.action === "transformed" && r.changes.length > 0).length
+    if (reconcileCount > 0) {
+      logger.success(`Reconciled ${reconcileCount} package.json file(s) post-merge`)
+    }
+
     // Check remaining conflicts
     const remaining = await git.getConflictedFiles()
     // Combine git-reported conflicts with files flagged due to kilocode_change markers
@@ -758,12 +862,25 @@ async function main() {
       // Exit early - don't continue to finalization steps
       process.exit(1)
     } else {
+      await validateBun(baseSha, targetVersion.commit)
       await git.stageAll()
       await git.commit(`merge: upstream ${targetVersion.tag}`)
       logger.success("Merge completed - all conflicts auto-resolved!")
     }
   } else {
     logger.success("Merge completed without conflicts!")
+    // Same reconcile pass as the conflict path: ensure rerere or git's textual
+    // merge can't slip stale package.json resolutions through.
+    const reconcileResults = await reconcileAllPackageJson({
+      oursRef: baseSha,
+      theirsRef: opencodeBranch,
+      verbose: options.verbose,
+    })
+    const reconcileCount = reconcileResults.filter((r) => r.action === "transformed" && r.changes.length > 0).length
+    if (reconcileCount > 0) {
+      logger.success(`Reconciled ${reconcileCount} package.json file(s) post-merge`)
+    }
+    await validateBun(baseSha, targetVersion.commit)
     await git.stageAll()
     const hasChanges = await git.hasUncommittedChanges()
     if (hasChanges) {

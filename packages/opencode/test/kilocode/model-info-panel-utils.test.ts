@@ -6,6 +6,11 @@ describe("model info panel price formatting", () => {
     expect(fmtPrice(0)).toBe("Free")
   })
 
+  test("fmtPrice returns dash for negative values", () => {
+    expect(fmtPrice(-1)).toBe("—")
+    expect(fmtPrice(-1000000)).toBe("—")
+  })
+
   test("fmtPrice uses four decimals for very small prices", () => {
     expect(fmtPrice(0.0095)).toBe("$0.0095/1M")
   })
@@ -22,8 +27,8 @@ describe("model info panel price formatting", () => {
     expect(fmtCachedPrice({ input: 0, output: 0, cache: { read: 0, write: 0 } })).toBe("Free")
   })
 
-  test("fmtCachedPrice returns N/A without cache read", () => {
-    expect(fmtCachedPrice({ input: 3, output: 15, cache: { read: 0, write: 0 } })).toBe("N/A")
+  test("fmtCachedPrice returns null without cache read", () => {
+    expect(fmtCachedPrice({ input: 3, output: 15, cache: { read: 0, write: 0 } })).toBeNull()
   })
 
   test("avgPrice uses cache weighted formula when cache read exists", () => {

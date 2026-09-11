@@ -6,6 +6,7 @@ import { Card } from "@kilocode/kilo-ui/card"
 import { useConfig } from "../../context/config"
 import { useLanguage } from "../../context/language"
 import { useVSCode } from "../../context/vscode"
+import { useImageModels } from "../../context/image-models"
 import type { ExtensionMessage } from "../../types/messages"
 import SettingsRow from "./SettingsRow"
 
@@ -21,8 +22,9 @@ const SHARE_OPTIONS: ShareOption[] = [
 ]
 
 const ExperimentalTab: Component = () => {
-  const { config, updateConfig } = useConfig()
+  const { config, settings, updateConfig, applySetting } = useConfig()
   const language = useLanguage()
+  const imageModels = useImageModels()
   const vscode = useVSCode()
   const [active, setActive] = createSignal(false)
 
@@ -129,19 +131,6 @@ const ExperimentalTab: Component = () => {
         </SettingsRow>
 
         <SettingsRow
-          title={language.t("settings.experimental.pasteSummary.title")}
-          description={language.t("settings.experimental.pasteSummary.description")}
-        >
-          <Switch
-            checked={experimental().disable_paste_summary ?? false}
-            onChange={(checked) => updateExperimental("disable_paste_summary", checked)}
-            hideLabel
-          >
-            {language.t("settings.experimental.pasteSummary.title")}
-          </Switch>
-        </SettingsRow>
-
-        <SettingsRow
           title={language.t("settings.experimental.batch.title")}
           description={language.t("settings.experimental.batch.description")}
         >
@@ -155,41 +144,63 @@ const ExperimentalTab: Component = () => {
         </SettingsRow>
 
         <SettingsRow
-          title={language.t("settings.experimental.semanticIndexing.title")}
-          description={language.t("settings.experimental.semanticIndexing.description")}
+          title={language.t("settings.experimental.imageGeneration.title")}
+          description={language.t("settings.experimental.imageGeneration.description")}
         >
           <Switch
-            checked={experimental().semantic_indexing ?? false}
-            onChange={(checked) => updateExperimental("semantic_indexing", checked)}
+            checked={experimental().image_generation ?? false}
+            onChange={(checked) => updateExperimental("image_generation", checked)}
             hideLabel
           >
-            {language.t("settings.experimental.semanticIndexing.title")}
+            {language.t("settings.experimental.imageGeneration.title")}
+          </Switch>
+        </SettingsRow>
+
+        <Show when={experimental().image_generation}>
+          <SettingsRow
+            title={language.t("settings.experimental.imageGenerationModel.title")}
+            description={language.t("settings.experimental.imageGenerationModel.description")}
+          >
+            <Select
+              options={imageModels.models().map((m) => ({ value: m.id, label: m.name }))}
+              current={imageModels
+                .models()
+                .map((m) => ({ value: m.id, label: m.name }))
+                .find((m) => m.value === experimental().image_generation_model)}
+              value={(item) => item.value}
+              label={(item) => item.label}
+              onSelect={(item) => updateExperimental("image_generation_model", item?.value ?? undefined)}
+              variant="secondary"
+              size="small"
+              triggerVariant="settings"
+              placeholder={language.t("settings.experimental.imageGenerationModel.placeholder")}
+            />
+          </SettingsRow>
+        </Show>
+
+        <SettingsRow
+          title={language.t("settings.experimental.sharedAgentBoard.title")}
+          description={language.t("settings.experimental.sharedAgentBoard.description")}
+        >
+          <Switch
+            checked={experimental().shared_agent_board ?? false}
+            onChange={(checked) => updateExperimental("shared_agent_board", checked)}
+            hideLabel
+          >
+            {language.t("settings.experimental.sharedAgentBoard.title")}
           </Switch>
         </SettingsRow>
 
         <SettingsRow
-          title={language.t("settings.experimental.codebaseSearch.title")}
-          description={language.t("settings.experimental.codebaseSearch.description")}
+          title={language.t("settings.experimental.nativeNotebookTools.title")}
+          description={language.t("settings.experimental.nativeNotebookTools.description")}
         >
           <Switch
-            checked={experimental().codebase_search ?? false}
-            onChange={(checked) => updateExperimental("codebase_search", checked)}
+            checked={experimental().native_notebook_tools ?? false}
+            onChange={(checked) => updateExperimental("native_notebook_tools", checked)}
             hideLabel
           >
-            {language.t("settings.experimental.codebaseSearch.title")}
-          </Switch>
-        </SettingsRow>
-
-        <SettingsRow
-          title={language.t("settings.experimental.agentManagerTool.title")}
-          description={language.t("settings.experimental.agentManagerTool.description")}
-        >
-          <Switch
-            checked={experimental().agent_manager_tool ?? false}
-            onChange={(checked) => updateExperimental("agent_manager_tool", checked)}
-            hideLabel
-          >
-            {language.t("settings.experimental.agentManagerTool.title")}
+            {language.t("settings.experimental.nativeNotebookTools.title")}
           </Switch>
         </SettingsRow>
 
@@ -203,6 +214,58 @@ const ExperimentalTab: Component = () => {
             hideLabel
           >
             {language.t("settings.experimental.continueOnDeny.title")}
+          </Switch>
+        </SettingsRow>
+
+        <SettingsRow
+          title={language.t("settings.experimental.multiProject.title")}
+          description={language.t("settings.experimental.multiProject.description")}
+        >
+          <Switch
+            checked={settings().multiProject === true}
+            onChange={(checked) => applySetting("multiProject", checked, "experimental.multiProject")}
+            hideLabel
+          >
+            {language.t("settings.experimental.multiProject.title")}
+          </Switch>
+        </SettingsRow>
+
+        <SettingsRow
+          title={language.t("settings.experimental.claudeMigration.title")}
+          description={language.t("settings.experimental.claudeMigration.description")}
+        >
+          <Switch
+            checked={settings().claudeMigration === true}
+            onChange={(checked) => applySetting("claudeMigration", checked, "experimental.claudeMigration")}
+            hideLabel
+          >
+            {language.t("settings.experimental.claudeMigration.title")}
+          </Switch>
+        </SettingsRow>
+
+        <SettingsRow
+          title={language.t("settings.browser.enable.title")}
+          description={language.t("settings.browser.enable.description")}
+        >
+          <Switch
+            checked={settings().browserAutomation === true}
+            onChange={(checked) => applySetting("browserAutomation", checked, "experimental.browserAutomation")}
+            hideLabel
+          >
+            {language.t("settings.browser.enable.title")}
+          </Switch>
+        </SettingsRow>
+
+        <SettingsRow
+          title={language.t("settings.experimental.taskModelSelection.title")}
+          description={language.t("settings.experimental.taskModelSelection.description")}
+        >
+          <Switch
+            checked={experimental().task_model_selection ?? false}
+            onChange={(checked) => updateExperimental("task_model_selection", checked)}
+            hideLabel
+          >
+            {language.t("settings.experimental.taskModelSelection.title")}
           </Switch>
         </SettingsRow>
 

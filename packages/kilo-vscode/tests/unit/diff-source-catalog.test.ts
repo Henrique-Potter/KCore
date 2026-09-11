@@ -2,7 +2,8 @@ import { describe, it, expect } from "bun:test"
 import type { KiloConnectionService } from "../../src/services/cli-backend"
 import { DiffSourceCatalog } from "../../src/diff/sources/catalog"
 import { sessionDescriptor } from "../../src/diff/sources/session"
-import { WORKSPACE_DESCRIPTOR } from "../../src/diff/sources/worktree"
+import { WORKSPACE_DESCRIPTOR, createWorktreeDiffSource } from "../../src/diff/sources/worktree"
+import { GitOps } from "../../src/agent-manager/GitOps"
 
 // Minimal stand-in for the connection service — the catalog only holds a
 // reference and passes it to the source factories, so we never exercise any
@@ -14,14 +15,14 @@ function makeCatalog(): DiffSourceCatalog {
 }
 
 describe("DiffSourceCatalog.listAvailable", () => {
-  it("returns workspace + session when both are available", () => {
+  it("returns workspace + staged + unstaged + session when both are available", () => {
     const out = makeCatalog().listAvailable({ workspaceRoot: "/repo", sessionId: "s1" })
-    expect(out.map((d) => d.id)).toEqual(["workspace", "session:s1"])
+    expect(out.map((d) => d.id)).toEqual(["workspace", "staged", "unstaged", "session:s1"])
   })
 
-  it("returns only workspace when sessionId is missing", () => {
+  it("returns workspace + staged + unstaged when sessionId is missing", () => {
     const out = makeCatalog().listAvailable({ workspaceRoot: "/repo" })
-    expect(out.map((d) => d.id)).toEqual(["workspace"])
+    expect(out.map((d) => d.id)).toEqual(["workspace", "staged", "unstaged"])
   })
 
   it("returns only session when workspaceRoot is missing", () => {
@@ -120,5 +121,48 @@ describe("descriptor types", () => {
 
   it("session descriptor has type 'session'", () => {
     expect(sessionDescriptor("s1").type).toBe("session")
+  })
+})
+
+describe("initial worktree preview", () => {
+  it("starts only two text previews without waiting for their content", async () => {
+    const git = new GitOps({ log: () => undefined })
+    const calls: string[] = []
+    const source = createWorktreeDiffSource({
+      git,
+      log: () => undefined,
+      dir: () => "/repo",
+      baseBranch: "main",
+      summary: async () =>
+        Array.from({ length: 20 }, (_, index) => ({
+          file: `file-${index}.ts`,
+          before: "",
+          after: "",
+          patch: "",
+          additions: 1,
+          deletions: 0,
+          summarized: true,
+          tracked: true,
+          generatedLike: false,
+          status: "modified" as const,
+        })),
+      file: async (_dir, _base, file) => {
+        calls.push(file)
+        return null
+      },
+    })
+    expect((await source.fetch()).diffs).toHaveLength(20)
+    expect(calls).toEqual(["file-0.ts", "file-1.ts"])
+    await source.fetch()
+    expect(calls).toHaveLength(2)
+    source.dispose?.()
+    git.dispose()
+  })
+})
+
+describe("DiffSourceCatalog.dispose", () => {
+  it("disposes without throwing when no branch resources were created", () => {
+    const cat = makeCatalog()
+    expect(() => cat.dispose()).not.toThrow()
   })
 })

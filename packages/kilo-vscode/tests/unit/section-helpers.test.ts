@@ -7,6 +7,7 @@ import {
   isGrouped,
   isGroupStart,
   isGroupEnd,
+  sortWorktrees,
 } from "../../webview-ui/agent-manager/section-helpers"
 import type { WorktreeState, SectionState } from "../../webview-ui/src/types/messages"
 
@@ -33,14 +34,14 @@ describe("buildTopLevelItems", () => {
     expect(result.every((r) => r.kind === "worktree")).toBe(true)
   })
 
-  it("interleaves sections and worktrees per order", () => {
+  it("places ungrouped worktrees before sections", () => {
     const s1 = sec("s1", 0)
     const w1 = wt("w1")
     const s2 = sec("s2", 1)
     const result = buildTopLevelItems([s1, s2], [w1], [w1], ["s1", "w1", "s2"])
     expect(result).toHaveLength(3)
-    expect(result[0]).toEqual({ kind: "section", section: s1 })
-    expect(result[1]).toEqual({ kind: "worktree", wt: w1 })
+    expect(result[0]).toEqual({ kind: "worktree", wt: w1 })
+    expect(result[1]).toEqual({ kind: "section", section: s1 })
     expect(result[2]).toEqual({ kind: "section", section: s2 })
   })
 
@@ -52,11 +53,10 @@ describe("buildTopLevelItems", () => {
     // Only s1 is in the order array
     const result = buildTopLevelItems([s1, s2], [w1, w2], [w1, w2], ["s1", "w1"])
     expect(result).toHaveLength(4)
-    expect(result[0]).toEqual({ kind: "section", section: s1 })
-    expect(result[1]).toEqual({ kind: "worktree", wt: w1 })
-    // unordered items appended
-    expect(result[2]).toEqual({ kind: "section", section: s2 })
-    expect(result[3]).toEqual({ kind: "worktree", wt: w2 })
+    expect(result[0]).toEqual({ kind: "worktree", wt: w1 })
+    expect(result[1]).toEqual({ kind: "worktree", wt: w2 })
+    expect(result[2]).toEqual({ kind: "section", section: s1 })
+    expect(result[3]).toEqual({ kind: "section", section: s2 })
   })
 
   it("skips duplicate ids in order array", () => {
@@ -72,8 +72,8 @@ describe("buildTopLevelItems", () => {
     const w2 = wt("w2")
     const result = buildTopLevelItems([s1], [w2], [w1, w2], ["w1", "s1", "w2"])
     expect(result).toEqual([
-      { kind: "section", section: s1 },
       { kind: "worktree", wt: w2 },
+      { kind: "section", section: s1 },
     ])
   })
 })
@@ -84,6 +84,12 @@ describe("completeSidebarOrder", () => {
     const w1 = wt("w1", { sectionId: "s1" })
     const w2 = wt("w2")
     expect(completeSidebarOrder([s1], [w1, w2], ["w2", "s1"])).toEqual(["w2", "s1", "w1"])
+  })
+
+  it("normalizes ungrouped worktrees above sections", () => {
+    const s1 = sec("s1", 0)
+    const w1 = wt("w1")
+    expect(completeSidebarOrder([s1], [w1], ["s1", "w1"])).toEqual(["w1", "s1"])
   })
 
   it("drops stale ids and skips duplicates", () => {
@@ -104,6 +110,23 @@ describe("isGrouped", () => {
 
   it("returns false when groupId is empty string", () => {
     expect(isGrouped(wt("a", { groupId: "" }))).toBe(false)
+  })
+})
+
+describe("sortWorktrees", () => {
+  it("applies persisted order", () => {
+    const all = [wt("a"), wt("b"), wt("c")]
+    expect(sortWorktrees(all, ["c", "a", "b"]).map((item) => item.id)).toEqual(["c", "a", "b"])
+  })
+
+  it("keeps multi-version siblings adjacent at the first group position", () => {
+    const all = [wt("a", { groupId: "g" }), wt("b"), wt("c", { groupId: "g" })]
+    expect(sortWorktrees(all, ["b", "c", "a"]).map((item) => item.id)).toEqual(["b", "c", "a"])
+  })
+
+  it("appends worktrees missing from persisted order", () => {
+    const all = [wt("a"), wt("b"), wt("c")]
+    expect(sortWorktrees(all, ["b"]).map((item) => item.id)).toEqual(["b", "a", "c"])
   })
 })
 
@@ -151,7 +174,7 @@ describe("buildSidebarOrder", () => {
   it("returns LOCAL + all sorted worktrees when no sections exist", () => {
     const sorted = [wt("a"), wt("b"), wt("c")]
     const items = buildTopLevelItems([], [], sorted, [])
-    const result = buildSidebarOrder(items, sorted, [], () => [], [])
+    const result = buildSidebarOrder(items, sorted, [], () => [])
     expect(result).toEqual([
       { type: "local", id: "local" },
       { type: "wt", id: "a" },
@@ -160,7 +183,7 @@ describe("buildSidebarOrder", () => {
     ])
   })
 
-  it("includes section worktrees in visual order", () => {
+  it("keeps ungrouped worktrees above section worktrees", () => {
     const s1 = sec("s1", 0)
     const w1 = wt("w1", { sectionId: "s1" })
     const w2 = wt("w2", { sectionId: "s1" })
@@ -168,12 +191,12 @@ describe("buildSidebarOrder", () => {
     const sorted = [w1, w2, w3]
     const items = buildTopLevelItems([s1], [w3], sorted, ["s1", "w3"])
     const members = (id: string) => (id === "s1" ? [w1, w2] : [])
-    const result = buildSidebarOrder(items, sorted, [s1], members, [])
+    const result = buildSidebarOrder(items, sorted, [s1], members)
     expect(result).toEqual([
       { type: "local", id: "local" },
+      { type: "wt", id: "w3" },
       { type: "wt", id: "w1" },
       { type: "wt", id: "w2" },
-      { type: "wt", id: "w3" },
     ])
   })
 
@@ -184,14 +207,28 @@ describe("buildSidebarOrder", () => {
     const sorted = [w1, w2]
     const items = buildTopLevelItems([s1], [w2], sorted, ["s1", "w2"])
     const members = (id: string) => (id === "s1" ? [w1] : [])
-    const result = buildSidebarOrder(items, sorted, [s1], members, [])
+    const result = buildSidebarOrder(items, sorted, [s1], members)
     expect(result).toEqual([
       { type: "local", id: "local" },
       { type: "wt", id: "w2" },
     ])
   })
 
-  it("respects section order between sections and ungrouped worktrees", () => {
+  it.each(["visible", "hidden"])("keeps only the %s deletion anchor and visible worktrees", (anchor) => {
+    const section = sec("s1", 0, { collapsed: true })
+    const hidden = wt("hidden", { sectionId: "s1" })
+    const sibling = wt("sibling", { sectionId: "s1" })
+    const visible = wt("visible")
+    const sorted = [hidden, sibling, visible]
+    const items = buildTopLevelItems([section], [visible], sorted, [])
+    const result = buildSidebarOrder(items, sorted, [section], () => [hidden, sibling], anchor)
+    expect(result.map((item) => item.id)).toEqual(
+      anchor === "hidden" ? ["local", "visible", "hidden"] : ["local", "visible"],
+    )
+    expect(section.collapsed).toBe(true)
+  })
+
+  it("respects section order after ungrouped worktrees", () => {
     const s1 = sec("s1", 0)
     const s2 = sec("s2", 1)
     const w1 = wt("w1", { sectionId: "s1" })
@@ -204,20 +241,17 @@ describe("buildSidebarOrder", () => {
       if (id === "s2") return [w3]
       return []
     }
-    const result = buildSidebarOrder(items, sorted, [s1, s2], members, [])
-    expect(result.map((r) => r.id)).toEqual(["local", "w1", "w2", "w3"])
+    const result = buildSidebarOrder(items, sorted, [s1, s2], members)
+    expect(result.map((r) => r.id)).toEqual(["local", "w2", "w1", "w3"])
   })
 
-  it("appends unassigned sessions after worktrees", () => {
+  it("appends nothing after worktrees (sessions live in the history view)", () => {
     const sorted = [wt("a")]
     const items = buildTopLevelItems([], [], sorted, [])
-    const sessions = [{ id: "sess1" }, { id: "sess2" }]
-    const result = buildSidebarOrder(items, sorted, [], () => [], sessions)
+    const result = buildSidebarOrder(items, sorted, [], () => [])
     expect(result).toEqual([
       { type: "local", id: "local" },
       { type: "wt", id: "a" },
-      { type: "session", id: "sess1" },
-      { type: "session", id: "sess2" },
     ])
   })
 })

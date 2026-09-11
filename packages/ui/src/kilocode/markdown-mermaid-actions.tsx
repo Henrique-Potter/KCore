@@ -17,7 +17,13 @@ function Chevron() {
   return (
     <span data-slot="markdown-mermaid-chevron" aria-hidden="true">
       <svg viewBox="0 0 16 16" fill="none">
-        <path d="M4 6L8 10L12 6" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6" />
+        <path
+          d="M4 6L8 10L12 6"
+          stroke="currentColor"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          stroke-width="1.6"
+        />
       </svg>
     </span>
   )
@@ -43,10 +49,15 @@ function Item(props: { label: string; onSelect: () => void }) {
 export function MermaidActions(props: Props) {
   const [copied, setCopied] = createSignal(false)
   const copy = (run: () => Promise<void>) => {
-    void run().then(() => {
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    })
+    void run()
+      .then(() => {
+        setCopied(true)
+        setTimeout(() => setCopied(false), 1500)
+      })
+      .catch((err) => {
+        // Avoid unhandledrejection; Copy PNG used to fail silently under webview CSP.
+        console.warn("Mermaid copy failed", err)
+      })
   }
 
   return (

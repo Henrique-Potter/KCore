@@ -8,21 +8,21 @@ import {
   isEventFromForeignProject,
   mapCloudSessionMessageToWebviewMessage,
   MessageConfirmation,
-  mergeFileSearchResults,
   getErrorMessage,
   getConfigErrorDetails,
   type ProviderInfo,
 } from "../../src/kilo-provider-utils"
-import { mergeFileSearchItems } from "../../src/kilo-provider/file-search-items"
 import type { CloudSessionMessage } from "../../src/services/cli-backend/types"
+import type { SyncPayload } from "../../src/services/cli-backend/sdk-sse-adapter"
 import type {
   Session,
   Agent,
   Provider,
   Event,
-  EventMessagePartUpdated,
-  EventMessageUpdated,
   EventSessionStatus,
+  EventSessionTurnClose,
+  EventSessionError,
+  EventSandboxStatusChanged,
   EventPermissionAsked,
   EventPermissionReplied,
   EventTodoUpdated,
@@ -32,12 +32,15 @@ import type {
   EventSuggestionShown,
   EventSuggestionAccepted,
   EventSuggestionDismissed,
-  EventSessionCreated,
-  EventSessionUpdated,
   EventServerConnected,
   TextPart,
   AssistantMessage,
 } from "@kilocode/sdk/v2/client"
+
+type SyncEventMessagePartUpdated = Extract<SyncPayload, { name: "message.part.updated.1" }>
+type SyncEventMessageUpdated = Extract<SyncPayload, { name: "message.updated.1" }>
+type SyncEventSessionCreated = Extract<SyncPayload, { name: "session.created.1" }>
+type SyncEventSessionUpdated = Extract<SyncPayload, { name: "session.updated.1" }>
 
 function makeSession(overrides: Partial<Session> = {}): Session {
   return {
@@ -157,6 +160,55 @@ describe("sessionToWebview", () => {
     expect(() => new Date(result.createdAt)).not.toThrow()
     expect(new Date(result.createdAt).getTime()).toBe(1700000000000)
   })
+
+  it("clears optional state omitted from a full session snapshot", () => {
+    const result = sessionToWebview(makeSession())
+    expect(result.revert).toBeNull()
+    expect(result.summary).toBeNull()
+    expect(result.goal).toBeNull()
+  })
+
+  it.each([true, false])("projects the saved goal with active=%s", (active) => {
+    const goal = { text: "Fix the failing tests", active }
+    const result = sessionToWebview(makeSession({ metadata: { "kilo.goal": goal, unrelated: "private" } }))
+    expect(result.goal).toEqual(goal)
+    expect(result).not.toHaveProperty("metadata")
+  })
+
+  it("clears the saved goal through JSON serialization and a session merge", () => {
+    const saved = sessionToWebview(makeSession({ metadata: { "kilo.goal": { text: "Fix tests", active: true } } }))
+    const cleared = JSON.parse(JSON.stringify(sessionToWebview(makeSession({ metadata: {} }))))
+    expect({ ...saved, ...cleared }.goal).toBeNull()
+  })
+
+  it.each(["active", "complete", "blocked", "paused"] as const)(
+    "carries %s goal state and report through JSON",
+    (status) => {
+      const goal = {
+        text: "Fix tests",
+        status,
+        active: status === "active",
+        reason: "Reported by the working model, not independently verified.",
+      }
+      const result = sessionToWebview(makeSession({ metadata: { "kilo.goal": goal } }))
+      expect(JSON.parse(JSON.stringify(result)).goal).toEqual(goal)
+    },
+  )
+
+  it.each([null, "text", { text: 1, active: true }, { text: "Goal" }, { text: "Goal", active: "true" }])(
+    "ignores invalid goal metadata %j",
+    (goal) => {
+      expect(sessionToWebview(makeSession({ metadata: { "kilo.goal": goal } })).goal).toBeNull()
+    },
+  )
+
+  it("preserves the workspace restoration outcome from a revert response", () => {
+    const session = {
+      ...makeSession(),
+      revert: { messageID: "msg-1", workspace: "snapshots-disabled" as const },
+    }
+    expect(sessionToWebview(session).revert).toMatchObject({ workspace: "snapshots-disabled" })
+  })
 })
 
 describe("indexProvidersById", () => {
@@ -244,11 +296,17 @@ describe("buildSettingPath", () => {
 })
 
 describe("mapSSEEventToWebviewMessage", () => {
-  it("maps message.part.updated to partUpdated", () => {
-    const event: EventMessagePartUpdated = {
-      type: "message.part.updated",
-      properties: {
+  it("maps message.part.updated.1 to partUpdated", () => {
+    const event: SyncEventMessagePartUpdated = {
+      type: "sync",
+      name: "message.part.updated.1",
+      id: "evt-part",
+      seq: 1,
+      aggregateID: "sessionID",
+      data: {
+        sessionID: "sess-1",
         part: makeTextPart({ text: "hello" }),
+        time: 1700000000000,
       },
     }
     const msg = mapSSEEventToWebviewMessage(event, "sess-1")
@@ -259,18 +317,33 @@ describe("mapSSEEventToWebviewMessage", () => {
     }
   })
 
-  it("returns null for message.part.updated when sessionID is undefined", () => {
-    const event: EventMessagePartUpdated = {
-      type: "message.part.updated",
-      properties: { part: makeTextPart({ text: "" }) },
+  it("maps message.part.updated.1 without a tracked sessionID", () => {
+    const event: SyncEventMessagePartUpdated = {
+      type: "sync",
+      name: "message.part.updated.1",
+      id: "evt-part",
+      seq: 1,
+      aggregateID: "sessionID",
+      data: {
+        sessionID: "sess-1",
+        part: makeTextPart({ text: "" }),
+        time: 1700000000000,
+      },
     }
-    expect(mapSSEEventToWebviewMessage(event, undefined)).toBeNull()
+    const msg = mapSSEEventToWebviewMessage(event, undefined)
+    expect(msg?.type).toBe("partUpdated")
+    if (msg?.type === "partUpdated") expect(msg.sessionID).toBe("sess-1")
   })
 
-  it("maps message.updated to messageCreated with ISO date", () => {
-    const event: EventMessageUpdated = {
-      type: "message.updated",
-      properties: {
+  it("maps message.updated.1 to messageCreated with ISO date", () => {
+    const event: SyncEventMessageUpdated = {
+      type: "sync",
+      name: "message.updated.1",
+      id: "evt-message",
+      seq: 1,
+      aggregateID: "sessionID",
+      data: {
+        sessionID: "sess-1",
         info: makeAssistantMessage({ cost: 0.001 }),
       },
     }
@@ -309,6 +382,73 @@ describe("mapSSEEventToWebviewMessage", () => {
       expect(msg.message).toBe("trying again")
       expect(msg.next).toBe(5000)
     }
+  })
+
+  it("maps sandbox status changes to effective button state", () => {
+    const event: EventSandboxStatusChanged = {
+      type: "sandbox.status.changed",
+      properties: { sessionID: "sess-1", directory: "/tmp", enabled: true, available: true, version: 3 },
+    }
+
+    expect(mapSSEEventToWebviewMessage(event, "sess-1")).toEqual({
+      type: "sandboxStatus",
+      sessionID: "sess-1",
+      directory: "/tmp",
+      enabled: true,
+      available: true,
+      reason: undefined,
+      version: 3,
+    })
+  })
+
+  it("maps session.turn.close with its event identity and terminal reason", () => {
+    const event: EventSessionTurnClose = {
+      id: "evt-turn",
+      type: "session.turn.close",
+      properties: { sessionID: "sess-1", reason: "interrupted" },
+    }
+    const msg = mapSSEEventToWebviewMessage(event, "sess-1")
+    expect(msg).toEqual({ type: "sessionTurnClosed", sessionID: "sess-1", eventID: "evt-turn", reason: "interrupted" })
+  })
+
+  it("forwards the parent session ID when a child turn closes", () => {
+    const event: EventSessionTurnClose = {
+      id: "evt-child-turn",
+      type: "session.turn.close",
+      properties: { sessionID: "child", parentID: "parent", reason: "completed" },
+    }
+
+    expect(mapSSEEventToWebviewMessage(event, "child")).toEqual({
+      type: "sessionTurnClosed",
+      sessionID: "child",
+      eventID: "evt-child-turn",
+      reason: "completed",
+      parentID: "parent",
+    })
+  })
+
+  it("maps session errors with their event identity and message", () => {
+    const event: EventSessionError = {
+      id: "evt-error",
+      type: "session.error",
+      properties: {
+        sessionID: "sess-1",
+        error: {
+          name: "APIError",
+          data: {
+            message: "prompt_cache_breakpoint is not supported on this model",
+            isRetryable: false,
+          },
+        },
+      },
+    }
+
+    expect(mapSSEEventToWebviewMessage(event, "sess-1")).toEqual({
+      type: "sessionError",
+      eventID: "evt-error",
+      sessionID: "sess-1",
+      error: event.properties.error,
+    })
   })
 
   it("maps permission.asked to permissionRequest", () => {
@@ -456,8 +596,8 @@ describe("mapSSEEventToWebviewMessage", () => {
       properties: {
         id: "sug-1",
         sessionID: "sess-1",
-        text: "Review changes?",
-        actions: [{ label: "Start", prompt: "/local-review-uncommitted" }],
+        text: "Run tests?",
+        actions: [{ label: "Run tests", prompt: "Run the test suite" }],
       },
     }
     const msg = mapSSEEventToWebviewMessage(event, "sess-1")
@@ -471,7 +611,7 @@ describe("mapSSEEventToWebviewMessage", () => {
         sessionID: "sess-1",
         requestID: "sug-1",
         index: 0,
-        action: { label: "Start", prompt: "/local-review-uncommitted" },
+        action: { label: "Run tests", prompt: "Run the test suite" },
       },
     }
     const msg = mapSSEEventToWebviewMessage(event, "sess-1")
@@ -487,10 +627,14 @@ describe("mapSSEEventToWebviewMessage", () => {
     expect(msg?.type).toBe("suggestionResolved")
   })
 
-  it("maps session.created to sessionCreated with ISO dates", () => {
-    const event: EventSessionCreated = {
-      type: "session.created",
-      properties: { info: makeSession() },
+  it("maps session.created.1 to sessionCreated with ISO dates", () => {
+    const event: SyncEventSessionCreated = {
+      type: "sync",
+      name: "session.created.1",
+      id: "evt-session",
+      seq: 1,
+      aggregateID: "sessionID",
+      data: { sessionID: "sess-1", info: makeSession() },
     }
     const msg = mapSSEEventToWebviewMessage(event, "sess-1")
     expect(msg?.type).toBe("sessionCreated")
@@ -499,13 +643,16 @@ describe("mapSSEEventToWebviewMessage", () => {
     }
   })
 
-  it("maps session.updated to sessionUpdated with ISO dates", () => {
-    const event: EventSessionUpdated = {
-      type: "session.updated",
-      properties: { info: makeSession({ id: "sess-2" }) },
+  it("ignores session.updated.1 after backend state reconciliation", () => {
+    const event: SyncEventSessionUpdated = {
+      type: "sync",
+      name: "session.updated.1",
+      id: "evt-session",
+      seq: 1,
+      aggregateID: "sessionID",
+      data: { sessionID: "sess-2", info: { id: "sess-2", time: { updated: 1700001000000 } } },
     }
-    const msg = mapSSEEventToWebviewMessage(event, "sess-2")
-    expect(msg?.type).toBe("sessionUpdated")
+    expect(mapSSEEventToWebviewMessage(event, "sess-2")).toBeNull()
   })
 
   it("returns null for server.connected (no webview message)", () => {
@@ -520,37 +667,46 @@ describe("mapSSEEventToWebviewMessage", () => {
 })
 
 describe("isEventFromForeignProject", () => {
-  const session = (projectID: string) =>
-    ({
-      id: "s1",
-      projectID,
-      title: "test",
-      directory: "/workspace",
-      time: { created: 0, updated: 0 },
-    }) as unknown as Session
+  function created(projectID: string): SyncEventSessionCreated {
+    return {
+      type: "sync",
+      name: "session.created.1",
+      id: "evt-session",
+      seq: 1,
+      aggregateID: "sessionID",
+      data: { sessionID: "sess-1", info: makeSession({ projectID }) },
+    }
+  }
 
-  it("drops session.created from a different project", () => {
-    const event: Event = { type: "session.created", properties: { info: session("project-B") } }
-    expect(isEventFromForeignProject(event, "project-A")).toBe(true)
+  function updated(projectID: string): SyncEventSessionUpdated {
+    return {
+      type: "sync",
+      name: "session.updated.1",
+      id: "evt-session",
+      seq: 1,
+      aggregateID: "sessionID",
+      data: { sessionID: "sess-1", info: { projectID } },
+    }
+  }
+
+  it("drops session.created.1 from a different project", () => {
+    expect(isEventFromForeignProject(created("project-B"), "project-A")).toBe(true)
   })
 
-  it("drops session.updated from a different project", () => {
-    const event: Event = { type: "session.updated", properties: { info: session("project-B") } }
-    expect(isEventFromForeignProject(event, "project-A")).toBe(true)
+  it("drops session.updated.1 from a different project", () => {
+    expect(isEventFromForeignProject(updated("project-B"), "project-A")).toBe(true)
   })
 
-  it("keeps session.created from the same project", () => {
-    const event: Event = { type: "session.created", properties: { info: session("project-A") } }
-    expect(isEventFromForeignProject(event, "project-A")).toBe(false)
+  it("keeps session.created.1 from the same project", () => {
+    expect(isEventFromForeignProject(created("project-A"), "project-A")).toBe(false)
   })
 
   it("keeps all events when expectedProjectID is undefined", () => {
-    const event: Event = { type: "session.created", properties: { info: session("project-B") } }
-    expect(isEventFromForeignProject(event, undefined)).toBe(false)
+    expect(isEventFromForeignProject(created("project-B"), undefined)).toBe(false)
   })
 
   it("keeps non-session events regardless of project", () => {
-    const event = { type: "server.heartbeat", properties: {} } as unknown as Event
+    const event: EventServerConnected = { type: "server.connected", properties: {} }
     expect(isEventFromForeignProject(event, "project-A")).toBe(false)
   })
 })
@@ -604,152 +760,6 @@ describe("mapCloudSessionMessage", () => {
   it("maps user role correctly", () => {
     const msg = mapCloudSessionMessageToWebviewMessage(makeCloudMessage({ role: "user" }))
     expect(msg.role).toBe("user")
-  })
-})
-
-describe("mergeFileSearchItems", () => {
-  it("puts exact folder matches before file matches", () => {
-    const result = mergeFileSearchItems({
-      query: "script",
-      files: ["script/hooks", "script/release", "script/beta.ts"],
-      folders: ["script/", "script/run-script/"],
-    })
-    expect(result).toEqual([
-      { path: "script/", type: "folder" },
-      { path: "script/hooks", type: "file" },
-      { path: "script/release", type: "file" },
-      { path: "script/beta.ts", type: "file" },
-      { path: "script/run-script/", type: "folder" },
-    ])
-  })
-
-  it("keeps file ordering before non-prefix folder matches", () => {
-    const result = mergeFileSearchItems({
-      query: "test",
-      files: ["src/test.ts"],
-      folders: ["src/latest/"],
-    })
-    expect(result).toEqual([
-      { path: "src/test.ts", type: "file" },
-      { path: "src/latest/", type: "folder" },
-    ])
-  })
-
-  it("normalizes Windows separators for matching and output", () => {
-    const result = mergeFileSearchItems({
-      query: "kilo-vscode",
-      files: ["packages\\kilo-vscode\\src\\KiloProvider.ts"],
-      folders: ["packages\\kilo-vscode\\"],
-    })
-    expect(result).toEqual([
-      { path: "packages/kilo-vscode/", type: "folder" },
-      { path: "packages/kilo-vscode/src/KiloProvider.ts", type: "file" },
-    ])
-  })
-})
-
-describe("mergeFileSearchResults", () => {
-  it("returns backend results when no open files", () => {
-    const result = mergeFileSearchResults({
-      query: "",
-      backend: ["src/a.ts", "src/b.ts"],
-      open: new Set(),
-    })
-    expect(result).toEqual(["src/a.ts", "src/b.ts"])
-  })
-
-  it("places open files before backend results", () => {
-    const result = mergeFileSearchResults({
-      query: "",
-      backend: ["src/a.ts", "src/b.ts", "src/c.ts"],
-      open: new Set(["src/c.ts", "src/d.ts"]),
-    })
-    expect(result).toEqual(["src/c.ts", "src/d.ts", "src/a.ts", "src/b.ts"])
-  })
-
-  it("places active file first among open files", () => {
-    const result = mergeFileSearchResults({
-      query: "",
-      backend: ["src/a.ts"],
-      open: new Set(["src/b.ts", "src/c.ts"]),
-      active: "src/c.ts",
-    })
-    expect(result).toEqual(["src/c.ts", "src/b.ts", "src/a.ts"])
-  })
-
-  it("ignores active file when it is not in open set", () => {
-    const result = mergeFileSearchResults({
-      query: "",
-      backend: ["src/a.ts"],
-      open: new Set(["src/b.ts"]),
-      active: "src/x.ts",
-    })
-    expect(result).toEqual(["src/b.ts", "src/a.ts"])
-  })
-
-  it("deduplicates open files from backend results", () => {
-    const result = mergeFileSearchResults({
-      query: "",
-      backend: ["src/a.ts", "src/b.ts"],
-      open: new Set(["src/a.ts"]),
-    })
-    expect(result).toEqual(["src/a.ts", "src/b.ts"])
-  })
-
-  it("filters open files by query", () => {
-    const result = mergeFileSearchResults({
-      query: "config",
-      backend: ["src/config.ts", "src/util.ts"],
-      open: new Set(["src/index.ts", "src/config.ts", "README.md"]),
-    })
-    expect(result).toEqual(["src/config.ts", "src/util.ts"])
-  })
-
-  it("query filtering is case-insensitive", () => {
-    const result = mergeFileSearchResults({
-      query: "READ",
-      backend: [],
-      open: new Set(["README.md", "src/index.ts"]),
-    })
-    expect(result).toEqual(["README.md"])
-  })
-
-  it("shows all open files on empty query", () => {
-    const result = mergeFileSearchResults({
-      query: "",
-      backend: [],
-      open: new Set(["src/a.ts", "src/b.ts"]),
-    })
-    expect(result).toEqual(["src/a.ts", "src/b.ts"])
-  })
-
-  it("shows all open files on whitespace-only query", () => {
-    const result = mergeFileSearchResults({
-      query: "  ",
-      backend: ["src/x.ts"],
-      open: new Set(["src/a.ts"]),
-    })
-    expect(result).toEqual(["src/a.ts", "src/x.ts"])
-  })
-
-  it("handles forward-slash paths (Windows-normalized)", () => {
-    const result = mergeFileSearchResults({
-      query: "",
-      backend: ["src/utils/path.ts"],
-      open: new Set(["src/utils/path.ts", "src/index.ts"]),
-      active: "src/utils/path.ts",
-    })
-    expect(result).toEqual(["src/utils/path.ts", "src/index.ts"])
-  })
-
-  it("normalizes backslash paths before filtering and deduping", () => {
-    const result = mergeFileSearchResults({
-      query: "utils/path",
-      backend: ["src\\utils\\path.ts"],
-      open: new Set(["src/utils/path.ts"]),
-      active: "src\\utils\\path.ts",
-    })
-    expect(result).toEqual(["src/utils/path.ts"])
   })
 })
 

@@ -29,18 +29,40 @@ export {
   fetchProfileWithBalance,
   fetchDefaultModel,
   getKiloProfile,
+  defaultOrganizationId,
   getKiloBalance,
   getKiloDefaultModel,
   promptOrganizationSelection,
 } from "./api/profile.js"
-export { fetchKiloModels } from "./api/models.js"
+export { fetchKiloPassState } from "./api/kilo-pass.js"
+export {
+  fetchKiloModels,
+  type KiloModelsResult,
+  fetchKiloImageModels,
+  type KiloImageModel,
+  type KiloImageModelsResult,
+  fetchKiloTranscriptionModels,
+  type KiloTranscriptionModel,
+  type KiloTranscriptionModelsResult,
+} from "./api/models.js"
 export {
   EMPTY_KILO_EMBEDDING_MODEL_CATALOG,
   fetchKiloEmbeddingModelCatalog,
   type KiloEmbeddingModel,
   type KiloEmbeddingModelCatalog,
+  type KiloEmbeddingModelCatalogIssue,
 } from "./api/embedding-models.js"
 export { resolveKiloGatewayBaseUrl, resolveKiloOpenRouterBaseUrl } from "./api/url.js"
+export {
+  AUTOCOMPLETE_MODELS,
+  DEFAULT_AUTOCOMPLETE_MODEL,
+  getAutocompleteModel,
+  getAutocompleteModelById,
+  validAutocompleteModel,
+  validAutocompleteProvider,
+  type AutocompleteModelDef,
+  type AutocompleteProviderID,
+} from "./autocomplete.js"
 export {
   fetchOrganizationModes,
   clearModesCache,
@@ -48,11 +70,39 @@ export {
   type OrganizationModeConfig,
 } from "./api/modes.js"
 export { fetchKilocodeNotifications, type KilocodeNotification } from "./api/notifications.js"
+export {
+  fetchByokEntries,
+  fetchCodingPlanSubscriptions,
+  fetchCodingPlanUsage,
+  type ByokEntry,
+  type CodingPlanSubscription,
+  type CodingPlanQuotaWindow,
+} from "./api/trpc.js"
+export {
+  fetchCloudSession,
+  fetchCloudSessionForImport,
+  SessionImportValidationError,
+  prepareSessionImport,
+  importSessionToDb,
+} from "./cloud-sessions.js"
 
 // ============================================================================
 // Server Routes (optional - requires hono and OpenCode dependencies)
 // ============================================================================
 export { createKiloRoutes } from "./server/routes.js"
+export {
+  GatewayError,
+  UnauthorizedError,
+  getOrganizationId,
+  getClawChatCredentials,
+  getClawStatus,
+  getCloudSessions,
+  getNotifications,
+  getProfile,
+  getToken,
+  normalizeClawStatus,
+  setOrganization,
+} from "./server/handlers.js"
 
 // ============================================================================
 // Note: TUI exports moved to separate entry point
@@ -70,6 +120,7 @@ export type {
   Organization,
   KilocodeProfile,
   KilocodeBalance,
+  KiloPassState,
   PollOptions,
   PollResult,
   // Provider types
@@ -88,6 +139,8 @@ export {
   ENV_KILO_API_URL,
   DEFAULT_KILO_API_URL,
   KILO_API_BASE,
+  KILO_CHAT_URL,
+  KILO_EVENT_SERVICE_URL,
   KILO_OPENROUTER_BASE,
   POLL_INTERVAL_MS,
   DEFAULT_MODEL,
@@ -100,6 +153,7 @@ export {
   MODELS_FETCH_TIMEOUT_MS,
   HEADER_ORGANIZATIONID,
   HEADER_TASKID,
+  HEADER_PARENT_TASKID,
   HEADER_PROJECTID,
   HEADER_TESTER,
   HEADER_EDITORNAME,

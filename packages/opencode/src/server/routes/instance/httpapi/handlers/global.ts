@@ -1,9 +1,12 @@
 import { Config } from "@/config/config"
 import { GlobalBus, type GlobalEvent as GlobalBusEvent } from "@/bus/global"
+import { EffectBridge } from "@/effect/bridge"
+import { EventV2 } from "@opencode-ai/core/event"
 import { Installation } from "@/installation"
-import { InstanceStore } from "@/project/instance-store"
+import { disconnect } from "@/kilocode/server/sse" // kilocode_change
+import { copied } from "@/kilocode/event-wire" // kilocode_change
+import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
-import * as Log from "@opencode-ai/core/util/log"
 import { Effect, Queue, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
@@ -11,8 +14,6 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { RootHttpApi } from "../api"
 import { GlobalUpgradeInput } from "../groups/global"
-
-const log = Log.create({ service: "server" })
 
 function eventData(data: unknown): Sse.Event {
   return {
@@ -31,51 +32,66 @@ function parseBody(body: string) {
   }
 }
 
-function eventResponse() {
-  log.info("global event connected")
-  const events = Stream.callback<GlobalBusEvent>((queue) => {
-    const handler = (event: GlobalBusEvent) => Queue.offerUnsafe(queue, event)
-    return Effect.acquireRelease(
-      Effect.sync(() => GlobalBus.on("event", handler)),
-      () => Effect.sync(() => GlobalBus.off("event", handler)),
+// kilocode_change start
+function eventResponse(request: HttpServerRequest.HttpServerRequest) {
+  return Effect.gen(function* () {
+    // kilocode_change end
+    yield* Effect.logInfo("global event connected")
+    const events = Stream.callback<GlobalBusEvent>((queue) => {
+      // kilocode_change start
+      const handler = (event: GlobalBusEvent) => {
+        if (request.headers["x-kilo-sse-skip-fork-sync"] === "1" && copied in event) return
+        Queue.offerUnsafe(queue, event)
+      }
+      // kilocode_change end
+      return Effect.acquireRelease(
+        Effect.sync(() => GlobalBus.on("event", handler)),
+        () => Effect.sync(() => GlobalBus.off("event", handler)),
+      )
+    })
+    const heartbeat = Stream.tick("10 seconds").pipe(
+      Stream.drop(1),
+      Stream.map(() => ({ payload: { id: EventV2.ID.create(), type: "server.heartbeat", properties: {} } })),
+    )
+
+    return HttpServerResponse.stream(
+      Stream.make({ payload: { id: EventV2.ID.create(), type: "server.connected", properties: {} } }).pipe(
+        Stream.concat(events.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
+        Stream.map(eventData),
+        Stream.pipeThroughChannel(Sse.encode()),
+        Stream.encodeText,
+        // kilocode_change start - prevent disconnected SSE clients from retaining full diff payloads
+        // Explicit interruption closes the stream scope, unregisters its GlobalBus listener, and
+        // releases the unbounded callback queue even when transport cancellation is not propagated.
+        Stream.interruptWhen(disconnect(request)),
+        // kilocode_change end
+        Stream.ensuring(Effect.logInfo("global event disconnected")),
+      ),
+      {
+        contentType: "text/event-stream",
+        headers: {
+          "Cache-Control": "no-cache, no-transform",
+          "X-Accel-Buffering": "no",
+          "X-Content-Type-Options": "nosniff",
+        },
+      },
     )
   })
-  const heartbeat = Stream.tick("10 seconds").pipe(
-    Stream.drop(1),
-    Stream.map(() => ({ payload: { type: "server.heartbeat", properties: {} } })),
-  )
-
-  return HttpServerResponse.stream(
-    Stream.make({ payload: { type: "server.connected", properties: {} } }).pipe(
-      Stream.concat(events.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
-      Stream.map(eventData),
-      Stream.pipeThroughChannel(Sse.encode()),
-      Stream.encodeText,
-      Stream.ensuring(Effect.sync(() => log.info("global event disconnected"))),
-    ),
-    {
-      contentType: "text/event-stream",
-      headers: {
-        "Cache-Control": "no-cache, no-transform",
-        "X-Accel-Buffering": "no",
-        "X-Content-Type-Options": "nosniff",
-      },
-    },
-  )
 }
 
 export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handlers) =>
   Effect.gen(function* () {
     const config = yield* Config.Service
     const installation = yield* Installation.Service
-    const store = yield* InstanceStore.Service
+    const bridge = yield* EffectBridge.make()
 
     const health = Effect.fn("GlobalHttpApi.health")(function* () {
       return { healthy: true as const, version: InstallationVersion }
     })
 
     const event = Effect.fn("GlobalHttpApi.event")(function* () {
-      return eventResponse()
+      const request = yield* HttpServerRequest.HttpServerRequest // kilocode_change
+      return yield* eventResponse(request) // kilocode_change
     })
 
     const configGet = Effect.fn("GlobalHttpApi.configGet")(function* () {
@@ -83,15 +99,19 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     })
 
     const configUpdate = Effect.fn("GlobalHttpApi.configUpdate")(function* (ctx) {
-      return yield* config.updateGlobal(ctx.payload)
+      const result = yield* config.updateGlobal(ctx.payload)
+      // kilocode_change start
+      if (result.changed) {
+        yield* bridge.run(
+          disposeAllInstancesAndEmitGlobalDisposed({ swallowErrors: true }).pipe(Effect.catchCause(() => Effect.void)),
+        )
+      }
+      // kilocode_change end
+      return result.info
     })
 
     const dispose = Effect.fn("GlobalHttpApi.dispose")(function* () {
-      yield* store.disposeAll()
-      GlobalBus.emit("event", {
-        directory: "global",
-        payload: { type: "global.disposed", properties: {} },
-      })
+      yield* disposeAllInstancesAndEmitGlobalDisposed()
       return true
     })
 

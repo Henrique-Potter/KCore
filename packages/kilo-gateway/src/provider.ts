@@ -1,5 +1,4 @@
 import { createOpenRouter } from "@openrouter/ai-sdk-provider"
-import { createAlibaba } from "@ai-sdk/alibaba"
 import { createAnthropic } from "@ai-sdk/anthropic"
 import { createOpenAI } from "@ai-sdk/openai"
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
@@ -8,6 +7,16 @@ import { getApiKey } from "./auth/token.js"
 import { buildKiloHeaders, getDefaultHeaders } from "./headers.js"
 import { ANONYMOUS_API_KEY } from "./api/constants.js"
 import { resolveKiloOpenRouterBaseUrl } from "./api/url.js"
+import { transformRequestBody } from "./responses.js"
+import * as GatewayMetadata from "./gateway-metadata.js"
+
+export function buildRequestHeaders(defaultHeaders: Record<string, string>, requestHeaders?: HeadersInit): Headers {
+  const headers = new Headers(defaultHeaders)
+  new Headers(requestHeaders).forEach((value, key) => {
+    headers.set(key, value)
+  })
+  return headers
+}
 
 /**
  * Create a KiloCode provider instance
@@ -44,12 +53,8 @@ export function createKilo(options: KiloProviderOptions = {}): KiloProvider {
   // Create custom fetch wrapper to add dynamic headers
   const originalFetch = options.fetch ?? fetch
   const wrappedFetch = async (input: string | URL | Request, init?: RequestInit) => {
-    const headers = new Headers(init?.headers)
-
-    // Add custom headers
-    Object.entries(customHeaders).forEach(([key, value]) => {
-      headers.set(key, value)
-    })
+    const headers = buildRequestHeaders(customHeaders, init?.headers)
+    const body = transformRequestBody(input, init?.body, options.dataCollection)
 
     // Add authorization if API key exists
     if (apiKey) {
@@ -59,6 +64,7 @@ export function createKilo(options: KiloProviderOptions = {}): KiloProvider {
     return originalFetch(input, {
       ...init,
       headers,
+      body,
     })
   }
 
@@ -70,7 +76,6 @@ export function createKilo(options: KiloProviderOptions = {}): KiloProvider {
   }
 
   const openrouter = createOpenRouter(sdkOptions)
-  const alibaba = createAlibaba(sdkOptions)
   const anthropic = createAnthropic(sdkOptions)
   const openai = createOpenAI(sdkOptions)
   const openaiCompatible = createOpenAICompatible({ ...sdkOptions, name: "openaiCompatible" })
@@ -88,14 +93,11 @@ export function createKilo(options: KiloProviderOptions = {}): KiloProvider {
     imageModel(modelId) {
       return openrouter.imageModel(modelId)
     },
-    alibaba(modelId) {
-      return alibaba(modelId)
-    },
     anthropic(modelId) {
-      return anthropic(modelId)
+      return GatewayMetadata.wrap(anthropic(modelId))
     },
     openai(modelId) {
-      return openai(modelId)
+      return GatewayMetadata.wrap(openai(modelId))
     },
     openaiCompatible(modelId) {
       return openaiCompatible(modelId)

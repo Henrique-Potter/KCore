@@ -1,7 +1,7 @@
 package ai.kilocode.client.session.ui.mode
 
 import ai.kilocode.client.plugin.KiloBundle
-import ai.kilocode.client.ui.UiStyle
+import ai.kilocode.client.ui.PickerButton
 import com.intellij.openapi.ui.popup.JBPopupFactory
 import com.intellij.openapi.ui.popup.PopupShowOptions
 import java.awt.Cursor
@@ -9,7 +9,7 @@ import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.ListSelectionModel
 
-class ModePicker : UiStyle.Pickers.Label() {
+class ModePicker : PickerButton() {
 
     data class Item(
         val id: String,
@@ -28,7 +28,7 @@ class ModePicker : UiStyle.Pickers.Label() {
     init {
         isEnabled = false
         text = " "
-        toolTipText = KiloBundle.message("mode.picker.tooltip")
+        syncTooltip()
 
         addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
@@ -49,6 +49,29 @@ class ModePicker : UiStyle.Pickers.Label() {
         refresh()
     }
 
+    /** Whether [cycle] would move to a different mode than the one selected now. */
+    fun canCycle(): Boolean = nextCycleItem() != null
+
+    /** Selects the next non-deprecated mode after the current one, wrapping at the end. */
+    fun cycle() {
+        val next = nextCycleItem() ?: return
+        selected = next
+        refresh()
+        onSelect(next)
+    }
+
+    private fun nextCycleItem(): Item? {
+        val pool = items.filterNot { it.deprecated }
+        if (pool.isEmpty()) return null
+        val index = pool.indexOfFirst { it.id == selected?.id }
+        val next = pool[(index + 1).mod(pool.size)]
+        return next.takeIf { it.id != selected?.id }
+    }
+
+    override fun syncTooltip() {
+        toolTipText = tip(KiloBundle.message("mode.picker.tooltip"))
+    }
+
     internal fun itemsForTest(): List<Item> = items
 
     internal fun selectedForTest(): Item? = selected
@@ -64,6 +87,11 @@ class ModePicker : UiStyle.Pickers.Label() {
         text = "$display ▴"
         isEnabled = true
         cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+    }
+
+    fun open() {
+        if (!isEnabled || items.isEmpty()) return
+        showPopup()
     }
 
     private fun showPopup() {
@@ -87,6 +115,7 @@ class ModePicker : UiStyle.Pickers.Label() {
             }
             .createPopup()
 
+        restoreFocusOnPick(popup)
         popup.show(PopupShowOptions.aboveComponent(this))
     }
 }
